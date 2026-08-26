@@ -33,12 +33,24 @@ const fit = new FitAddon();
 term.loadAddon(fit);
 term.open(document.getElementById("term-screen")!);
 
-// 等 Web 字体加载完再 fit + 淡入, 避免字体切换引起的重排闪烁(配合 style.css)
-document.fonts.ready.then(() => {
+// 等 Web 字体真正加载完再 fit + 淡入。
+// 陷阱: document.fonts.ready 在"没有任何元素使用该字体"时会立即 resolve,
+// 此时 fit 用 fallback 字体的行高(≈14px)算出错误行数(52 行); Maple Mono
+// 实际是 20px/行(只该有 36 行), 多余的行被 overflow:hidden 裁掉,
+// 提示符永远画在可见区域外。所以必须显式 fonts.load 触发加载。
+function refit() {
   fit.fit();
+  sendResize();
+}
+Promise.all([
+  document.fonts.load('15px "Maple Mono"'),
+  document.fonts.load('italic 15px "Maple Mono"'),
+]).then(() => {
+  refit();
   document.getElementById("term-host")!.classList.add("ready");
-  sendResize(); // Open 可能在 fit 前已发出(初始尺寸不准), 这里纠正一次
 });
+// 双保险: 任何字体加载完成(如 italic 后续换入)都重新 fit 一次
+document.fonts.addEventListener("loadingdone", refit);
 
 // ── 连接 ──
 const wsProto = location.protocol === "https:" ? "wss" : "ws";
