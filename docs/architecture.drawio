@@ -1,0 +1,83 @@
+<mxfile host="65bd71144e">
+    <diagram name="termblog-arch" id="termblog-arch">
+        <mxGraphModel dx="2186" dy="689" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1250" pageHeight="900" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="browser" value="浏览器" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#dae8fc;strokeColor=#6c8ebf;" parent="1" vertex="1">
+                    <mxGeometry x="-140" y="60" width="240" height="300" as="geometry"/>
+                </mxCell>
+                <mxCell id="xterm" value="xterm.js&#xa;渲染 ANSI 转义序列&#xa;捕获按键 (term.onData)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="browser" vertex="1">
+                    <mxGeometry x="20" y="50" width="200" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="tsproto" value="main.ts&#xa;proto 帧编解码 (TS 实现)&#xa;u8 kind | u32 len | payload" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="browser" vertex="1">
+                    <mxGeometry x="20" y="150" width="200" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="web" value="termblog-web 进程 (axum, 127.0.0.1:8080)" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="380" y="60" width="300" height="380" as="geometry"/>
+                </mxCell>
+                <mxCell id="router" value="Router&#xa;GET /ws → handle()&#xa;其余 → ServeDir(frontend/dist)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
+                    <mxGeometry x="30" y="45" width="240" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="handshake" value="handle() 握手&#xa;首帧须为 Open{cols,rows}&#xa;配额满 → 回 Closed{reason}" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
+                    <mxGeometry x="30" y="135" width="240" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="up" value="上行泵 (WS → core)&#xa;Data → input.send()&#xa;Resize → control.send()&#xa;Close → 结束" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
+                    <mxGeometry x="30" y="225" width="240" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="down" value="下行泵 (core → WS, 独立 task)&#xa;output.recv() → 套 Data 帧&#xa;Lagged → 丢帧继续&#xa;Closed → 发 Closed{exit}" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
+                    <mxGeometry x="30" y="315" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="core" value="termblog-core (库 crate, 编译进 web 进程)" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#fff2cc;strokeColor=#d6b656;" parent="1" vertex="1">
+                    <mxGeometry x="1000" y="10" width="340" height="440" as="geometry"/>
+                </mxCell>
+                <mxCell id="mgr" value="SessionManager::create(ip, cols, rows)&#xa;① 配额检查+占位 (同一把锁, 不超发)&#xa;② backend.spawn() → ShellChild&#xa;③ 建三条通道, spawn(pump)&#xa;④ 返回 SessionHandle" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="core" vertex="1">
+                    <mxGeometry x="30" y="45" width="280" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="handle" value="SessionHandle&#xa;input: mpsc::Sender&#xa;control: mpsc::Sender&#xa;output: broadcast::Receiver (多观察者)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="core" vertex="1">
+                    <mxGeometry x="30" y="165" width="280" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="pump" value="pump task (每会话一个, 独占 PTY)&#xa;select! {&#xa;  input.recv() → write(master)&#xa;  Resize → TIOCSWINSZ + SIGWINCH&#xa;  master 可读 → read → broadcast&#xa;}&#xa;回收: SIGHUP 进程组 → reap(5s→SIGKILL)&#xa;→ backend.cleanup() → 移出会话表" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="core" vertex="1">
+                    <mxGeometry x="30" y="275" width="280" height="150" as="geometry"/>
+                </mxCell>
+                <mxCell id="kernel" value="操作系统内核 / 子进程" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
+                    <mxGeometry x="970" y="620" width="340" height="240" as="geometry"/>
+                </mxCell>
+                <mxCell id="master" value="PTY master fd&#xa;(ShellChild.master, 非阻塞, AsyncFd)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kernel" vertex="1">
+                    <mxGeometry x="20" y="70" width="140" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="slave" value="PTY slave&#xa;/dev/ttysNNN" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kernel" vertex="1">
+                    <mxGeometry x="180" y="70" width="130" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="zsh" value="zsh 进程 (forkpty+exec)&#xa;stdin/stdout/stderr = slave&#xa;pid == pgid (setsid)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kernel" vertex="1">
+                    <mxGeometry x="100" y="160" width="200" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1" value="HTTP GET / → index.html + js (一次性)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;strokeColor=#6c8ebf;" parent="1" source="browser" target="router" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e2" value="WebSocket: 一条消息 = 一个 proto 帧&#xa;↑ Open / Data(键入) / Resize&#xa;↓ Opened / Data(输出) / Closed" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;startArrow=none;endArrow=open;strokeColor=#6c8ebf;" parent="1" source="tsproto" target="handshake" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e3" value="create() → SessionHandle (进程内函数调用)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="handshake" target="mgr" edge="1">
+                    <mxGeometry x="-0.4286" relative="1" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e4" value="input.send(字节)&#xa;control.send(Resize)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;" parent="1" source="up" target="pump" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e5" value="output.recv() (broadcast)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;" parent="1" source="pump" target="down" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e6" value="write(键入) / TIOCSWINSZ&#xa;read(输出)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;" parent="1" source="pump" target="master" edge="1">
+                    <mxGeometry x="-0.561" relative="1" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e8" value="fd 0/1/2" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;strokeColor=#9673a6;" parent="1" source="slave" target="zsh" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>
