@@ -1,0 +1,12 @@
+[package]
+name = "termblog-ssh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+termblog-core = { path = "../core" }
+russh = "0.63"
+rand = "0.10"

@@ -1,12 +1,14 @@
 # termblog —— 编译 / 启动 / 停止
 # 用法: make build | make run(前台调试) | make start/stop/restart/status(后台服务)
+# ssh 接入层是独立进程: make dev-ssh(前台调试, 开发建议 TERMBLOG_SSH_LISTEN=127.0.0.1:2222)
 
 BIN       := target/release/termblog-web
+BIN_SSH   := target/release/termblog-ssh
 PID_FILE  := .termblog.pid
 LOG_FILE  := termblog.log
 ADDR      := 127.0.0.1:8080
 
-.PHONY: all build build-frontend run start stop restart status logs clean dev dev-web
+.PHONY: all build build-frontend run start stop restart status logs clean dev dev-web dev-ssh run-ssh
 
 all: build
 
@@ -63,6 +65,14 @@ dev:
 
 dev-web:
 	cd frontend && npm run dev
+
+# ── ssh 接入层: 与 web 完全独立的进程。默认绑 0.0.0.0:22(特权端口, 需 root);
+#    开发时用非特权端口: TERMBLOG_SSH_LISTEN=127.0.0.1:2222 make dev-ssh ──
+dev-ssh:
+	cargo run -p termblog-ssh
+
+run-ssh: build
+	./$(BIN_SSH)
 
 clean:
 	cargo clean

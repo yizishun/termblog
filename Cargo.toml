@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/core", "crates/web"] # M2 加入 "crates/ssh"
+members = ["crates/proto", "crates/core", "crates/web", "crates/ssh"]
 
 [workspace.dependencies]
 anyhow = "1"
