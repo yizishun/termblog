@@ -3,8 +3,7 @@ dist
 /target
 /.cargo-home
 /.npm-cache
-/.termblog.pid
-/termblog.log
+/.termblog*.pid
 *.log
 .DS_Store
 .worktrees/
