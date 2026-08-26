@@ -7,3 +7,4 @@ dist
 /termblog.log
 *.log
 .DS_Store
+.worktrees/

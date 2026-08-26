@@ -19,11 +19,22 @@ pub const CLOSED: u8 = 0x05; // <- Closed  会话结束(含配额拒绝等原因
 pub struct Open {
     pub cols: u16,
     pub rows: u16,
+    /// 断线重连: 带上上次 Opened 下发的 token, 请求 attach 回原会话。
+    /// 无此字段(或 token 已失效) => 开新会话。
+    #[serde(default)]
+    pub attach_token: Option<String>,
+    // 注意: peer_ip 不放在这里(客户端不可信)。M3 拆进程后由网关在发往 jaild 的
+    // Open 里自行填入真实对端 IP, 配额判定才有意义。
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Opened {
     pub session_id: String,
+    /// 本次会话的 attach token, 客户端存好(sessionStorage), 重连时凭它回原会话
+    pub attach_token: String,
+    /// true = 成功 attach 回旧会话(会先发一轮 scrollback 回放, 客户端应先 reset
+    /// 屏幕再接收); false = 开了新会话(token 缺失/已过期)
+    pub attached: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

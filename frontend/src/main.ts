@@ -6,6 +6,7 @@ import "@xterm/xterm/css/xterm.css";
 const T_OPEN = 0x01;
 const T_DATA = 0x02;
 const T_RESIZE = 0x03;
+const T_OPENED = 0x04;
 const T_CLOSED = 0x05;
 
 const textEnc = new TextEncoder();
@@ -52,7 +53,9 @@ Promise.all([
 // 双保险: 任何字体加载完成(如 italic 后续换入)都重新 fit 一次
 document.fonts.addEventListener("loadingdone", refit);
 
-// ── 连接 ──
+// ── 连接(attach token: 刷新页面回原会话, shell 状态不丢) ──
+const TOKEN_KEY = "termblog.attach_token";
+
 const wsProto = location.protocol === "https:" ? "wss" : "ws";
 const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
 ws.binaryType = "arraybuffer";
@@ -63,7 +66,12 @@ function send(buf: ArrayBuffer) {
 const sendResize = () => send(jsonFrame(T_RESIZE, { cols: term.cols, rows: term.rows }));
 
 ws.onopen = () => {
-  ws.send(jsonFrame(T_OPEN, { cols: term.cols, rows: term.rows }));
+  // 带上次拿到的 token 尝试恢复原会话; 没有/已失效则服务端自动开新会话
+  ws.send(jsonFrame(T_OPEN, {
+    cols: term.cols,
+    rows: term.rows,
+    attach_token: sessionStorage.getItem(TOKEN_KEY),
+  }));
 
   // 键入原样进 WS(不做行缓冲/命令拦截, 否则会与 zsh ZLE、vim 打架)
   term.onData((d) => send(frame(T_DATA, textEnc.encode(d))));
@@ -81,12 +89,22 @@ ws.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
     case T_DATA:
       term.write(payload); // 裸 PTY 字节, ANSI 原样上屏
       break;
+    case T_OPENED: {
+      const opened = JSON.parse(textDec.decode(payload));
+      // 恢复的会话: 屏幕清干净, 由 SIGWINCH 触发前台程序重绘; 新会话本来就是新画面
+      term.reset();
+      sessionStorage.setItem(TOKEN_KEY, opened.attach_token);
+      if (opened.attached) term.write("\x1b[90m[已恢复原会话]\x1b[0m\r\n");
+      sendResize(); // attach 后服务端 winsize 可能还是旧值, 主动同步一次
+      break;
+    }
     case T_CLOSED: {
       let reason = textDec.decode(payload);
       try {
         reason = JSON.parse(reason).reason;
       } catch { /* 非 JSON 就直接显示 */ }
       term.write(`\r\n\x1b[31m[会话结束: ${reason}]\x1b[0m\r\n`);
+      sessionStorage.removeItem(TOKEN_KEY);
       break;
     }
   }
