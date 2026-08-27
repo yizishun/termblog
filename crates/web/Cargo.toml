@@ -7,6 +7,8 @@ edition = "2021"
 anyhow.workspace = true
 bytes.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = "0.3"
 termblog-core = { path = "../core" }
 termblog-proto = { path = "../proto" }
 axum = { version = "0.8", features = ["ws"] }

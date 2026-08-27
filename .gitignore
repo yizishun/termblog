@@ -8,3 +8,5 @@ dist
 .DS_Store
 .worktrees/
 ssh_host_ed25519*
+# 本地说明文档, 不入库
+m3.md

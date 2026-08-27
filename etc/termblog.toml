@@ -1,0 +1,34 @@
+# termblog 运行配置(jaild / termblog-web / termblog-ssh 三个二进制共用)
+
+[web]
+# 生产直连公网; 后续想挂反代/Anubis 时改回 127.0.0.1:8080
+listen = "0.0.0.0:8080"
+static_dir = "/usr/local/share/termblog/frontend"
+
+[ssh]
+# 降权 www 跑不了特权端口 22, 生产用 2222
+listen = "0.0.0.0:2222"
+user = "blog"
+host_key = "/var/db/termblog/ssh_host_ed25519"
+
+[session]
+max_total = 64
+max_per_ip = 3
+# M4 落地(先占位)
+hard_lifetime_secs = 7200
+
+[jail]
+# jaild 的 Unix socket: 接入层(web/ssh)与特权 jaild 之间的唯一通道
+socket = "/var/run/termblog.sock"
+template = "zroot/jails/template@release"
+dataset_prefix = "zroot/jails/s-"
+# 每会话可写空间上限(ZFS quota; 模板共享块不计入), 防写爆宿主池
+disk_quota = "4M"
+path_prefix = "/jails"
+memory = "128M"
+vmemory = "512M"
+maxproc = 32
+openfiles = 256
+pcpu = 25
+zsh = "/usr/local/bin/zsh"
+guest_user = "guest"

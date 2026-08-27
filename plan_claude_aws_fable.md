@@ -246,7 +246,7 @@ cleanup(sid):
 - `etc/rc.d/{jaild,termblog}` rc 脚本 + `etc/termblog.toml`：
 
 ```toml
-[web]  listen = "127.0.0.1:8080"          # 前面可挂反代/Anubis（后续）
+[web]  listen = "0.0.0.0:8080"            # 生产直连公网; 后续可换回 127.0.0.1 挂反代/Anubis
 [ssh]  listen = "0.0.0.0:2222"
 [session] max_total = 64
           max_per_ip = 3

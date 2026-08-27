@@ -1,0 +1,51 @@
+#!/bin/sh
+
+# PROVIDE: termblog
+# REQUIRE: LOGIN jaild
+# KEYWORD: shutdown
+
+# termblog 接入层(降权 www): 同时拉起 termblog-web(axum) 与
+# termblog-ssh(russh), 两者都经 /var/run/termblog.sock 触达 jaild。
+# 权限分离: 解析不可信网络输入的两个进程绝不携带 root。
+
+. /etc/rc.subr
+
+name="termblog"
+rcvar="termblog_enable"
+
+: "${termblog_enable:=NO}"
+: "${termblog_user:=www}"
+
+start_cmd="termblog_start"
+stop_cmd="termblog_stop"
+
+termblog_start()
+{
+    echo "Starting termblog (web + ssh) as ${termblog_user}."
+    # 降权用户需要写的目录与日志
+    mkdir -p /var/db/termblog /var/log
+    chown "$termblog_user" /var/db/termblog
+    touch /var/log/termblog-web.log /var/log/termblog-ssh.log
+    chown "$termblog_user" /var/log/termblog-web.log /var/log/termblog-ssh.log
+
+    /usr/sbin/daemon -u "$termblog_user" -p /var/run/termblog-web.pid \
+        -o /var/log/termblog-web.log /usr/local/sbin/termblog-web
+    /usr/sbin/daemon -u "$termblog_user" -p /var/run/termblog-ssh.pid \
+        -o /var/log/termblog-ssh.log /usr/local/sbin/termblog-ssh
+}
+
+termblog_stop()
+{
+    for p in /var/run/termblog-web.pid /var/run/termblog-ssh.pid; do
+        if [ -f "$p" ]; then
+            pid=$(cat "$p")
+            if kill "$pid" 2>/dev/null; then
+                echo "Stopped ${p} (pid ${pid})."
+            fi
+            rm -f "$p"
+        fi
+    done
+}
+
+load_rc_config "$name"
+run_rc_command "$1"

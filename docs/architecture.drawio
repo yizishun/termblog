@@ -1,81 +1,112 @@
 <mxfile host="65bd71144e">
     <diagram name="termblog-arch" id="termblog-arch">
-        <mxGraphModel dx="2186" dy="689" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1250" pageHeight="900" math="0" shadow="0">
+        <mxGraphModel dx="2182" dy="1917" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1150" pageHeight="1250" math="0" shadow="0">
             <root>
                 <mxCell id="0"/>
                 <mxCell id="1" parent="0"/>
                 <mxCell id="browser" value="浏览器" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#dae8fc;strokeColor=#6c8ebf;" parent="1" vertex="1">
-                    <mxGeometry x="-140" y="60" width="240" height="300" as="geometry"/>
+                    <mxGeometry x="-200" y="-200" width="240" height="300" as="geometry"/>
                 </mxCell>
                 <mxCell id="xterm" value="xterm.js&#xa;渲染 ANSI 转义序列&#xa;捕获按键 (term.onData)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="browser" vertex="1">
-                    <mxGeometry x="20" y="50" width="200" height="70" as="geometry"/>
+                    <mxGeometry x="20" y="48" width="200" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="tsproto" value="main.ts&#xa;proto 帧编解码 (TS 实现)&#xa;u8 kind | u32 len | payload" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="browser" vertex="1">
-                    <mxGeometry x="20" y="150" width="200" height="80" as="geometry"/>
+                <mxCell id="tsproto" value="main.ts&#xa;proto 帧编解码 (TS 实现)&#xa;u8 kind | u32 len | payload&#xa;attach_token 存 sessionStorage,&#xa;刷新重连时带上" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="browser" vertex="1">
+                    <mxGeometry x="20" y="140" width="200" height="95" as="geometry"/>
                 </mxCell>
-                <mxCell id="web" value="termblog-web 进程 (axum, 127.0.0.1:8080)" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
-                    <mxGeometry x="380" y="60" width="300" height="380" as="geometry"/>
+                <mxCell id="web" value="termblog-web 进程 (axum, 0.0.0.0:8080) [降权 www]" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="330" y="-90" width="370" height="470" as="geometry"/>
                 </mxCell>
                 <mxCell id="router" value="Router&#xa;GET /ws → handle()&#xa;其余 → ServeDir(frontend/dist)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
-                    <mxGeometry x="30" y="45" width="240" height="70" as="geometry"/>
+                    <mxGeometry x="20" y="46" width="300" height="55" as="geometry"/>
                 </mxCell>
-                <mxCell id="handshake" value="handle() 握手&#xa;首帧须为 Open{cols,rows}&#xa;配额满 → 回 Closed{reason}" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
-                    <mxGeometry x="30" y="135" width="240" height="70" as="geometry"/>
+                <mxCell id="websess" value="会话持有表 WebSession (token → 句柄)&#xa;· 60s 宽限: 刷新不断会话&#xa;· 转发 task: scrollback 128KiB + attach 回放&#xa;(先订阅再回放, 不重不漏)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
+                    <mxGeometry x="20" y="112" width="300" height="88" as="geometry"/>
                 </mxCell>
-                <mxCell id="up" value="上行泵 (WS → core)&#xa;Data → input.send()&#xa;Resize → control.send()&#xa;Close → 结束" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
-                    <mxGeometry x="30" y="225" width="240" height="80" as="geometry"/>
+                <mxCell id="handshake" value="handle()&#xa;首帧须为 Open{cols,rows}&#xa;attach 优先 → 否则 create()&#xa;→ Opened → 上行/下行泵" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
+                    <mxGeometry x="20" y="212" width="300" height="80" as="geometry"/>
                 </mxCell>
-                <mxCell id="down" value="下行泵 (core → WS, 独立 task)&#xa;output.recv() → 套 Data 帧&#xa;Lagged → 丢帧继续&#xa;Closed → 发 Closed{exit}" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
-                    <mxGeometry x="30" y="315" width="240" height="60" as="geometry"/>
+                <mxCell id="wsclient" value="SessionClient (termblog-core, 每会话一条 socket 连接)&#xa;open(): 连 socket → 发 Open 帧 → 读 Opened/Closed&#xa;(配额拒绝在此报错)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="web" vertex="1">
+                    <mxGeometry x="20" y="304" width="300" height="56" as="geometry"/>
                 </mxCell>
-                <mxCell id="core" value="termblog-core (库 crate, 编译进 web 进程)" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#fff2cc;strokeColor=#d6b656;" parent="1" vertex="1">
-                    <mxGeometry x="1000" y="10" width="340" height="440" as="geometry"/>
+                <mxCell id="wpump" value="客户端pump task (每会话一个, open 内 spawn)&#xa;键入/Resize → 帧写 socket;&#xa;socket 帧 → 广播输出&#xa;断开: drop 输出端 → 会话交还" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" vertex="1" parent="web">
+                    <mxGeometry x="20" y="370" width="300" height="72" as="geometry"/>
                 </mxCell>
-                <mxCell id="mgr" value="SessionManager::create(ip, cols, rows)&#xa;① 配额检查+占位 (同一把锁, 不超发)&#xa;② backend.spawn() → ShellChild&#xa;③ 建三条通道, spawn(pump)&#xa;④ 返回 SessionHandle" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="core" vertex="1">
-                    <mxGeometry x="30" y="45" width="280" height="100" as="geometry"/>
+                <mxCell id="sshl" value="termblog-ssh 进程 (russh, 0.0.0.0:2222) [降权 www]" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="750" y="-90" width="360" height="374" as="geometry"/>
                 </mxCell>
-                <mxCell id="handle" value="SessionHandle&#xa;input: mpsc::Sender&#xa;control: mpsc::Sender&#xa;output: broadcast::Receiver (多观察者)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="core" vertex="1">
-                    <mxGeometry x="30" y="165" width="280" height="90" as="geometry"/>
+                <mxCell id="rserver" value="russh Server&#xa;auth_none / auth_password:&#xa;用户名 == blog 即免密接受" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="sshl" vertex="1">
+                    <mxGeometry x="20" y="46" width="280" height="62" as="geometry"/>
                 </mxCell>
-                <mxCell id="pump" value="pump task (每会话一个, 独占 PTY)&#xa;select! {&#xa;  input.recv() → write(master)&#xa;  Resize → TIOCSWINSZ + SIGWINCH&#xa;  master 可读 → read → broadcast&#xa;}&#xa;回收: SIGHUP 进程组 → reap(5s→SIGKILL)&#xa;→ backend.cleanup() → 移出会话表" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="core" vertex="1">
-                    <mxGeometry x="30" y="275" width="280" height="150" as="geometry"/>
+                <mxCell id="rhandler" value="SshHandler&#xa;pty_request → 记 winsize&#xa;shell_request → client.open()&#xa;window_change → Resize&#xa;exec / subsystem 一律拒绝" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="sshl" vertex="1">
+                    <mxGeometry x="20" y="120" width="280" height="92" as="geometry"/>
                 </mxCell>
-                <mxCell id="kernel" value="操作系统内核 / 子进程" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
-                    <mxGeometry x="970" y="620" width="340" height="240" as="geometry"/>
+                <mxCell id="sshclient" value="SessionClient (termblog-core)&#xa;open(): 连 socket → 发 Open 帧 → 读 Opened/Closed&#xa;(客户端泵同 web: 键入/Resize → 帧; 帧 → 输出广播)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="sshl" vertex="1">
+                    <mxGeometry x="20" y="224" width="280" height="62" as="geometry"/>
                 </mxCell>
-                <mxCell id="master" value="PTY master fd&#xa;(ShellChild.master, 非阻塞, AsyncFd)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kernel" vertex="1">
-                    <mxGeometry x="20" y="70" width="140" height="70" as="geometry"/>
+                <mxCell id="sdown" value="下行pump task (russh 侧)&#xa;输出 → channel data&#xa;会话终结 → exit_status + close" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" vertex="1" parent="sshl">
+                    <mxGeometry x="20" y="296" width="280" height="62" as="geometry"/>
                 </mxCell>
-                <mxCell id="slave" value="PTY slave&#xa;/dev/ttysNNN" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kernel" vertex="1">
-                    <mxGeometry x="180" y="70" width="130" height="70" as="geometry"/>
+                <mxCell id="boundary" value="权限边界 —— /var/run/termblog.sock · SOCK_SEQPACKET(一帧 = 一条消息, 无粘包) · 0660 root:www" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=13;fontStyle=1;fontColor=#b85450;" parent="1" vertex="1">
+                    <mxGeometry x="360" y="530" width="720" height="30" as="geometry"/>
                 </mxCell>
-                <mxCell id="zsh" value="zsh 进程 (forkpty+exec)&#xa;stdin/stdout/stderr = slave&#xa;pid == pgid (setsid)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kernel" vertex="1">
-                    <mxGeometry x="100" y="160" width="200" height="60" as="geometry"/>
+                <mxCell id="boundline" value="" style="endArrow=none;dashed=1;strokeWidth=1;strokeColor=#b85450;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="555" width="1040" height="10" as="geometry"/>
                 </mxCell>
-                <mxCell id="e1" value="HTTP GET / → index.html + js (一次性)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;strokeColor=#6c8ebf;" parent="1" source="browser" target="router" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
+                <mxCell id="jaild" value="jaild 进程 [root] —— 整个系统唯一携带 root 的进程" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#fff2cc;strokeColor=#d6b656;" parent="1" vertex="1">
+                    <mxGeometry x="360" y="620" width="720" height="474" as="geometry"/>
                 </mxCell>
-                <mxCell id="e2" value="WebSocket: 一条消息 = 一个 proto 帧&#xa;↑ Open / Data(键入) / Resize&#xa;↓ Opened / Data(输出) / Closed" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;startArrow=none;endArrow=open;strokeColor=#6c8ebf;" parent="1" source="tsproto" target="handshake" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
+                <mxCell id="jlistener" value="LinkListener (SOCK_SEQPACKET)&#xa;启动: sweep 回收 s-* 残留 + 补 devfs 规则集 4&#xa;bind socket → chmod 0660 / chown root:www → accept → handle_conn" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
+                    <mxGeometry x="20" y="46" width="680" height="66" as="geometry"/>
                 </mxCell>
-                <mxCell id="e3" value="create() → SessionHandle (进程内函数调用)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="handshake" target="mgr" edge="1">
-                    <mxGeometry x="-0.4286" relative="1" as="geometry">
+                <mxCell id="jconn" value="handle_conn (每连接一个 task)&#xa;15s 握手: 首帧必须 Open (attach_token 已废弃, 忽略) → SessionManager::create, 配额拒绝回 Closed → Opened&#xa;单 task 双 select: 上行 Data→input / Resize→control; 下行 输出→帧 / 终结→Closed&#xa;socket 断开 = drop 句柄 = 会话立即回收 (无宽限期)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
+                    <mxGeometry x="20" y="122" width="680" height="88" as="geometry"/>
+                </mxCell>
+                <mxCell id="jmgr" value="SessionManager::create(peer_ip 由网关填入, 客户端不可信)&#xa;配额: 全局 ≤64 / 每 IP ≤3 (同一把锁检查+占位, 不超发) → 起会话 pump task&#xa;JailBackend (create 内调用, blocking 线程):&#xa;① zfs clone 只读模板  ② mountpoint + devfs(规则集 4)  ③ jail -c(无网络, allow.* 全关, persist)&#xa;④ rctl×5 (fail-closed: 挂不上就拒绝开会话)  ⑤ 解析 jail 内 passwd 得 guest&#xa;⑥ openpty + fork; 子进程: setsid → ctty → jail_attach → setuid(guest) → exec zsh" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="jaild">
+                    <mxGeometry x="20" y="222" width="680" height="136" as="geometry"/>
+                </mxCell>
+                <mxCell id="jpump" value="会话 pump task (每会话一个, 独占 PTY)&#xa;select!{ 键入→write(master) · Resize→TIOCSWINSZ+SIGWINCH · master 可读→read→broadcast }&#xa;回收: SIGHUP 进程组 → reap(5s→SIGKILL) → cleanup(销 jail) → 移出会话表 (每环落日志)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
+                    <mxGeometry x="20" y="368" width="680" height="86" as="geometry"/>
+                </mxCell>
+                <mxCell id="kern" value="操作系统内核 / 子进程" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
+                    <mxGeometry x="-80" y="570" width="280" height="430" as="geometry"/>
+                </mxCell>
+                <mxCell id="master" value="PTY master&#xa;(非阻塞 fd)&#xa;ShellChild.master" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kern" vertex="1">
+                    <mxGeometry x="20" y="70" width="115" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="slave" value="PTY slave&#xa;/dev/ttysN" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kern" vertex="1">
+                    <mxGeometry x="150" y="70" width="110" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="jailbox" value="jail s-&lt;sid&gt; (persist, 无网络)&#xa;· 根: zfs clone 自只读模板 @release&#xa;· devfs (规则集 4: 只露无害设备)&#xa;· allow.* 全关&#xa;· rctl: mem 128M / vmem 512M / proc 32 / files 256 / pcpu 25%&#xa;· 销毁: umount devfs → jail -r → zfs destroy (幂等)" style="rounded=1;whiteSpace=wrap;fill=#f8cecc;strokeColor=#b85450;fontSize=11;verticalAlign=top;" parent="kern" vertex="1">
+                    <mxGeometry x="20" y="200" width="240" height="190" as="geometry"/>
+                </mxCell>
+                <mxCell id="zsh" value="zsh -l (uid=guest)&#xa;fd 0/1/2 = PTY slave&#xa;HOME=/home/guest" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#b85450;fontSize=12;" parent="kern" vertex="1">
+                    <mxGeometry x="50" y="310" width="180" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1" value="HTTP GET / → index.html + js (一次性)&#xa;WebSocket: 一条消息 = 一个 proto 帧&#xa;↑ Open/Data(键入)/Resize&#xa;↓ Opened/Data(输出)/Closed" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#6c8ebf;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="tsproto" target="router" edge="1">
+                    <mxGeometry x="-0.0189" relative="1" as="geometry">
                         <mxPoint as="offset"/>
                     </mxGeometry>
                 </mxCell>
-                <mxCell id="e4" value="input.send(字节)&#xa;control.send(Resize)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;" parent="1" source="up" target="pump" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e5" value="output.recv() (broadcast)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;" parent="1" source="pump" target="down" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e6" value="write(键入) / TIOCSWINSZ&#xa;read(输出)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;" parent="1" source="pump" target="master" edge="1">
-                    <mxGeometry x="-0.561" relative="1" as="geometry">
+                <mxCell id="e2" value="每会话一条 socket 连接 (SEQPACKET)&#xa;Open{cols,rows,attach_token?,peer_ip} →&#xa;Data / Resize →&#xa;← Opened / Data / Closed" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#82b366;" parent="1" source="wsclient" target="jlistener" edge="1">
+                    <mxGeometry x="-0.0323" relative="1" as="geometry">
                         <mxPoint as="offset"/>
                     </mxGeometry>
                 </mxCell>
-                <mxCell id="e8" value="fd 0/1/2" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;strokeColor=#9673a6;" parent="1" source="slave" target="zsh" edge="1">
+                <mxCell id="e3" value="每会话一条 socket 连接&#xa;peer_ip 由网关从 TCP 握手填入" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#82b366;" parent="1" source="sshclient" target="jlistener" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e4" value="read / write(键入)&#xa;TIOCSWINSZ" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d6b656;" parent="1" source="jpump" target="master" edge="1">
+                    <mxGeometry x="-0.6917" y="-11" relative="1" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e5" value="建 (create 内): zfs clone → jail -c → rctl×5&#xa;销 (泵回收时): jail -r → zfs destroy" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d6b656;" parent="1" source="jmgr" target="jailbox" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e6" value="fd 0/1/2" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#9673a6;" parent="1" source="slave" target="zsh" edge="1">
+                    <mxGeometry x="-0.5918" y="5" relative="1" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
                 </mxCell>
             </root>
         </mxGraphModel>

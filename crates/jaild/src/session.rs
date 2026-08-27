@@ -1,4 +1,7 @@
-//! 会话核心: 会话表 + 配额 + 每会话一个 PTY 读写泵 task。
+//! 会话核心(jaild 私有): 会话表 + 配额 + 每会话一个 PTY 读写泵 task。
+//!
+//! 共享 API 类型(Control / SessionHandle)不在这里, 而在
+//! `termblog_core::handle`, 本文件与接入层共用那一份定义。
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -10,24 +13,12 @@ use bytes::Bytes;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::os::unix::io::AsRawFd;
+use termblog_core::{Control, SessionHandle};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::backend::ShellBackend;
+use crate::jail::JailBackend;
 use crate::pty::{set_winsize, ShellChild};
-
-pub enum Control {
-    Resize { cols: u16, rows: u16 },
-}
-
-/// 接入层拿到的句柄: 与 backend / 传输方式(web or ssh)无关。
-/// drop 掉它(input/control 通道关闭)即表示接入方断开, 会话被回收。
-pub struct SessionHandle {
-    pub id: String,
-    pub input: mpsc::Sender<Bytes>,          // 键入 -> PTY master 写
-    pub output: broadcast::Receiver<Bytes>,  // PTY master 读 -> 所有观察者
-    pub control: mpsc::Sender<Control>,      // Resize
-}
 
 pub struct Quota {
     pub max_total: usize,
@@ -35,7 +26,7 @@ pub struct Quota {
 }
 
 struct Inner {
-    backend: Box<dyn ShellBackend>,
+    backend: Arc<JailBackend>,
     quota: Quota,
     table: Mutex<HashMap<String, IpAddr>>, // sid -> 来源 IP(配额计数用)
 }
@@ -44,9 +35,9 @@ struct Inner {
 pub struct SessionManager(Arc<Inner>);
 
 impl SessionManager {
-    pub fn new(backend: impl ShellBackend + 'static, quota: Quota) -> Self {
+    pub fn new(backend: JailBackend, quota: Quota) -> Self {
         Self(Arc::new(Inner {
-            backend: Box::new(backend),
+            backend: Arc::new(backend),
             quota,
             table: Mutex::new(HashMap::new()),
         }))
@@ -102,21 +93,25 @@ async fn pump(
     let master = match AsyncFd::new(child.master) {
         Ok(m) => m,
         Err(_) => {
-            // pump 未能启动: 收掉已 fork 出的 shell, 释放配额占位
+            // pump 未能启动: 收掉已 fork 出的 shell, 释放配额占位;
+            // backend 资源(如 jail)一并回收, 不留泄漏
             let _ = kill(Pid::from_raw(-child.pid.as_raw()), Signal::SIGHUP);
             reap(child.pid).await;
+            let _ = inner.backend.cleanup(&sid).await;
             inner.table.lock().unwrap().remove(&sid);
             return;
         }
     };
     let mut buf = [0u8; 8192];
 
+    // 循环退出原因(泄漏排障: 每条退出路径都落日志)
+    let why: &str;
     loop {
         tokio::select! {
             // 键入 -> 写 PTY 主端
             data = input.recv() => match data {
                 Some(b) => { let _ = write_all(&master, &b).await; }
-                None => break, // 接入层断开(SessionHandle 被 drop)
+                None => { why = "input 通道关闭(接入层断开)"; break; }
             },
             // 控制帧; control 通道关闭 => 接入层断开 => 回收
             c = ctrl.recv() => match c {
@@ -124,25 +119,29 @@ async fn pump(
                     let _ = set_winsize(master.get_ref(), cols, rows);
                     let _ = kill(child.pid, Signal::SIGWINCH);
                 }
-                None => break,
+                None => { why = "control 通道关闭(接入层断开)"; break; }
             },
             // PTY 输出 -> 广播给观察者
             ready = master.readable() => {
-                let mut g = match ready { Ok(g) => g, Err(_) => break };
+                let mut g = match ready { Ok(g) => g, Err(_) => { why = "master readable 错误"; break; } };
                 match nix::unistd::read(master.as_raw_fd(), &mut buf) {
-                    Ok(0) => break, // EOF: shell 退出
+                    Ok(0) => { why = "PTY EOF(shell 退出)"; break; }
                     Ok(n) => { let _ = out.send(Bytes::copy_from_slice(&buf[..n])); }
                     Err(nix::errno::Errno::EAGAIN) => g.clear_ready(),
-                    Err(_) => break,
+                    Err(_) => { why = "PTY 读错误"; break; }
                 }
             },
         }
     }
 
     // ---- 回收: 杀进程组(forkpty 里 setsid 过, pid == pgid) -> wait -> 移出会话表 ----
+    // (链路日志: 泄漏排障用, 每一环都有迹可查)
+    tracing::info!(sid, why, "pump 退出, 回收开始: SIGHUP 进程组");
     let _ = kill(Pid::from_raw(-child.pid.as_raw()), Signal::SIGHUP);
     reap(child.pid).await;
+    tracing::info!(sid, "shell 已收尸, backend 清理开始");
     let _ = inner.backend.cleanup(&sid).await;
+    tracing::info!(sid, "backend 清理完成, 移出会话表");
     inner.table.lock().unwrap().remove(&sid);
     // out(broadcast::Sender) 随本 task 结束被 drop => 观察者收到 Closed, 得知会话终结
 }

@@ -1,4 +1,5 @@
 # termblog —— 编译 / 运行 / 服务管理
+# 注意: GNU make 语法(define/endef + $(shell)); FreeBSD 请用 gmake 调用。
 #
 # 约定: 不带后缀的目标操作 web, 带 -ssh 后缀的对应操作 ssh。
 #   run/run-ssh            前台运行(Ctrl-C 停止, 调试用)
@@ -9,19 +10,25 @@
 #   logs/logs-ssh          跟踪日志
 #
 # 监听地址可用环境变量覆盖:
-#   TERMBLOG_LISTEN       web, 默认 127.0.0.1:8080
-#   TERMBLOG_SSH_LISTEN   ssh, 默认 0.0.0.0:22(特权端口; 开发建议 127.0.0.1:2222)
+#   TERMBLOG_LISTEN       web, 默认 0.0.0.0:8080
+#   TERMBLOG_SSH_LISTEN   ssh, 默认 0.0.0.0:2222(降权 www 跑不了特权端口 22)
+#   TERMBLOG_SOCKET       jaild 的 Unix socket 路径
+#   TERMBLOG_CONFIG       TOML 配置文件路径
 
 BIN_WEB := target/release/termblog-web
 BIN_SSH := target/release/termblog-ssh
+BIN_JAILD := target/release/termblog-jaild
 PID_WEB := .termblog-web.pid
 PID_SSH := .termblog-ssh.pid
 LOG_WEB := termblog-web.log
 LOG_SSH := termblog-ssh.log
-URL_WEB := http://127.0.0.1:8080
-URL_SSH := ssh://0.0.0.0:22
+URL_WEB := http://$(shell hostname):8080
+URL_SSH := ssh://0.0.0.0:2222
 
-.PHONY: all build build-frontend \
+PREFIX ?= /usr/local
+ETCDIR ?= $(PREFIX)/etc
+
+.PHONY: all build build-frontend install \
         run run-ssh \
         start start-ssh stop stop-ssh restart restart-ssh \
         status status-ssh logs logs-ssh clean
@@ -35,9 +42,24 @@ frontend/node_modules: frontend/package.json
 build-frontend: frontend/node_modules
 	cd frontend && npm run build
 
-# ── 构建: 一次产出 web + ssh 两个二进制 ──
+# ── 构建: 一次产出 web + ssh + jaild 三个二进制 ──
 build: build-frontend
 	cargo build --release
+
+# ── 部署(需要 root): 二进制 -> sbin, 前端 -> share, rc 脚本 -> etc/rc.d ──
+install: build
+	install -d $(DESTDIR)$(PREFIX)/sbin
+	install -d $(DESTDIR)$(PREFIX)/share/termblog/frontend
+	install -d $(DESTDIR)$(ETCDIR)/rc.d
+	install -m 555 $(BIN_WEB) $(DESTDIR)$(PREFIX)/sbin/termblog-web
+	install -m 555 $(BIN_SSH) $(DESTDIR)$(PREFIX)/sbin/termblog-ssh
+	install -m 555 $(BIN_JAILD) $(DESTDIR)$(PREFIX)/sbin/jaild
+	cp -R frontend/dist/. $(DESTDIR)$(PREFIX)/share/termblog/frontend/
+	install -m 644 etc/termblog.toml $(DESTDIR)$(ETCDIR)/termblog.toml.sample
+	install -m 555 etc/rc.d/jaild etc/rc.d/termblog $(DESTDIR)$(ETCDIR)/rc.d/
+	@echo ">> 已安装到 $(DESTDIR)$(PREFIX)"
+	@echo ">> 配置样例: $(ETCDIR)/termblog.toml.sample (复制为 termblog.toml 后按需修改)"
+	@echo ">> 启用: sysrc jaild_enable=YES termblog_enable=YES"
 
 # ── 前台运行(Ctrl-C 停止) ──
 run: build

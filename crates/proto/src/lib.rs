@@ -1,11 +1,13 @@
-//! 接入层(web/ssh) 与会话后端之间共享的唯一契约: 极简二进制帧。
+//! 接入层(web/ssh) 与会话后端(jaild)之间共享的唯一契约: 极简二进制帧。
 //!
 //! 线上格式: `u8 kind | u32 len(大端) | payload`
 //! - `Data` 帧 payload 是裸 PTY 字节(ANSI/OSC 原样穿透, web 与 ssh 画面一致的根本保证)
 //! - 其余帧 payload 是 JSON
 //!
-//! WS 约定: 一个 binary message 恰好承载一个帧, 所以网关是纯透传、零协议转换。
-//! (M3 接 Unix socket 字节流时, 在这里再加一个处理粘包的流式 Decoder 即可)
+//! 两条传输各有天然的消息边界, 无需任何粘包处理:
+//! - WS: 一个 binary message 恰好承载一个帧(axum 保证消息完整), decode_one 直接解
+//! - Unix socket: SOCK_SEQPACKET 按消息收发, 一次 send = 一次 recv(见 core/link.rs)
+//! 因此帧解码只有「整条消息 -> 帧」这一步, 流式 Decoder 已删除。
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -23,8 +25,10 @@ pub struct Open {
     /// 无此字段(或 token 已失效) => 开新会话。
     #[serde(default)]
     pub attach_token: Option<String>,
-    // 注意: peer_ip 不放在这里(客户端不可信)。M3 拆进程后由网关在发往 jaild 的
-    // Open 里自行填入真实对端 IP, 配额判定才有意义。
+    /// 真实对端 IP, 由网关(web/ssh 接入层)填入, 客户端不可信。
+    /// jaild 据此做每 IP 配额判定(单一事实来源)。
+    #[serde(default)]
+    pub peer_ip: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -79,14 +83,54 @@ pub fn encode(f: &Frame) -> Bytes {
     b.freeze()
 }
 
-/// 解码一条完整的消息(WS binary message 恰为一帧, 不多不少)
+/// 解码一条完整的消息(WS binary message / socket 一次 recv 恰为一帧, 不多不少)。
+/// 帧头声明的长度超过 MAX_FRAME、或与消息实际长度不符, 都视为协议错误返回 None。
 pub fn decode_one(b: &[u8]) -> Option<Frame> {
     if b.len() < 5 {
         return None;
     }
     let len = u32::from_be_bytes(b[1..5].try_into().ok()?) as usize;
-    if b.len() != 5 + len {
+    if len > MAX_FRAME as usize || b.len() != 5 + len {
         return None;
     }
     Some(Frame { kind: b[0], payload: Bytes::copy_from_slice(&b[5..]) })
+}
+
+/// 单帧 payload 上限(1 MiB)。PTY 输出/键入远小于此; 超限视为协议错误, 断开。
+pub const MAX_FRAME: u32 = 1 << 20;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip() {
+        let f = Frame::json(OPEN, &Open { cols: 80, rows: 24, attach_token: None, peer_ip: None });
+        let got = decode_one(&encode(&f)).expect("frame");
+        assert_eq!(got.kind, OPEN);
+        let o: Open = got.parse().unwrap();
+        assert_eq!(o.cols, 80);
+    }
+
+    #[test]
+    fn data_roundtrip() {
+        let f = Frame::data(vec![1u8, 2, 3, 4, 5]);
+        let got = decode_one(&encode(&f)).expect("frame");
+        assert_eq!(&got.payload[..], &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn oversize_rejected() {
+        let mut wire = BytesMut::new();
+        wire.put_u8(DATA);
+        wire.put_u32(MAX_FRAME + 1);
+        assert!(decode_one(&wire).is_none());
+    }
+
+    #[test]
+    fn truncated_rejected() {
+        let f = Frame::data(vec![1u8, 2, 3]);
+        let wire = encode(&f);
+        assert!(decode_one(&wire[..wire.len() - 1]).is_none());
+    }
 }

@@ -1,16 +1,14 @@
 //! termblog-ssh [降权]: russh 实现的 SSH 接入层, 独立二进制, 与 web 进程完全分离。
 //!
-//! 每个 ssh 连接通过 SessionManager::create 开自己的独立会话(PTY + zsh),
-//! 与 web 会话互不共享; 两边共享的只是 termblog-core 里的会话核心代码
-//! (PTY 泵 / 配额 / 回收逻辑)。接入层各自持有自己的 SessionManager,
-//! 互不知晓彼此的存在。
+//! 每个 ssh 连接经 SessionClient(Unix socket -> jaild)开自己的独立会话
+//! (PTY + jail + zsh), 与 web 会话互不共享; 配额单一事实来源在 jaild。
 //!
-//! 只做 SSH <-> core 的最小翻译:
+//! 只做 SSH <-> 会话的最小翻译:
 //!   pty_request          -> 记 winsize
-//!   shell_request        -> SessionManager::create + 起下行泵
+//!   shell_request        -> client.open + 起下行泵
 //!   data                 -> 键入进 PTY
 //!   window_change        -> Control::Resize
-//!   channel eof/close    -> drop 句柄, 触发 core 侧回收
+//!   channel eof/close    -> drop 句柄, 触发后端侧回收
 //!
 //! 安全面: 免密但只放行约定用户名(默认 blog); 只实现 shell 会话最小子集,
 //! exec / subsystem / port-forward / agent-forward 一律拒绝(靠 russh 默认拒绝,
@@ -25,7 +23,7 @@ use bytes::Bytes;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Config, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, Pty};
-use termblog_core::{Control, SessionManager};
+use termblog_core::{Control, SessionClient};
 use tokio::sync::{broadcast, mpsc};
 
 /// SSH 接入层配置
@@ -48,9 +46,9 @@ impl Default for SshConfig {
     }
 }
 
-/// 拉起 SSH 接入层。mgr 由调用方(本 crate 的 bin)构造, 与 web 进程各自独立。
+/// 拉起 SSH 接入层。client 由调用方(本 crate 的 bin)构造, 与 web 进程各自独立。
 /// 返回的 Future 即 accept 循环, 调用方 await 即可。
-pub async fn run(mgr: SessionManager, cfg: SshConfig) -> Result<()> {
+pub async fn run(client: SessionClient, cfg: SshConfig) -> Result<()> {
     let key = load_or_create_host_key(&cfg.host_key)?;
     let config = Arc::new(Config {
         keys: vec![key],
@@ -60,14 +58,14 @@ pub async fn run(mgr: SessionManager, cfg: SshConfig) -> Result<()> {
         .await
         .with_context(|| format!("ssh bind {}", cfg.listen))?;
     let user = cfg.user.clone();
-    let mut server = SshServer { mgr, user };
+    let mut server = SshServer { client, user };
     // RunningServer 本身是 Future(accept 循环), 直接 await 到关闭
     server.run_on_socket(config, &listener).await?;
     Ok(())
 }
 
 struct SshServer {
-    mgr: SessionManager,
+    client: SessionClient,
     user: String,
 }
 
@@ -76,7 +74,7 @@ impl Server for SshServer {
 
     fn new_client(&mut self, peer: Option<SocketAddr>) -> SshHandler {
         SshHandler {
-            mgr: self.mgr.clone(),
+            client: self.client.clone(),
             user: self.user.clone(),
             peer: peer
                 .map(|a| a.ip())
@@ -96,7 +94,7 @@ struct Active {
 }
 
 struct SshHandler {
-    mgr: SessionManager,
+    client: SessionClient,
     user: String,
     peer: IpAddr,
     winsize: (u16, u16),
@@ -112,7 +110,7 @@ impl SshHandler {
         }
     }
 
-    /// 断开接入 => drop 通道端点, core 泵发现 input 关闭后回收会话。
+    /// 断开接入 => drop 通道端点, jaild 泵发现 input 关闭后回收会话。
     /// 注意不 abort 下行泵: 让它自然走到 broadcast::Closed, 由它给客户端
     /// 补发 exit_status + close, 否则客户端(如 stdin 提前 EOF 的 ssh)会干等。
     fn drop_session(&mut self) {
@@ -161,8 +159,9 @@ impl Handler for SshHandler {
 
     async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
         let (cols, rows) = self.winsize;
-        match self.mgr.create(self.peer, cols, rows).await {
+        match self.client.open(self.peer, cols, rows, None).await {
             Ok(s) => {
+                tracing::info!(peer = %self.peer, sid = %s.id, "会话创建成功");
                 let termblog_core::SessionHandle {
                     input,
                     mut output,
@@ -194,10 +193,17 @@ impl Handler for SshHandler {
                     control,
                     _pump: pump,
                 });
-                session.channel_success(channel)?;
+                // channel_success 写失败(客户端已断/channel 已关)时不要用 `?`
+                // 返回 Err —— russh 会把 handler 的 Err 翻译成 CHANNEL_FAILURE,
+                // 客户端就会看到 "shell request failed" 而实际会话已建好。
+                // 这里只记日志: 连接既已半死, Active 随 handler 被 drop 自然回收。
+                if let Err(e) = session.channel_success(channel) {
+                    tracing::warn!(%e, "channel_success 写失败(连接可能已断)");
+                }
             }
             Err(e) => {
-                // 配额超限等: 告知原因, 拒绝 shell 请求(单一事实来源在 core)
+                // 配额超限等: 告知原因, 拒绝 shell 请求(单一事实来源在 jaild)
+                tracing::warn!(peer = %self.peer, error = %e, "会话创建失败, 拒绝 shell 请求");
                 let handle = session.handle();
                 let msg = format!("\x1b[31m[无法创建会话: {e}]\x1b[0m\r\n");
                 let _ = handle.data(channel, Bytes::from(msg)).await;

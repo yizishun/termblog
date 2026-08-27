@@ -1,14 +1,19 @@
 [package]
-name = "termblog-ssh"
+name = "termblog-jaild"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "termblog-jaild"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+nix.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3"
+libc = "0.2"
 termblog-core = { path = "../core" }
-russh = "0.63"
-rand = "0.10"
+termblog-proto = { path = "../proto" }

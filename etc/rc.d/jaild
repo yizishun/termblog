@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# PROVIDE: jaild
+# REQUIRE: LOGIN zfs
+# BEFORE: termblog
+# KEYWORD: shutdown
+
+# jaild [root]: termblog 特权守护进程(每访客一个 ephemeral jail)。
+# 监听 /var/run/termblog.sock(0660 root:www), 必须跑在 root。
+
+. /etc/rc.subr
+
+name="jaild"
+rcvar="jaild_enable"
+
+command="/usr/sbin/daemon"
+command_args="-p /var/run/jaild.pid -o /var/log/jaild.log /usr/local/sbin/jaild"
+pidfile="/var/run/jaild.pid"
+
+load_rc_config "$name"
+: "${jaild_enable:=NO}"
+
+run_rc_command "$1"
