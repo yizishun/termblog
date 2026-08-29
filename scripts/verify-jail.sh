@@ -50,7 +50,7 @@ echo "== 2. ssh 会话跑在真实 jail 里 =="
 # 先 sleep 2 等会话建好再投喂命令: 服务刚重启后冷 clone 较慢, 命令早到
 # 会撞上会话创建窗口(曾导致一次性竞态失败)。
 (sleep 2; printf 'echo IN_JAIL_$((39+3))\n'; printf 'id -un\n'; printf 'hostname\n'; \
-  printf 'sleep 8\n'; sleep 9) \
+  printf 'pwd\n'; printf 'sleep 8\n'; sleep 9) \
     | timeout 20 $SSH 2>&1 | tr -d '\r' > /tmp/tb-verify1.txt &
 SSHPID=$!
 sleep 5
@@ -65,6 +65,8 @@ grep -q "^guest$" /tmp/tb-verify1.txt
 check $? "jail 内以 guest 身份运行"
 grep -q "^blog$" /tmp/tb-verify1.txt
 check $? "jail hostname=blog"
+grep -q "^/home/guest$" /tmp/tb-verify1.txt
+check $? "起始目录为 guest 家目录 (/home/guest)"
 
 echo "== (等 8s: 会话回收, 释放每 IP 配额) =="
 sleep 8

@@ -211,6 +211,9 @@ fn spawn_inner(
     let arg0 = CString::new("-zsh")?; // argv[0] 以 '-' 开头 => login shell
     let argv: [*const c_char; 2] = [arg0.as_ptr(), std::ptr::null()];
     let home_c = CString::new(format!("HOME={home}"))?;
+    // chdir(2) 要裸路径("HOME=/home/guest" 是环境串, 传它会 ENOENT 且静默
+    // 留在 /); 环境串与路径分开备好(子进程里不分配内存)
+    let home_dir = CString::new(home.clone())?;
     let term_c = CString::new("TERM=xterm-256color")?;
     let path_c = CString::new("PATH=/usr/local/bin:/usr/bin:/bin")?;
     let envp: [*const c_char; 4] =
@@ -243,7 +246,11 @@ fn spawn_inner(
             libc::setgroups(0, std::ptr::null());
             libc::setgid(gid);
             libc::setuid(uid);
-            libc::chdir(home_c.as_ptr());
+            // 失败不致命(shell 落在 / 也比会话打不开强), 但要在 PTY 上留痕
+            if libc::chdir(home_dir.as_ptr()) != 0 {
+                let msg = b"chdir home failed\n";
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+            }
             libc::execve(zsh.as_ptr(), argv.as_ptr(), envp.as_ptr());
             let msg = b"exec zsh failed\n";
             libc::write(2, msg.as_ptr().cast(), msg.len());
