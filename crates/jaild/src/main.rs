@@ -42,16 +42,11 @@ async fn main() -> Result<()> {
     let cfg_path = std::env::var("TERMBLOG_CONFIG").ok();
     let cfg = Config::load(cfg_path.as_deref().map(Path::new))?;
 
-    // 启动残留回收: 上次崩溃遗留的 s-* 全部销毁(幂等)
-    JailBackend::sweep(&cfg.jail)?;
-    // devfs 规则集 4(FreeBSD 14+ 不自带, 缺了 jail 里没有 /dev)
-    ensure_devfs_ruleset();
-
-    let mgr = SessionManager::new(
-        JailBackend::new(cfg.jail.clone()),
-        Quota { max_total: cfg.session.max_total, max_per_ip: cfg.session.max_per_ip },
-    );
-
+    // 先绑 socket 再做耗时启动步骤: 残留会话的 sweep(jail -r 杀进程 +
+    // zfs destroy)可达 10s+(现场: 14:52:47 重启, 14:52:58 才就绪), 若
+    // socket 晚于 sweep 才绑, 重启窗口里的连接会被直接拒绝。现在连接
+    // 只在 backlog 里排队, accept 循环在所有启动步骤完成后才开始,
+    // 排队的连接随后照常握手——sweep 期间没有任何新会话, 零竞态。
     let socket = cfg.jail.socket.clone();
     let _ = std::fs::remove_file(&socket);
     let mut listener =
@@ -68,7 +63,18 @@ async fn main() -> Result<()> {
         Ok(None) => warn!("系统没有 www 组, socket 保持 root 属组"),
         Err(e) => warn!(%e, "查找 www 组失败"),
     }
-    info!(socket = %socket.display(), "jaild 启动");
+    info!(socket = %socket.display(), "socket 已监听(启动步骤未完成, 连接先排队)");
+
+    // 启动残留回收: 上次崩溃遗留的 s-* 全部销毁(幂等)
+    JailBackend::sweep(&cfg.jail)?;
+    // devfs 规则集 4(FreeBSD 14+ 不自带, 缺了 jail 里没有 /dev)
+    ensure_devfs_ruleset();
+
+    let mgr = SessionManager::new(
+        JailBackend::new(cfg.jail.clone()),
+        Quota { max_total: cfg.session.max_total, max_per_ip: cfg.session.max_per_ip },
+    );
+    info!(socket = %socket.display(), "jaild 就绪, 开始 accept");
 
     loop {
         match listener.accept().await {

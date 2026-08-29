@@ -45,6 +45,30 @@ PERM=$(stat -f '%Sp %Su:%Sg' /var/run/termblog.sock 2>/dev/null)
 check $? "socket 权限 0660 root:www (实际: $PERM)"
 
 echo "== 2. ssh 会话跑在真实 jail 里 =="
+# 就绪探针: 部署刚重启后, jaild 要先 sweep 残留会话(有泄漏时 10s+),
+# 期间 socket 虽已监听但尚未 accept(2026-08-29 现场: 14:52:47 重启、
+# 14:52:58 才就绪, 首连 14:52:50 被拒, 输出文件全空整组假失败)。
+# 用重试小会话确认链路就绪再开观察组, 未就绪时明确失败而非留空文件。
+# 注意: 管道必须留 stdin 打开——"会话断开即回收"语义下, printf 一结束
+# stdin 即 EOF, ssh 立刻关通道、会话即刻被回收, shell 根本来不及执行
+# echo(2026-08-29 现场: 8 次探针全是"会话创建 → 1ms 后回收", 假失败)。
+# 与 run_ssh 同款写法: 命令后 sleep 撑住存活窗口。
+ready=0
+for _ in 1 2 3 4 5 6 7 8; do
+    if (printf 'echo TB_READY_$((6*7))\n'; sleep 3) | timeout 10 $SSH 2>/dev/null | grep -q TB_READY_42; then
+        ready=1; break
+    fi
+    sleep 3
+done
+if [ "$ready" -ne 1 ]; then
+    echo "!! 就绪探针 8 次均失败, 第 2 组观察跳过(查 jaild/ssh 两个日志确认链路状态)"
+    check 1 "存在会话 jail (jls)"
+    check 1 "存在会话数据集 (zfs list)"
+    check 1 "jail 内 shell 可用"
+    check 1 "jail 内以 guest 身份运行"
+    check 1 "jail hostname=blog"
+    check 1 "起始目录为 guest 家目录 (/home/guest)"
+else
 # 新语义: 会话断开即回收, jls/zfs 观察必须趁会话还活着做——后台起会话
 # (末条命令 sleep 8 撑住存活窗口), 先查 jls/zfs, 再 wait 收尾验输出。
 # 先 sleep 2 等会话建好再投喂命令: 服务刚重启后冷 clone 较慢, 命令早到
@@ -67,6 +91,7 @@ grep -q "^blog$" /tmp/tb-verify1.txt
 check $? "jail hostname=blog"
 grep -q "^/home/guest$" /tmp/tb-verify1.txt
 check $? "起始目录为 guest 家目录 (/home/guest)"
+fi
 
 echo "== (等 8s: 会话回收, 释放每 IP 配额) =="
 sleep 8
