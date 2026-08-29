@@ -148,9 +148,10 @@ pub struct ShellChild {
   - `input` mpsc 有数据 → 写 PTY master；
   - `Control::Resize` → `ioctl(TIOCSWINSZ)` + `SIGWINCH`；
   - shell 退出（EOF/SIGCHLD）→ 通知观察者 → `backend.cleanup` → 移出会话表。
-- **空闲回收**：无任何观察者且超过 `idle_grace`（默认 60s）→ 销毁。这个宽限期
-  即"刷新页面不丢会话"的重连窗口：WS 重连时带上 session token 可 attach 回原会话。
-- **核心决策（默认）**：每个连接一个独立 jail 会话；重连 attach 仅限持有原 token
+- **回收语义**：socket 断开 = 会话立即回收（jaild 不设宽限期）。"刷新页面不丢
+  会话"的重连窗口完全由 web 层实现（web 进程替浏览器捧会话 60s + scrollback
+  回放）；跨进程 attach（web 崩溃后接回）明确不做。
+- **核心决策（默认）**：每个连接一个独立 jail 会话；web 层重连仅限持有原 token
   的同一访客。web 与 ssh 不共享会话（未来若要"ssh 接管 web 会话"，broadcast 输出
   通道已天然支持多观察者，只需加认证即可，架构不用改）。
 
@@ -230,7 +231,7 @@ cleanup(sid):
   - `pty_req(term, cols, rows)` → 记录 winsize；`shell_req` → 向 jaild 发 `Open`
     → 泵 channel data ↔ `Data` 帧；
   - `window_change_req` → `Resize` 帧；
-  - 收 `Closed` → `exit_status` + 关 channel；channel 关 → 断开 socket（触发宽限回收）。
+  - 收 `Closed` → `exit_status` + 关 channel；channel 关 → 断开 socket（会话立即回收）。
 - 禁 exec/subsystem/port-forward/agent-forward，只实现 shell 会话最小子集。
 - host key 持久化在 `/var/db/termblog/ssh_host_ed25519`，首次启动自动生成。
 
@@ -275,15 +276,16 @@ cleanup(sid):
    脚本 + rctl + 启动残留回收；web/ssh 降权运行。
    ✔ 验收：并发多访客互不可见；fork bomb 被 rctl 掐死；断线 60s 后 jail 消失；
    `zfs list` 无泄漏；termblogd 以 www 用户运行。
-4. **M4 打磨**：attach 重连、配额/限流、hard lifetime、日志（tracing）、rc 脚本、
-   单文件部署。✔ 验收：真机 FreeBSD 15.0 上线跑通；破坏性自测
-   （fork 炸弹、写盘打满、内存打满、会话占满）全部通过。
+4. **M4 打磨（剩余）**：接入层握手限流、hard lifetime、jaild 优雅停机
+   （SIGTERM 回收全部会话）、web 宽限期配置化。✔ 验收：真机 FreeBSD
+   上线跑通；破坏性自测（fork 炸弹、写盘打满、内存打满、会话占满）全部通过。
 
 ## 10. 明确不做（本期）
 
 Anubis / dmesg 开机动画、comment、/proc/blog、CTF、webctl 具体命令的实现
 （仅留 OSC handler 注册点与 webctl crate 骨架）、SEO 静态镜像、多观察者共享会话、
-jail 预热池（秒开优化，接口上兼容，后续加）。
+jail 预热池（秒开优化，接口上兼容，后续加）、UFS 后端（非 ZFS 机器）、
+跨进程 attach scrollback 回放（web 崩溃后接回；恢复机制只在 web 层）。
 
 ## 11. 风险与预案
 
