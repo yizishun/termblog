@@ -28,10 +28,13 @@ termblog_start()
     touch /var/log/termblog-web.log /var/log/termblog-ssh.log
     chown "$termblog_user" /var/log/termblog-web.log /var/log/termblog-ssh.log
 
-    /usr/sbin/daemon -u "$termblog_user" -p /var/run/termblog-web.pid \
-        -o /var/log/termblog-web.log /usr/local/sbin/termblog-web
-    /usr/sbin/daemon -u "$termblog_user" -p /var/run/termblog-ssh.pid \
-        -o /var/log/termblog-ssh.log /usr/local/sbin/termblog-ssh
+    # -H/-P 同上: 配合 newsyslog 轮转(SIGHUP -> daemon 重开输出文件)
+    /usr/sbin/daemon -H -u "$termblog_user" -p /var/run/termblog-web.pid \
+        -P /var/run/termblog-web-super.pid -o /var/log/termblog-web.log \
+        /usr/local/sbin/termblog-web
+    /usr/sbin/daemon -H -u "$termblog_user" -p /var/run/termblog-ssh.pid \
+        -P /var/run/termblog-ssh-super.pid -o /var/log/termblog-ssh.log \
+        /usr/local/sbin/termblog-ssh
 }
 
 termblog_stop()

@@ -14,7 +14,9 @@ name="jaild"
 rcvar="jaild_enable"
 
 command="/usr/sbin/daemon"
-command_args="-p /var/run/jaild.pid -o /var/log/jaild.log /usr/local/sbin/jaild"
+# -H: 收到 SIGHUP 时 close+reopen 输出文件(newsyslog 轮转日志用)
+# -p: 子进程 pid(rc stop 用)  -P: 监督进程 pid(newsyslog 发 SIGHUP 的目标)
+command_args="-H -p /var/run/jaild.pid -P /var/run/jaild-super.pid -o /var/log/jaild.log /usr/local/sbin/jaild"
 pidfile="/var/run/jaild.pid"
 
 load_rc_config "$name"

@@ -63,6 +63,12 @@ elif [ ! -f /usr/local/etc/termblog.toml ]; then
     cp /usr/local/etc/termblog.toml.sample /usr/local/etc/termblog.toml
 fi
 install -m 555 "$REPO/etc/rc.d/jaild" "$REPO/etc/rc.d/termblog" /usr/local/etc/rc.d/
+# 日志轮转配置(newsyslog 每小时跑一次; 超 500KB 轮转, 归档 7 份)
+install -d /usr/local/etc/newsyslog.conf.d
+install -m 644 "$REPO/etc/newsyslog.conf.d/termblog.conf" /usr/local/etc/newsyslog.conf.d/
+# 开机自启: rc 框架只拉起 rcvar=YES 的脚本; 本脚本的 daemon 直起只是滚动重启
+sysrc jaild_enable=YES termblog_enable=YES >/dev/null
+echo ">> 已启用开机自启: jaild_enable=YES termblog_enable=YES"
 
 # ── 5. 运行时目录(降权 www 需要写的部分) ──
 mkdir -p /var/db/termblog /var/log
@@ -78,10 +84,11 @@ start_daemon() { # $1=服务名 $2=用户(可空) $3=二进制
         sleep 0.5
     fi
     rm -f "$pidf"
+    # -H: SIGHUP 时重开输出文件(newsyslog 轮转) -P: 监督进程 pid 供轮转发信号
     if [ -n "$2" ]; then
-        daemon -u "$2" -p "$pidf" -o "/var/log/$1.log" "$3"
+        daemon -H -u "$2" -p "$pidf" -P "/var/run/$1-super.pid" -o "/var/log/$1.log" "$3"
     else
-        daemon -p "$pidf" -o "/var/log/$1.log" "$3"
+        daemon -H -p "$pidf" -P "/var/run/$1-super.pid" -o "/var/log/$1.log" "$3"
     fi
     echo ">> $1 已启动/重启"
 }
