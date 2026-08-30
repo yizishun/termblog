@@ -83,10 +83,17 @@ async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {
     };
     let open: proto::Open = open;
 
-    // 2) attach 优先; token 缺失/失效(会话已回收)则开新会话,
-    //    由 Opened.attached 告知前端是恢复还是新开(前端据此重置屏幕)
+    // 2) 会话获取。fresh(镜像页)一律开新会话: 每次落地都是干净 shell,
+    //    浏览器无需判断旧 shell 状态(在文章里/别的分页器/提示符)——状态判断
+    //    与恢复按键整块删除。开新会话前回收旧 token 的闲置会话, 配额即时释放。
+    //    非 fresh 走 attach 优先; token 缺失/失效(会话已回收)则开新会话,
+    //    由 Opened.attached 告知前端是恢复还是新开(前端据此重置屏幕)。
     let mut conn = None;
-    if let Some(token) = open.attach_token.as_deref() {
+    if open.fresh {
+        if let Some(token) = open.attach_token.as_deref() {
+            store.reset(token);
+        }
+    } else if let Some(token) = open.attach_token.as_deref() {
         conn = store.attach(token).await;
     }
     let conn = match conn {

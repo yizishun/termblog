@@ -183,6 +183,19 @@ impl SessionStore {
         })
     }
 
+    /// fresh 开局前的旧会话回收(镜像页 Open.fresh=1 时由网关调用):
+    /// token 对应的会话若无其它连接在用(connections==0), 立即移出持有表 ——
+    /// 条目 drop → 转发 task 清理 → socket 断开 → jaild 回收 jail, 配额即时释放
+    /// (不等 60s 宽限, 快速切换文章也不会顶到每 IP 配额)。有别的标签页还在用
+    /// (connections>0)则保留给那个标签页。token 不存在(会话已终结)则无操作。
+    pub fn reset(&self, token: &str) {
+        let mut table = self.table.lock().unwrap();
+        let idle = table.get(token).map(|s| s.connections == 0).unwrap_or(false);
+        if idle {
+            table.remove(token);
+        }
+    }
+
     /// WS 断开: 连接计数 -1; 归零则启动宽限定时器, 到点把会话移出持有表
     /// (发送端被 drop => jaild 侧 socket 断开 => 会话立即回收)
     pub fn detach(&self, token: &str) {

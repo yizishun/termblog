@@ -18,6 +18,7 @@
 BIN_WEB := target/release/termblog-web
 BIN_SSH := target/release/termblog-ssh
 BIN_JAILD := target/release/termblog-jaild
+BIN_CONTENT := target/release/content-build
 PID_WEB := .termblog-web.pid
 PID_SSH := .termblog-ssh.pid
 LOG_WEB := termblog-web.log
@@ -28,7 +29,7 @@ URL_SSH := ssh://0.0.0.0:2222
 PREFIX ?= /usr/local
 ETCDIR ?= $(PREFIX)/etc
 
-.PHONY: all build build-frontend install \
+.PHONY: all build build-frontend build-content install \
         run run-ssh \
         start start-ssh stop stop-ssh restart restart-ssh \
         status status-ssh logs logs-ssh clean
@@ -42,9 +43,16 @@ frontend/node_modules: frontend/package.json
 build-frontend: frontend/node_modules
 	cd frontend && npm run build
 
-# ── 构建: 一次产出 web + ssh + jaild 三个二进制 ──
+# ── 内容编译器: md → HTML 镜像(进 dist) + ANSI 预渲染(进 jailtpl/content/.rendered) ──
+# 注意顺序: 必须在 vite build 之后跑(产物写入 dist 且需读 assets/index-*.js)
+build-content:
+	cargo build --release -p content-build
+	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
+
+# ── 构建: 一次产出 web + ssh + jaild 三个二进制 + 前端 + 内容镜像 ──
 build: build-frontend
 	cargo build --release
+	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
 
 # ── 部署(需要 root): 二进制 -> sbin, 前端 -> share, rc 脚本 -> etc/rc.d ──
 install: build
@@ -133,3 +141,4 @@ clean:
 	cargo clean
 	rm -f $(PID_WEB) $(PID_SSH) $(LOG_WEB) $(LOG_SSH)
 	rm -rf frontend/dist
+	rm -rf jailtpl/content/.rendered

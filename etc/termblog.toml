@@ -4,6 +4,9 @@
 # 生产直连公网; 后续想挂反代/Anubis 时改回 127.0.0.1:8080
 listen = "0.0.0.0:8080"
 static_dir = "/usr/local/share/termblog/frontend"
+# 站点对外绝对地址(不带尾斜杠)。canonical/sitemap/atom/OG 用;不设则镜像页
+# 照常生成, 只是不产出 sitemap/atom 与 canonical(部署后务必设置!)
+# site_url = "https://your-real-domain.example.com"
 
 [ssh]
 # 降权 www 跑不了特权端口 22, 生产用 2222

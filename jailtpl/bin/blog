@@ -1,0 +1,81 @@
+#!/bin/sh
+# blog —— 文章阅读入口(termblog M5)。
+# 接口像 cat: 任意路径的 md 都能读, 任意目录层级(相对 cwd / 相对 ~/blog / 绝对)。
+# 内容上更聪明: ~/blog/ 下的文章读预渲染排版 ~/.rendered/<slug>(76 列折行、
+# 标题加粗/表格对齐等由 content-build 构建期算好); 没有产物的才退回原始 md。
+# cat/less 任何时候读的都是原始未渲染的 markdown。
+#   blog                列出文章(~/.rendered/.index)
+#   blog hello          = blog ~/blog/hello.md, 读预渲染排版
+#   blog <其他文件.md>   像 cat 一样读原始内容(不渲染、不同步地址栏)
+# 读 ~/blog/ 下文章时: 进入同步地址栏 /blog/<slug>/(尾斜杠 = canonical 形态),
+# 退出分页器后复位 /。交互终端用 less -RXc 分页(-R 解释颜色/粗体, -X 不进
+# 备用屏不闪屏, -c 清屏重画, attach 回放不叠旧画面), 非交互管道直接 cat。
+# 模板构建时由 build-template.sh 安装到 /usr/local/bin(0555)。
+
+set -eu
+R="$HOME/blog"        # 文章目录: 与 URL 前缀 /blog/ 一一对应
+D="$HOME/.rendered"   # 预渲染产物(工具目录, ls 默认不可见)
+
+case "${1:-}" in
+    "")
+        if [ -f "$D/.index" ]; then
+            cat "$D/.index"
+        else
+            echo "暂无文章(模板里没有 .rendered/.index, 重建模板试试)"
+        fi
+        ;;
+    *)
+        # 解析文件: 原样(相对 cwd / 绝对)→ 相对 ~/blog → ~/blog/<名>.md(blog hello 简写)
+        file=""
+        for cand in "$1" "$R/$1" "$R/$1.md"; do
+            if [ -f "$cand" ]; then
+                file=$cand
+                break
+            fi
+        done
+        if [ -z "$file" ]; then
+            echo "blog: 没有这个文件: $1 (敲 blog 看列表)" >&2
+            exit 1
+        fi
+        # 规范化成绝对路径(相对 cwd 的补 $PWD), 便于按 ~/blog/ 前缀算 slug
+        case "$file" in
+            /*) ;;
+            *) file="$PWD/$file" ;;
+        esac
+
+        # 文件在 ~/blog/ 下 → 算 slug 并同步地址栏(带尾斜杠 = canonical 形态)
+        # slug 白名单 [a-z0-9/-] 与内容编译器一致, 违规则不同步(仅阅读)
+        slug=""
+        case "$file" in
+            "$R/"*.md)
+                slug=${file#"$R/"}
+                slug=${slug%.md}
+                ;;
+        esac
+        case "$slug" in
+            *[!a-z0-9/-]*|""|*/|*//*) slug="" ;;
+        esac
+        if [ -n "$slug" ] && command -v webctl >/dev/null 2>&1; then
+            webctl url "/blog/$slug/"
+        fi
+
+        # 内容源: 文章优先读预渲染排版; 无产物(模板建成后才加的 md)退回原始文件
+        if [ -n "$slug" ] && [ -f "$D/$slug" ]; then
+            src="$D/$slug"
+        else
+            src="$file"
+            if [ -n "$slug" ]; then
+                echo "blog: 「$slug」无预渲染产物, 显示原始 markdown(重建模板后即排版)" >&2
+            fi
+        fi
+
+        if [ -t 0 ]; then
+            less -RXc "$src" || true
+        else
+            cat "$src"
+        fi
+        if [ -n "$slug" ] && command -v webctl >/dev/null 2>&1; then
+            webctl url /
+        fi
+        ;;
+esac

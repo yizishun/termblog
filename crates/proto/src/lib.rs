@@ -25,6 +25,11 @@ pub struct Open {
     /// 无此字段(或 token 已失效) => 开新会话。
     #[serde(default)]
     pub attach_token: Option<String>,
+    /// true = 本连接要一个全新会话, 跳过 attach(镜像页用它: 每次落地都是
+    /// 干净 shell, 无需判断旧 shell 状态)。若同时带了 attach_token, 网关
+    /// 会在开新会话前回收该 token 的闲置旧会话(见 web 的 SessionStore::reset)。
+    #[serde(default)]
+    pub fresh: bool,
     /// 真实对端 IP, 由网关(web/ssh 接入层)填入, 客户端不可信。
     /// jaild 据此做每 IP 配额判定(单一事实来源)。
     #[serde(default)]
@@ -105,7 +110,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let f = Frame::json(OPEN, &Open { cols: 80, rows: 24, attach_token: None, peer_ip: None });
+        let f = Frame::json(OPEN, &Open { cols: 80, rows: 24, attach_token: None, fresh: false, peer_ip: None });
         let got = decode_one(&encode(&f)).expect("frame");
         assert_eq!(got.kind, OPEN);
         let o: Open = got.parse().unwrap();

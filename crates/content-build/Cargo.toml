@@ -1,0 +1,11 @@
+[package]
+name = "content-build"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+pulldown-cmark = "0.13"
+termblog-core = { path = "../core" }
+unicode-width = "0.2"

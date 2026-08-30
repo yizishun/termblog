@@ -10,3 +10,5 @@ dist
 ssh_host_ed25519*
 # 本地说明文档, 不入库
 m3.md
+# 内容编译产物(由 content-build 生成, 勿手改、勿提交)
+jailtpl/content/.rendered/

@@ -52,11 +52,18 @@ pub struct WebConfig {
     pub listen: String,
     /// 前端静态资源目录(安装布局下为绝对路径)
     pub static_dir: String,
+    /// 站点对外绝对地址(https://host[:port], 尾部不带 /)。
+    /// canonical / sitemap / atom / OG 的前缀, 仅 content-build 消费。
+    pub site_url: Option<String>,
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
-        Self { listen: "0.0.0.0:8080".into(), static_dir: "frontend/dist".into() }
+        Self {
+            listen: "0.0.0.0:8080".into(),
+            static_dir: "frontend/dist".into(),
+            site_url: None,
+        }
     }
 }
 

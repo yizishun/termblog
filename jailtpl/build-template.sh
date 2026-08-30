@@ -50,21 +50,32 @@ pkg -c "$MOUNT" install -y zsh less tree
 # 5. guest 用户(会话 jail 里降权运行; uid 1001 避开 base 自带用户)
 pw -R "$MOUNT" useradd -n "$GUEST" -u 1001 -d "/home/$GUEST" -s /usr/local/bin/zsh -m
 
-# 6. 定制 zshrc(欢迎语 / 提示符 / 受限 PATH)
+# 6. 定制 zshrc(欢迎语 / 提示符 / 受限 PATH / locale / MOTD)
 cat > "$MOUNT/home/$GUEST/.zshrc" <<'EOF'
 # termblog guest shell —— 每个访客一个真实 FreeBSD jail
 export PATH=/usr/local/bin:/usr/bin:/bin
+export LANG=C.UTF-8
 umask 022
 PS1='%F{green}blog@jail%f %~ %# '
 setopt INTERACTIVE_COMMENTS
+echo '博客: 敲 blog 看文章列表, 读一篇: blog hello (或 blog ~/blog/hello.md)'
 EOF
 
-# 7. 博客内容(可选: jailtpl/content/ 下的文件进 ~/blog)
+# 7. 博客内容: 文章进 ~/blog(与 URL /blog/ 一一对应), 预渲染产物进 ~/.rendered
+#    (hidden 工具目录, 不混进文章); README 是仓库侧写作规范, 不进 jail
 if [ -d "$SCRIPT_DIR/content" ]; then
-    mkdir -p "$MOUNT/home/$GUEST/blog"
-    cp -R "$SCRIPT_DIR/content/." "$MOUNT/home/$GUEST/blog/"
+    mkdir -p "$MOUNT/home/$GUEST/blog" "$MOUNT/home/$GUEST/.rendered"
+    cp -R "$SCRIPT_DIR/content/blog/." "$MOUNT/home/$GUEST/blog/"
+    if [ -d "$SCRIPT_DIR/content/.rendered" ]; then
+        cp -R "$SCRIPT_DIR/content/.rendered/." "$MOUNT/home/$GUEST/.rendered/"
+    fi
 fi
 chown -R 1001:1001 "$MOUNT/home/$GUEST"
+
+# 7.5 blog / webctl 命令(0555, 只读; .rendered 已随第 7 步拷进 ~/.rendered)
+if [ -d "$SCRIPT_DIR/bin" ]; then
+    install -m 555 "$SCRIPT_DIR/bin/blog" "$SCRIPT_DIR/bin/webctl" "$MOUNT/usr/local/bin/"
+fi
 
 # 8. 收尾: 卸 devfs, 清 DNS, 打 snapshot, 模板转只读
 umount -f "$MOUNT/dev" 2>/dev/null || true

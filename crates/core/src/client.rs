@@ -45,7 +45,7 @@ impl SessionClient {
             .await
             .with_context(|| format!("连接 jaild {}", self.socket.display()))?;
 
-        let open = proto::Open { cols, rows, attach_token, peer_ip: Some(peer.to_string()) };
+        let open = proto::Open { cols, rows, attach_token, fresh: false, peer_ip: Some(peer.to_string()) };
         link.send(&proto::Frame::json(proto::OPEN, &open)).await.context("发送 Open")?;
 
         // 第一条回帧: Opened(成功) 或 Closed(配额拒绝等原因)
