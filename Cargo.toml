@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/core", "crates/web", "crates/ssh", "crates/jaild", "crates/content-build"]
+members = [
+    "crates/config",
+    "crates/servers/proto",
+    "crates/servers/core",
+    "crates/servers/web",
+    "crates/servers/ssh",
+    "crates/servers/jaild",
+    "crates/tools/content-build",
+    "crates/tools/jailbin",
+]
 
 [workspace.dependencies]
 anyhow = "1"

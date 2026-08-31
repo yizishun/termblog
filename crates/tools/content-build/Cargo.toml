@@ -7,5 +7,5 @@ edition = "2021"
 anyhow.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 pulldown-cmark = "0.13"
-termblog-core = { path = "../core" }
+termblog-config = { path = "../../config" }
 unicode-width = "0.2"

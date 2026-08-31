@@ -1,6 +1,6 @@
 //! 会话句柄与控制消息: jaild 与接入层(web/ssh)共享的 API 类型。
 //!
-//! SessionHandle 与传输方式无关 —— jaild 的 SessionManager(见 crates/jaild)
+//! SessionHandle 与传输方式无关 —— jaild 的 SessionManager(见 crates/servers/jaild)
 //! 创建会话后返回它, 接入层的 SessionClient 开会话后也返回同型句柄,
 //! 因此两侧代码可以共用这一份类型定义。
 

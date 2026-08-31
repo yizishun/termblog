@@ -23,8 +23,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nix::unistd::Group;
+use termblog_config::Config;
 use termblog_core::link::{Link, LinkListener};
-use termblog_core::{Config, Control};
+use termblog_core::Control;
 use termblog_proto as proto;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};

@@ -362,7 +362,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "pulldown-cmark",
- "termblog-core",
+ "termblog-config",
  "unicode-width",
 ]
 
@@ -2146,17 +2146,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
+name = "termblog-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "termblog-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "serde",
  "termblog-proto",
  "tokio",
  "tokio-seqpacket",
- "toml",
  "tracing",
+]
+
+[[package]]
+name = "termblog-jailbin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -2167,6 +2181,7 @@ dependencies = [
  "bytes",
  "libc",
  "nix 0.29.0",
+ "termblog-config",
  "termblog-core",
  "termblog-proto",
  "tokio",
@@ -2191,6 +2206,7 @@ dependencies = [
  "bytes",
  "rand 0.10.2",
  "russh",
+ "termblog-config",
  "termblog-core",
  "tokio",
  "tracing",
@@ -2205,6 +2221,7 @@ dependencies = [
  "axum",
  "bytes",
  "futures",
+ "termblog-config",
  "termblog-core",
  "termblog-proto",
  "tokio",

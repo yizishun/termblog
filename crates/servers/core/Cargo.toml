@@ -1,5 +1,5 @@
 [package]
-name = "termblog-ssh"
+name = "termblog-core"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,8 +7,6 @@ edition = "2021"
 anyhow.workspace = true
 bytes.workspace = true
 tokio.workspace = true
+tokio-seqpacket.workspace = true
 tracing.workspace = true
-tracing-subscriber = "0.3"
-termblog-core = { path = "../core" }
-russh = "0.63"
-rand = "0.10"
+termblog-proto = { path = "../proto" }

@@ -10,6 +10,7 @@
 //!                 [--config <file>] [--site-url <url>] [--site-title <title>]
 //!
 //! site_url 优先级: --site-url > 配置文件 web.site_url > 无(无则跳过 sitemap/atom)。
+//! site_title 优先级: --site-title > 配置文件 web.site_title > 内置默认。
 
 mod ansi;
 mod feed;
@@ -41,7 +42,7 @@ struct Cli {
     dist: PathBuf,
     config: Option<PathBuf>,
     site_url_arg: Option<String>,
-    site_title: String,
+    site_title: Option<String>,
 }
 
 fn next_val(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
@@ -54,7 +55,7 @@ fn parse_cli() -> Result<Cli> {
         dist: PathBuf::from("frontend/dist"),
         config: None,
         site_url_arg: None,
-        site_title: "~yzs".into(),
+        site_title: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -63,7 +64,7 @@ fn parse_cli() -> Result<Cli> {
             "--dist" => cli.dist = PathBuf::from(next_val(&mut args, "--dist")?),
             "--config" => cli.config = Some(PathBuf::from(next_val(&mut args, "--config")?)),
             "--site-url" => cli.site_url_arg = Some(next_val(&mut args, "--site-url")?),
-            "--site-title" => cli.site_title = next_val(&mut args, "--site-title")?,
+            "--site-title" => cli.site_title = Some(next_val(&mut args, "--site-title")?),
             other => bail!("未知参数: {other}"),
         }
     }
@@ -109,17 +110,19 @@ fn main() -> Result<()> {
     let cli = parse_cli()?;
 
     // site_url: --site-url > 配置文件 web.site_url > 无
-    // 配置文件查找复用 termblog_core::Config::load 的机制:
+    // site_title: --site-title > 配置文件 web.site_title > 内置默认
+    // 配置文件查找复用 termblog_config::Config::load 的机制:
     // --config 指定文件 > $TERMBLOG_CONFIG > /usr/local/etc/termblog.toml(不存在则全默认)。
     let cfg_path = match &cli.config {
         Some(p) => Some(p.clone()),
         None => std::env::var("TERMBLOG_CONFIG").ok().map(PathBuf::from),
     };
-    let cfg = termblog_core::Config::load(cfg_path.as_deref())?;
+    let cfg = termblog_config::Config::load(cfg_path.as_deref())?;
     let site_url = cli
         .site_url_arg
         .or(cfg.web.site_url)
         .map(|u| u.trim_end_matches('/').to_string());
+    let site_title = cli.site_title.clone().unwrap_or(cfg.web.site_title.clone());
 
     // 扫描 + slug 校验(违规全部列出后统一失败)
     let blog_dir = cli.content.join("blog");
@@ -199,7 +202,7 @@ fn main() -> Result<()> {
         match found.len() {
             1 => Some(found.pop().unwrap()),
             0 => bail!(
-                "找不到前端入口 JS ({}), 请先 gmake build-frontend(vite build 先于 content-build)",
+                "找不到前端入口 JS ({}), 请先 make build-frontend(vite build 先于 content-build)",
                 assets.display()
             ),
             n => bail!("找到 {n} 个前端入口 JS, 无法确定用哪个: {found:?}"),
@@ -223,7 +226,7 @@ fn main() -> Result<()> {
         match found.len() {
             1 => Some(found.pop().unwrap()),
             0 => bail!(
-                "找不到前端入口 CSS ({}), 请先 gmake build-frontend(vite build 先于 content-build)",
+                "找不到前端入口 CSS ({}), 请先 make build-frontend(vite build 先于 content-build)",
                 assets.display()
             ),
             n => bail!("找到 {n} 个前端入口 CSS, 无法确定用哪个: {found:?}"),
@@ -264,7 +267,7 @@ fn main() -> Result<()> {
             entry_js.as_deref().unwrap_or_default(),
             entry_css.as_deref().unwrap_or_default(),
             site_url.as_deref(),
-            &cli.site_title,
+            &site_title,
         );
         let hp = dist_blog.join(&a.slug).join("index.html");
         if let Some(parent) = hp.parent() {
@@ -279,7 +282,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("写 {}", rendered.join(".index").display()))?;
     std::fs::create_dir_all(&dist_blog).with_context(|| format!("创建 {}", dist_blog.display()))?;
     let entry_js_str = entry_js.as_deref().unwrap_or_default();
-    let list = html::render_list_page(&arts, site_url.as_deref(), &cli.site_title, entry_js_str);
+    let list = html::render_list_page(&arts, site_url.as_deref(), &site_title, entry_js_str);
     std::fs::write(dist_blog.join("index.html"), list)
         .with_context(|| format!("写 {}", dist_blog.join("index.html").display()))?;
 
@@ -291,7 +294,7 @@ fn main() -> Result<()> {
             .first()
             .map(|a| a.date_rfc3339.clone())
             .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
-        std::fs::write(cli.dist.join("atom.xml"), feed::atom(u, &cli.site_title, &arts, &feed_updated))
+        std::fs::write(cli.dist.join("atom.xml"), feed::atom(u, &site_title, &arts, &feed_updated))
             .with_context(|| format!("写 {}", cli.dist.join("atom.xml").display()))?;
     } else {
         warns.push("未设置 site_url, 跳过 sitemap.xml / atom.xml(镜像页无 canonical/OG:url)".into());

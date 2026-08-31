@@ -29,7 +29,7 @@ use nix::pty::{openpty, Winsize};
 use nix::unistd::{fork, ForkResult};
 use tracing::{error, info, warn};
 
-use termblog_core::config::JailConfig;
+use termblog_config::JailConfig;
 
 use crate::pty::ShellChild;
 

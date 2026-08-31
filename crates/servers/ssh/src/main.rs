@@ -14,7 +14,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Context;
-use termblog_core::{Config, SessionClient};
+use termblog_config::Config;
+use termblog_core::SessionClient;
 
 #[tokio::main]
 async fn main() -> ExitCode {

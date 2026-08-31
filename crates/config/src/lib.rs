@@ -1,4 +1,4 @@
-//! 全局配置(TOML)。web / ssh / jaild 三个二进制共用同一份配置文件。
+//! 全局配置(TOML)。web / ssh / jaild 三个服务器二进制与 content-build 共用同一份配置文件。
 
 use std::path::{Path, PathBuf};
 
@@ -55,6 +55,8 @@ pub struct WebConfig {
     /// 站点对外绝对地址(https://host[:port], 尾部不带 /)。
     /// canonical / sitemap / atom / OG 的前缀, 仅 content-build 消费。
     pub site_url: Option<String>,
+    /// 站点标题: 镜像页 <title> / og:site_name / atom feed 标题, content-build 消费。
+    pub site_title: String,
 }
 
 impl Default for WebConfig {
@@ -63,6 +65,7 @@ impl Default for WebConfig {
             listen: "0.0.0.0:8080".into(),
             static_dir: "frontend/dist".into(),
             site_url: None,
+            site_title: "~yzs".into(),
         }
     }
 }
