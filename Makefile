@@ -1,7 +1,12 @@
 # termblog —— 编译 / 运行 / 服务管理
-# 注意: GNU make 语法(define/endef + $(shell)); FreeBSD 请用 gmake 调用。
+# bmake(FreeBSD 默认 make)风格, 直接 `make <目标>` 即可, 无需 gmake。
 #
-# 约定: 不带后缀的目标操作 web, 带 -ssh 后缀的对应操作 ssh。
+# 部署目标(需要 root, sudo 已内嵌, 会提示输入密码):
+#   make tpl      构建 jail 模板(build-template.sh; 加 --replace 零停机换面)
+#   make deploy   全量生产部署(deploy.sh; 需模板已构建)
+#   make content  只改文章的部署: 静态发布 + 模板零停机换面
+#
+# 开发期目标(不带后缀的操作 web, 带 -ssh 后缀的对应操作 ssh):
 #   run/run-ssh            前台运行(Ctrl-C 停止, 调试用)
 #   start/start-ssh        后台启动(幂等: 已在运行则不重复启动)
 #   stop/stop-ssh          停止
@@ -17,19 +22,17 @@
 
 BIN_WEB := target/release/termblog-web
 BIN_SSH := target/release/termblog-ssh
-BIN_JAILD := target/release/termblog-jaild
 BIN_CONTENT := target/release/content-build
 PID_WEB := .termblog-web.pid
 PID_SSH := .termblog-ssh.pid
 LOG_WEB := termblog-web.log
 LOG_SSH := termblog-ssh.log
-URL_WEB := http://$(shell hostname):8080
+HOSTNAME != hostname
+URL_WEB := http://$(HOSTNAME):8080
 URL_SSH := ssh://0.0.0.0:2222
 
-PREFIX ?= /usr/local
-ETCDIR ?= $(PREFIX)/etc
-
-.PHONY: all build build-frontend build-content install \
+.PHONY: all build build-frontend build-content \
+        tpl deploy content \
         run run-ssh \
         start start-ssh stop stop-ssh restart restart-ssh \
         status status-ssh logs logs-ssh clean
@@ -49,25 +52,21 @@ build-content:
 	cargo build --release -p content-build
 	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
 
-# ── 构建: 一次产出 web + ssh + jaild 三个二进制 + 前端 + 内容镜像 ──
+# ── 构建: 一次产出全部二进制(含 jailbin)+ 前端 + 内容镜像 ──
 build: build-frontend
 	cargo build --release
 	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
 
-# ── 部署(需要 root): 二进制 -> sbin, 前端 -> share, rc 脚本 -> etc/rc.d ──
-install: build
-	install -d $(DESTDIR)$(PREFIX)/sbin
-	install -d $(DESTDIR)$(PREFIX)/share/termblog/frontend
-	install -d $(DESTDIR)$(ETCDIR)/rc.d
-	install -m 555 $(BIN_WEB) $(DESTDIR)$(PREFIX)/sbin/termblog-web
-	install -m 555 $(BIN_SSH) $(DESTDIR)$(PREFIX)/sbin/termblog-ssh
-	install -m 555 $(BIN_JAILD) $(DESTDIR)$(PREFIX)/sbin/jaild
-	cp -R frontend/dist/. $(DESTDIR)$(PREFIX)/share/termblog/frontend/
-	install -m 644 etc/termblog.toml $(DESTDIR)$(ETCDIR)/termblog.toml.sample
-	install -m 555 etc/rc.d/jaild etc/rc.d/termblog $(DESTDIR)$(ETCDIR)/rc.d/
-	@echo ">> 已安装到 $(DESTDIR)$(PREFIX)"
-	@echo ">> 配置样例: $(ETCDIR)/termblog.toml.sample (复制为 termblog.toml 后按需修改)"
-	@echo ">> 启用: sysrc jaild_enable=YES termblog_enable=YES"
+# ── 部署入口(需要 root): 薄入口, sudo 已内嵌; 逻辑在 deploy-scripts/ ──
+tpl:
+	sudo sh deploy-scripts/build-template.sh
+
+deploy:
+	sudo sh deploy-scripts/deploy.sh
+
+# 只改文章的部署: 静态发布 + 模板零停机换面(全程不停服、不杀会话)
+content:
+	sudo sh -c 'sh deploy-scripts/deploy.sh --static-only && sh deploy-scripts/build-template.sh --replace'
 
 # ── 前台运行(Ctrl-C 停止) ──
 run: build
@@ -76,60 +75,66 @@ run: build
 run-ssh: build
 	./$(BIN_SSH)
 
-# ── 后台服务: web/ssh 各持独立 pid+log, 逻辑同一套(幂等) ──
-# 参数: $(1)=pid 文件  $(2)=二进制  $(3)=日志  $(4)=服务名  $(5)=地址
-define start_service
-	@if [ -f $(1) ] && kill -0 $$(cat $(1)) 2>/dev/null; then \
-		echo "$(4) 已在运行 (pid $$(cat $(1)))  $(5)"; \
+# ── 后台服务: web/ssh 各持独立 pid+log(幂等) ──
+start: build
+	@if [ -f $(PID_WEB) ] && kill -0 $$(cat $(PID_WEB)) 2>/dev/null; then \
+		echo "termblog-web 已在运行 (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
 	else \
-		nohup ./$(2) > $(3) 2>&1 & echo $$! > $(1); \
+		nohup ./$(BIN_WEB) > $(LOG_WEB) 2>&1 & echo $$! > $(PID_WEB); \
 		sleep 0.5; \
-		if kill -0 $$(cat $(1)) 2>/dev/null; then \
-			echo "$(4) 已启动 (pid $$(cat $(1)))  $(5)"; \
+		if kill -0 $$(cat $(PID_WEB)) 2>/dev/null; then \
+			echo "termblog-web 已启动 (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
 		else \
-			echo "$(4) 启动失败, 日志:"; tail -20 $(3); exit 1; \
+			echo "termblog-web 启动失败, 日志:"; tail -20 $(LOG_WEB); exit 1; \
 		fi; \
 	fi
-endef
-
-define stop_service
-	@if [ -f $(1) ] && kill -0 $$(cat $(1)) 2>/dev/null; then \
-		kill $$(cat $(1)) && echo "已停止 $(2) (pid $$(cat $(1)))"; \
-	else \
-		echo "$(2) 未在运行"; \
-	fi; \
-	rm -f $(1)
-endef
-
-define status_service
-	@if [ -f $(1) ] && kill -0 $$(cat $(1)) 2>/dev/null; then \
-		echo "$(2) 运行中 (pid $$(cat $(1)))  $(3)"; \
-	else \
-		echo "$(2) 未在运行"; \
-	fi
-endef
-
-start: build
-	$(call start_service,$(PID_WEB),$(BIN_WEB),$(LOG_WEB),termblog-web,$(URL_WEB))
 
 start-ssh: build
-	$(call start_service,$(PID_SSH),$(BIN_SSH),$(LOG_SSH),termblog-ssh,$(URL_SSH))
+	@if [ -f $(PID_SSH) ] && kill -0 $$(cat $(PID_SSH)) 2>/dev/null; then \
+		echo "termblog-ssh 已在运行 (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
+	else \
+		nohup ./$(BIN_SSH) > $(LOG_SSH) 2>&1 & echo $$! > $(PID_SSH); \
+		sleep 0.5; \
+		if kill -0 $$(cat $(PID_SSH)) 2>/dev/null; then \
+			echo "termblog-ssh 已启动 (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
+		else \
+			echo "termblog-ssh 启动失败, 日志:"; tail -20 $(LOG_SSH); exit 1; \
+		fi; \
+	fi
 
 stop:
-	$(call stop_service,$(PID_WEB),termblog-web)
+	@if [ -f $(PID_WEB) ] && kill -0 $$(cat $(PID_WEB)) 2>/dev/null; then \
+		kill $$(cat $(PID_WEB)) && echo "已停止 termblog-web (pid $$(cat $(PID_WEB)))"; \
+	else \
+		echo "termblog-web 未在运行"; \
+	fi; \
+	rm -f $(PID_WEB)
 
 stop-ssh:
-	$(call stop_service,$(PID_SSH),termblog-ssh)
+	@if [ -f $(PID_SSH) ] && kill -0 $$(cat $(PID_SSH)) 2>/dev/null; then \
+		kill $$(cat $(PID_SSH)) && echo "已停止 termblog-ssh (pid $$(cat $(PID_SSH)))"; \
+	else \
+		echo "termblog-ssh 未在运行"; \
+	fi; \
+	rm -f $(PID_SSH)
 
 restart: stop start
 
 restart-ssh: stop-ssh start-ssh
 
 status:
-	$(call status_service,$(PID_WEB),termblog-web,$(URL_WEB))
+	@if [ -f $(PID_WEB) ] && kill -0 $$(cat $(PID_WEB)) 2>/dev/null; then \
+		echo "termblog-web 运行中 (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
+	else \
+		echo "termblog-web 未在运行"; \
+	fi
 
 status-ssh:
-	$(call status_service,$(PID_SSH),termblog-ssh,$(URL_SSH))
+	@if [ -f $(PID_SSH) ] && kill -0 $$(cat $(PID_SSH)) 2>/dev/null; then \
+		echo "termblog-ssh 运行中 (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
+	else \
+		echo "termblog-ssh 未在运行"; \
+	fi
 
 logs:
 	tail -f $(LOG_WEB)

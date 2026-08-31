@@ -1,7 +1,7 @@
 #!/bin/sh
-# verify-jail.sh —— M3 验收(以 root 运行, 全自动, 约 2 分钟)
+# verify-m3.sh —— M3 验收(以 root 运行, 全自动, 约 2 分钟)
 #
-#   sh /home/yzs/termblog/scripts/verify-jail.sh
+#   sh /home/yzs/termblog/tests/verify-m3.sh
 #
 # 覆盖 plan §9 M3 验收点:
 #   1. 进程形态: jaild=root, termblog-web/ssh=www, socket 0660 root:www
@@ -17,7 +17,7 @@
 # sleep 撑住存活窗口), 步骤组之间留 8s 覆盖回收耗时(shell 无视 HUP 时
 # 5s SIGKILL 兜底 + 清理)。
 # web 侧用浏览器开 http://<host>:8080 目测即可, 协议路径已由
-# scripts/e2e-reconnect.mjs 覆盖。
+# tests/e2e-reconnect.mjs 覆盖。
 
 set -u
 
@@ -132,14 +132,18 @@ echo "== (等 8s: 会话回收, 清空配额) =="
 sleep 8
 
 echo "== 5. 配额: 每 IP 3 个并发会话封顶 =="
+# 基线可能是外部访客会话(浏览器开着的终端等), 不在本组 4 连接之内;
+# 断言按增量算: 每 IP 封顶 3, 4 并发最多新增 3 个会话 jail。
+# jaild 的配额检查与占位在同一把锁里原子完成(会话表), 不会超发。
 BASE=$(jail_count)
 for i in 1 2 3 4; do
     (printf 'sleep 8\n'; sleep 9) | timeout 12 $SSH > /dev/null 2>&1 &
 done
 sleep 4
 N=$(jail_count)
-[ "$N" -ge 1 ] && [ "$N" -le 3 ]
-check $? "4 并发连接时 jail 数在 1..3 (基线 $BASE, 实际 $N)"
+NEW=$((N - BASE))
+[ "$NEW" -ge 1 ] && [ "$NEW" -le 3 ]
+check $? "4 并发连接时新增 jail 数在 1..3 (基线 $BASE, 实际 $N, 新增 $NEW)"
 wait 2>/dev/null
 
 echo "== 6. 断线后 jail 回收, zfs 无泄漏 (等 8s) =="

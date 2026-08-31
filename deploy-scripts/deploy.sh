@@ -1,17 +1,42 @@
 #!/bin/sh
-# deploy-root.sh —— 生产部署(必须以 root 运行, 一步到位)
+# deploy-scripts/deploy.sh —— 生产部署(必须以 root 运行, 一步到位)
 #
-#   su -   (切到 root)
-#   sh /home/yzs/termblog/scripts/deploy-root.sh
+#   su -
+#   sh /home/yzs/termblog/deploy-scripts/deploy.sh               # 全量部署(用已构建的模板)
+#   sh /home/yzs/termblog/deploy-scripts/deploy.sh --static-only # 只发静态镜像(零停机改文章)
 #
-# 做的事: 检查/写入 racct(loader tunable, 首次需要重启机器) ->
-# 构建 jail 模板(已存在则跳过, 需网络) ->
+# 全量做的事: 检查/写入 racct(loader tunable, 首次需要重启机器) ->
+# 检查 jail 模板已存在(不存在则提示先跑 build-template.sh) ->
 # 以 yzs 身份编译(避免 target/ 被 root 污染) -> 安装二进制/前端/配置 ->
-# 拉起 jaild[root] 与 termblog-web/termblog-ssh[www](幂等)。
+# 发布静态镜像 -> 拉起 jaild[root] 与 termblog-web/termblog-ssh[www](幂等)。
+#
+# --static-only: 只编译内容 + 发布静态镜像。纯文件替换, 零进程重启、
+# 零会话中断; jail 侧(模板内文章)将在下次模板重建时跟进。
+# 内容两侧都更新(含模板)走: make content(= 本脚本 --static-only +
+# build-template.sh --replace, 全程零停机)。
 
 set -eu
 
-REPO=/home/yzs/termblog
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+REPO=$(dirname "$SCRIPT_DIR")
+STATIC_DIR=/usr/local/share/termblog/frontend
+BUILD_USER=yzs
+
+[ "$(id -u)" -eq 0 ] || { echo "需要 root (service/zfs/install)"; exit 1; }
+
+# ── --static-only: 内容小改, 零停机(不碰进程/模板/会话) ──
+if [ "${1:-}" = "--static-only" ]; then
+    echo ">> 1/2 编译内容(以 $BUILD_USER, 产物进 frontend/dist 与 jailtpl/content/.rendered)"
+    su -l "$BUILD_USER" -c "set -e; cd $REPO; cargo build --release -p content-build; \
+        ./target/release/content-build --content jailtpl/content --dist frontend/dist"
+    echo ">> 2/2 发布静态镜像(纯文件替换, 无感, 不重启)"
+    rm -rf "$STATIC_DIR/blog"
+    cp -R "$REPO/frontend/dist/." "$STATIC_DIR/"
+    # 保证 www 可读(曾出过 600 权限导致 /blog.css 404 的事故)
+    chmod -R a+rX "$STATIC_DIR"
+    echo ">> 完成(仅镜像)。jail 侧将在下次模板重建时跟进。"
+    exit 0
+fi
 
 # ── 1. racct: rctl 限额的前提。loader tunable, 运行期只读, 必须重启生效 ──
 if ! grep -q '^kern.racct.enable=1' /boot/loader.conf 2>/dev/null; then
@@ -27,23 +52,22 @@ if [ "$(sysctl -n kern.racct.enable 2>/dev/null)" != "1" ]; then
 fi
 echo ">> kern.racct.enable 已生效"
 
-# ── 2. jail 模板 ──
-if zfs list -H -o name zroot/jails/template@release >/dev/null 2>&1; then
-    echo ">> 模板已存在: zroot/jails/template@release, 跳过构建"
-else
-    echo ">> 构建 jail 模板(下载 base.txz + pkg 装 zsh, 约 2-5 分钟)"
-    sh "$REPO/jailtpl/build-template.sh"
+# ── 2. jail 模板(只检查, 不构建: 模板构建归 build-template.sh) ──
+if ! zfs list -H -o name zroot/jails/template@release >/dev/null 2>&1; then
+    echo ""
+    echo "!! 未找到 jail 模板 zroot/jails/template@release"
+    echo "!! 请先运行: sh $REPO/deploy-scripts/build-template.sh"
+    exit 1
 fi
+echo ">> jail 模板已就绪: zroot/jails/template@release"
 
 # ── 3. 编译(以 yzs 跑: HOME/PATH 正确, 且不污染仓库属主) ──
-# Makefile 是 GNU make 语法(define/endef + $(shell)), FreeBSD 默认 make 是
-# bmake 不兼容, 必须显式用 gmake。
-echo ">> 编译"
-if ! command -v gmake >/dev/null 2>&1; then
-    echo ">> 安装 gmake"
-    pkg install -y gmake
-fi
-su -l yzs -c "cd $REPO && gmake build"
+# 全 workspace(web/ssh/jaild/jailbin/content-build)+ 前端 + 内容产物;
+# 不再依赖 gmake: cargo/npm 直接调用。
+echo ">> 编译(全 workspace + 前端 + 内容产物)"
+su -l "$BUILD_USER" -c "set -e; cd $REPO; cargo build --release; \
+    cd frontend; [ -d node_modules ] || npm install; npm run build; \
+    cd $REPO; ./target/release/content-build --content jailtpl/content --dist frontend/dist"
 
 # ── 4. 安装 ──
 echo ">> 安装二进制 / 前端 / rc 脚本"
@@ -54,8 +78,7 @@ install -m 555 "$REPO/target/release/termblog-jaild" /usr/local/sbin/jaild
 cp -R "$REPO/frontend/dist/." /usr/local/share/termblog/frontend/
 install -m 644 "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml.sample
 if [ -f /usr/local/etc/termblog.toml ] && ! cmp -s "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml; then
-    # 仓库配置有更新(如 backend -> jail.socket 迁移): 备份本地版后刷新。
-    # 本地如有自定义项, 部署后自行合并回新文件
+    # 仓库配置有更新: 备份本地版后刷新。本地如有自定义项, 部署后自行合并回新文件
     cp /usr/local/etc/termblog.toml /usr/local/etc/termblog.toml.old
     install -m 644 "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml
     echo ">> 配置有更新: 旧版已备份到 /usr/local/etc/termblog.toml.old, 现配置已刷新为仓库版本"
@@ -70,13 +93,18 @@ install -m 644 "$REPO/etc/newsyslog.conf.d/termblog.conf" /usr/local/etc/newsysl
 sysrc jaild_enable=YES termblog_enable=YES >/dev/null
 echo ">> 已启用开机自启: jaild_enable=YES termblog_enable=YES"
 
-# ── 5. 运行时目录(降权 www 需要写的部分) ──
+# ── 5. 发布静态镜像(纯文件替换; blog 目录先清掉防删文留僵尸) ──
+rm -rf "$STATIC_DIR/blog"
+cp -R "$REPO/frontend/dist/." "$STATIC_DIR/"
+chmod -R a+rX "$STATIC_DIR"
+
+# ── 6. 运行时目录(降权 www 需要写的部分) ──
 mkdir -p /var/db/termblog /var/log
 chown www /var/db/termblog
 touch /var/log/jaild.log /var/log/termblog-web.log /var/log/termblog-ssh.log
 chown www /var/log/termblog-web.log /var/log/termblog-ssh.log
 
-# ── 6. 拉起/重启服务(先停旧进程再起新二进制, 部署即滚动重启) ──
+# ── 7. 拉起/重启服务(先停旧进程再起新二进制, 部署即滚动重启) ──
 start_daemon() { # $1=服务名 $2=用户(可空) $3=二进制
     pidf="/var/run/$1.pid"
     if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
@@ -103,4 +131,4 @@ ls -l /var/run/termblog.sock
 ps -axo user,pid,comm | grep -E "jaild|termblog-" | grep -v grep
 echo ""
 echo ">> 网页: http://$(hostname):8080   ssh: ssh -p 2222 blog@$(hostname)"
-echo ">> 验收: sh $REPO/scripts/verify-jail.sh (root)"
+echo ">> 验收: sh $REPO/tests/verify-m3.sh (root) 与 sh $REPO/tests/verify-m5.sh"
