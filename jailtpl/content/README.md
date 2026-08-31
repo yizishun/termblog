@@ -15,7 +15,7 @@
 - `blog/` 下的 md 由 content-build 同时编译为网页镜像(frontend/dist/blog/)
   与终端预渲染(`.rendered/`, 与文章路径一一对应)。
 
-构建时 build-template.sh 把两块分别拷进 jail:
+构建时 deploy-scripts/build-template.sh 把两块分别拷进 jail:
 
 - `blog/` → 访客家目录 `~/blog/`(与 URL 前缀 `/blog/` 一一对应);
 - `.rendered/` → `~/.rendered/`(隐藏工具目录)。

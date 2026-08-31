@@ -73,7 +73,7 @@ jail 里也因此不需要装任何 markdown 渲染器。
 
 ## 4. 构建期:content-build 做了什么
 
-`content-build` 是仓库里的一个 Rust 工具(`crates/content-build`), 由
+`content-build` 是仓库里的一个 Rust 工具(`crates/tools/content-build`), 由
 `gmake build` 在 vite 之后调用。它用 pulldown-cmark 把每篇 md **只解析一次**,
 得到一串事件, 再喂给两个渲染器:
 
@@ -189,9 +189,11 @@ scrollback 里), 各种按键恢复序列(`^C`、`q⏎`、`^U`)要么被运行�
 
 ## 7. 终端侧:blog 命令
 
-`blog` 是装进 jail 模板的一个 shell 脚本(`/usr/local/bin/blog`, 0555), 接口
-**像 cat**:任意路径的 md 都能读(相对 cwd / 相对 `~/blog` / 绝对路径, 任意
-层级), `blog hello` 等价 `blog ~/blog/hello.md`, 裸 `blog` 列出文章列表。
+`blog` 是装进 jail 模板的命令(`/usr/local/bin/blog`, 0555), 由 Rust 多合一
+二进制 `jailbin` 提供 —— `blog` / `webctl` 都是指向它的符号链接(busybox 式,
+访客无感)。接口**像 cat**:任意路径的 md 都能读(相对 cwd / 相对 `~/blog` /
+绝对路径, 任意层级), `blog hello` 等价 `blog ~/blog/hello.md`, 裸 `blog`
+列出文章列表。
 
 内容上更聪明:
 
@@ -224,11 +226,19 @@ jailtpl/content/
 
 ## 9. 部署与验收
 
-- **构建**:`gmake build`(vite → cargo → content-build);
-- **发布**:`sudo sh scripts/update-content.sh` —— 编译内容 → 发布静态镜像
-  (纯文件替换, 无感)→ 重建 jail 模板(杀全部会话);`--static-only` 只发镜像;
-- **验收**:`scripts/verify-m5.sh` —— 镜像页/列表页/feed/robots、无尾斜杠
-  307、ssh 侧 `blog` 列表与进入/退出 OSC、预渲染 ANSI 粗体等检查项。
+部署逻辑在 `deploy-scripts/`(Makefile 只做薄入口, 需 root):
+
+- **构建**:`make build`(vite → cargo → content-build, 开发期);
+- **模板**:`sh deploy-scripts/build-template.sh`(首次构建);`--replace` =
+  零停机换模板: 构建到旁路名 `template.new` 再换名上场, 不停服、不杀会话,
+  旧会话继续用旧模板、新会话取新模板(旧模板被 pin 至旧会话全部退出后回收);
+- **全量部署**:`sh deploy-scripts/deploy.sh`(需模板已构建): racct 检查 →
+  编译 → 安装二进制/前端/配置 → 发布静态镜像 → 拉起服务;
+- **只改文章**:`make content` = `deploy.sh --static-only`(编译内容 + 纯文件
+  替换发布镜像, 零停机)+ `build-template.sh --replace`(模板零停机换面);
+- **验收**:`tests/verify-m5.sh` —— 镜像页/列表页/feed/robots、无尾斜杠
+  307、ssh 侧 `blog` 列表与进入/退出 OSC、预渲染 ANSI 粗体等检查项;
+  `tests/verify-m3.sh`(root)与 `tests/e2e-reconnect.mjs` 覆盖 M3 与重连协议。
 
 ---
 

@@ -1,57 +1,61 @@
-# ghpage — terminal-style homepage
+# termblog —— 终端即博客
 
-A single-page, fully static personal site that pretends to be a terminal.
-Built on `xterm.js` with a tiny shell on top. Content is plain markdown; the
-compiler turns it into structured data the runtime consumes. Deployed to
-GitHub Pages (`jiangyy.github.io`).
+每篇文章一个稳定 URL: 爬虫看到静态 HTML 镜像, 真人打开 URL 则自动接入
+每个访客一个的真实 FreeBSD jail 终端(zsh + less), 读预渲染排版的文章。
+URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期生成。
 
-## Architecture — four decoupled layers
+## 架构
+
+- **jaild**(root, 唯一特权进程): 每访客从只读模板 `zroot/jails/template@release`
+  ZFS clone 出一个会话 jail(rctl 限额 + 4M 磁盘配额), PTY 经 Unix socket 供接入层使用。
+- **termblog-web / termblog-ssh**(降权 www): 浏览器(WS)/ SSH 两个接入网关,
+  经 SEQPACKET Unix socket 连 jaild, 零协议转换。
+- **content-build**: 把唯一内容源 `jailtpl/content/blog/*.md` 一次解析成两个投影 ——
+  HTML 静态镜像(`frontend/dist/blog/<slug>/`, 爬虫不开 jail 读全文)与 ANSI 预渲染
+  (`jailtpl/content/.rendered/`, 终端 `less -R` 可读), 并产出列表页/首页注入/
+  sitemap/atom/robots。
+- **jailbin**: 装进 jail 模板的访客命令多合一二进制(busybox 式), `blog`(cat 式
+  文章阅读器: 读预渲染排版 + 同步地址栏)与 `webctl`(发 OSC 7777)是其符号链接。
+
+## 目录
 
 ```
-content/*.md ──[compiler]──▶ src/generated/content.ts (manifest)
-                                   │
-index.html ──vite──▶ dist/         ▼
-                     runtime:   main.ts
-                        ├─ term/     xterm.js wrapper + ANSI/TUI primitives + buttons
-                        ├─ shell/    Registry + Parser + REPL (pipes, history, inject)
-                        ├─ content/  manifest store + markdown→ANSI renderer + doc commands
-                        └─ apps/     oneshot & TUI commands, plugin-registered
+crates/
+  config/        # termblog-config: TOML 配置(servers 与 content-build 共用)
+  servers/       # proto(线协议) core(会话运行时) web ssh jaild
+  tools/         # content-build(内容编译器) jailbin(jail 内命令)
+deploy-scripts/  # build-template.sh(模板构建/零停机换面) deploy.sh(全量部署)
+tests/           # verify-m3.sh verify-m5.sh e2e-reconnect.mjs(验收脚本)
+jailtpl/content/ # 唯一内容源: blog/*.md + .rendered 产物(README 写作规范只留仓库)
+etc/             # termblog.toml 样例 + rc.d + newsyslog
+frontend/        # xterm.js 前端(vite)
 ```
 
-- **content** — pure markdown. No frontmatter, no type markers. The directory
-  tree *is* the structure (`about.md` → `about`, `blog/hello.md` → `blog/hello`).
-  The compiler alone decides what each document becomes (today: everything is a
-  page; the `analyze()` hook is where a future LLM-driven pass decides kind and
-  generated artifacts).
-- **compiler** (`scripts/build-content.ts`) — standalone, runnable on its own.
-  Emits `src/generated/content.ts`. Re-runs automatically in dev via the vite
-  plugin whenever `content/` changes.
-- **framework** (`term/`, `shell/`) — knows nothing about markdown. `shell/types.ts`
-  is the contract every command codes against.
-- **apps** (`apps/`) — each file exports a `Command`; add one and register it in
-  `apps/index.ts`. Nothing else changes.
+## 部署(需要 root)
 
-## Commands: oneshot and TUI share one shell
+| 入口 | 做什么 |
+| --- | --- |
+| `make tpl` | 构建 jail 模板(首次); 已存在则拒绝 |
+| `make deploy` | 全量生产部署: racct 检查 → 编译 → 安装 → 发布镜像 → 拉起服务(需模板已构建) |
+| `make content` | 只改文章的部署: 静态发布 + 模板零停机换面, 全程不停服、不杀会话 |
+| `deploy.sh --static-only` | 只发静态镜像(零停机); jail 侧下次模板重建跟进 |
+| `build-template.sh --replace` | 零停机换模板(旧会话继续用旧模板, 全部退出后回收) |
 
-A `Command` is just `run(ctx, argv)`. Oneshot commands read `ctx.stdin` / write
-`ctx.stdout`. A TUI command calls `ctx.term.takeOver()`, draws and handles keys,
-then `release()`s — the shell awaits `run`, so the two never fight over input.
-Pipes work (`about | wc -l`) because the shell chains `stdout` → next `stdin`.
+部署目标内嵌 sudo, 直接 `make tpl` / `make deploy` / `make content` 即可
+(会提示输入密码)。部署脚本不依赖 Makefile; Makefile 只是薄入口。
 
-Every content document is also a command, so `about` and `cat about` are equivalent.
+配置: `/usr/local/etc/termblog.toml`(仓库 `etc/termblog.toml` 为样例)。
+部署后务必设 `web.site_url`(不设则不产 sitemap/atom/canonical);
+`web.site_title` 用于镜像页标题 / og:site_name / atom 标题。
 
-## Scripts
+## 验收
 
-| script            | what it does                                       |
-| ----------------- | -------------------------------------------------- |
-| `npm run dev`     | vite dev server; recompiles content on save        |
-| `npm run build`   | compile content + production bundle to `dist/`     |
-| `npm run preview` | serve the built `dist/` locally                    |
-| `npm test`        | node:test unit tests (parser/render/store/...)      |
-| `npm run typecheck` | `tsc --noEmit`                                   |
-| `npm run deploy`  | build + push `dist/` to the `gh-pages` branch      |
+- `sh tests/verify-m3.sh`(root): 进程形态 / 真实 jail / 隔离 / rctl / 配额 / zfs 无泄漏
+- `sh tests/verify-m5.sh`: 镜像页 / 发现链路 / feed / robots + ssh 侧 blog 行为
+- `node tests/e2e-reconnect.mjs`: 断线重连协议
 
-## Try it
+## 开发
 
-`help`, `ls`, `about`, `cat projects`, `about | wc -l`, `tree`, `more help`. Or
-click the buttons on top — they just inject a command.
+- `make build`: 全部二进制(含 jailbin)+ 前端 + 内容产物(bmake, FreeBSD 默认 make)
+- `make run` / `make run-ssh`: 前台调试
+- `cargo test`: Rust 单测(含 jailbin 对 blog/webctl 的移植等价性测试)
