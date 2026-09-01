@@ -5,6 +5,7 @@
 //! 未来新命令 = 新模块 + 模板里多一条 symlink。
 
 mod blog;
+mod play;
 mod webctl;
 
 use std::ffi::OsString;
@@ -20,9 +21,10 @@ fn main() {
         .unwrap_or_else(|| "jailbin".into());
     let code = match prog.as_str() {
         "blog" => blog::run(&rest),
+        "play" => play::run(&rest),
         "webctl" => webctl::run(&rest),
         _ => {
-            eprintln!("jailbin: 用法: blog [文件] | webctl url /path");
+            eprintln!("jailbin: 用法: blog [文件] | play [选项] [录像] | webctl url /path");
             2
         }
     };

@@ -9,3 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+nix = { workspace = true, features = ["poll"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

@@ -90,6 +90,7 @@ umask 022
 PS1='%F{green}blog@jail%f %~ %# '
 setopt INTERACTIVE_COMMENTS
 echo '博客: 敲 blog 看文章列表, 读一篇: blog hello (或 blog ~/blog/hello.md)'
+echo '录像: 敲 play 列出终端录像(.cast), 播一个: play hello/demo (空格暂停, q 退出)'
 EOF
 
 # 8. 博客内容: 文章进 ~/blog(与 URL /blog/ 一一对应), 预渲染产物进 ~/.rendered
@@ -103,10 +104,11 @@ if [ -d "$REPO/jailtpl/content" ]; then
 fi
 chown -R 1001:1001 "$BUILD_MOUNT/home/$GUEST"
 
-# 9. jailbin 命令(0555, 只读): blog / webctl 是指向 jailbin 的符号链接(busybox 式)
-echo ">> 安装 jailbin 命令(blog / webctl → jailbin)"
+# 9. jailbin 命令(0555, 只读): blog / play / webctl 是指向 jailbin 的符号链接(busybox 式)
+echo ">> 安装 jailbin 命令(blog / play / webctl → jailbin)"
 install -m 555 "$REPO/target/release/jailbin" "$BUILD_MOUNT/usr/local/bin/jailbin"
 ln -s jailbin "$BUILD_MOUNT/usr/local/bin/blog"
+ln -s jailbin "$BUILD_MOUNT/usr/local/bin/play"
 ln -s jailbin "$BUILD_MOUNT/usr/local/bin/webctl"
 
 # 10. 收尾: 卸 devfs, 清 DNS, 打 snapshot, 模板转只读

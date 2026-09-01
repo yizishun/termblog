@@ -15,7 +15,8 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
   (`jailtpl/content/.rendered/`, 终端 `less -R` 可读), 并产出列表页/首页注入/
   sitemap/atom/robots。
 - **jailbin**: 装进 jail 模板的访客命令多合一二进制(busybox 式), `blog`(cat 式
-  文章阅读器: 读预渲染排版 + 同步地址栏)与 `webctl`(发 OSC 7777)是其符号链接。
+  文章阅读器: 读预渲染排版 + 同步地址栏)、`play`(asciicast 终端录像播放器,
+  自包含实现: 定时回放 + 暂停/逐帧/倍速)与 `webctl`(发 OSC 7777)是其符号链接。
 
 ## 目录
 
@@ -26,7 +27,8 @@ crates/
   tools/         # content-build(内容编译器) jailbin(jail 内命令)
 deploy-scripts/  # build-template.sh(模板构建/零停机换面) deploy.sh(全量部署)
 tests/           # verify-m3.sh verify-m5.sh e2e-reconnect.mjs(验收脚本)
-jailtpl/content/ # 唯一内容源: blog/*.md + .rendered 产物(README 写作规范只留仓库)
+jailtpl/content/ # 唯一内容源: blog/*.md(每篇可带同名资源目录, 如录像 .cast)
+                 # + .rendered 产物(README 写作规范只留仓库)
 etc/             # termblog.toml 样例 + rc.d + newsyslog
 frontend/        # xterm.js 前端(vite)
 ```
@@ -58,4 +60,5 @@ frontend/        # xterm.js 前端(vite)
 
 - `make build`: 全部二进制(含 jailbin)+ 前端 + 内容产物(bmake, FreeBSD 默认 make)
 - `make run` / `make run-ssh`: 前台调试
-- `cargo test`: Rust 单测(含 jailbin 对 blog/webctl 的移植等价性测试)
+- `cargo test`: Rust 单测(含 jailbin 对 blog/webctl 的移植等价性测试、play 的
+  asciicast 解析与时间轴测试)

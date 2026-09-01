@@ -2171,6 +2171,9 @@ name = "termblog-jailbin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
