@@ -71,15 +71,22 @@ pub fn parse_cast(text: &str) -> Result<Cast, String> {
     let mut events = cast.events;
     let mut prev_t = 0.0f64;
     for (ln, line) in lines {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue; // v3 允许注释行
+        }
         let ev: (f64, String, String) = serde_json::from_str(line)
             .map_err(|e| format!("第 {} 行: 不是合法事件 [时间, 类型, 数据]: {e}", ln + 1))?;
-        // 只回放输出; i/r/m 等忽略。时间防御性单调化
-        if ev.1 == "o" {
-            let t = ev.0.max(prev_t);
-            prev_t = t;
-            events.push(OutEvent { t, data: ev.2.into_bytes() });
+        // 时间语义: v2 绝对秒; v3 相对上一事件的增量(累加成绝对时间)。
+        // 只回放输出, i/r/m/x 等忽略。
+        let t = if version == 3 {
+            prev_t + ev.0.max(0.0)
         } else {
-            prev_t = prev_t.max(ev.0);
+            ev.0.max(prev_t) // v2 防御性单调化
+        };
+        prev_t = t;
+        if ev.1 == "o" {
+            events.push(OutEvent { t, data: ev.2.into_bytes() });
         }
     }
     Ok(Cast { events, ..cast })
@@ -540,6 +547,28 @@ mod tests {
         assert_eq!(cast.version, 3);
         assert_eq!((cast.cols, cast.rows), (72, 30));
         assert_eq!(cast.events.len(), 1); // resize 被忽略
+    }
+
+    #[test]
+    fn parse_v3_relative_deltas() {
+        // v3 时间是相对上一事件的增量(对齐 asciinema 官方夹具的期望值)
+        let text = r#"{"version": 3, "term": {"cols": 100, "rows": 50}}
+[0.000001, "o", "a"]
+[1.0, "o", "b"]
+[0.3, "i", "\n"]
+[1.600001, "r", "80x40"]
+[10.5, "o", "c"]
+# 注释行应被跳过
+"#;
+        let cast = parse_cast(text).unwrap();
+        assert_eq!(cast.version, 3);
+        let ts: Vec<f64> = cast.events.iter().map(|e| e.t).collect();
+        // 0.000001 → +1.0 → (+0.3 输入, 时间轴照走) → (+1.600001 缩放) → +10.5
+        assert!(ts[0].abs() - 0.000001 < 1e-9);
+        assert!((ts[1] - 1.000001).abs() < 1e-9);
+        assert!((ts[2] - 13.400002).abs() < 1e-9);
+        let datas: Vec<&[u8]> = cast.events.iter().map(|e| e.data.as_slice()).collect();
+        assert_eq!(datas, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
     }
 
     #[test]
