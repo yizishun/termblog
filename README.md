@@ -12,7 +12,7 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
   经 SEQPACKET Unix socket 连 jaild, 零协议转换。
 - **content-build**: 把唯一内容源 `jailtpl/content/blog/*.md` 一次解析成两个投影 ——
   HTML 静态镜像(`frontend/dist/blog/<slug>/`, 爬虫不开 jail 读全文)与 ANSI 预渲染
-  (`jailtpl/content/.rendered/`, 终端 `less -R` 可读), 并产出列表页/首页注入/
+  (`jailtpl/content/.rendered/`, 终端 `less -R` 可读), 并产出列表页/
   sitemap/atom/robots。
 - **jailbin**: 装进 jail 模板的访客命令多合一二进制(busybox 式), `blog`(cat 式
   文章阅读器: 读预渲染排版 + 同步地址栏)、`play`(asciicast 终端录像播放器,

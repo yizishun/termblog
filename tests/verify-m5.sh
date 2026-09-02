@@ -15,8 +15,11 @@ curl -sf -o /dev/null -w '%{http_code}' "$BASE/blog/hello" | grep -q 307
 check $? "无尾斜杠 307 → 尾斜杠(canonical 形态)"
 
 echo "== 2. 发现链路 =="
-curl -sf "$BASE/" | grep -q 'termblog:blog-index'
-check $? "首页含注入的文章列表"
+if curl -sf "$BASE/" | grep -q 'termblog:blog-index'; then
+    check 1 "首页不再注入文章列表(应为纯终端)"
+else
+    check 0 "首页不再注入文章列表(应为纯终端)"
+fi
 curl -sf "$BASE/blog/" | grep -q '/blog/hello/'
 check $? "/blog/ 列表页含文章链接"
 

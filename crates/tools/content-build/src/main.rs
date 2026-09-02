@@ -3,7 +3,7 @@
 //! 唯一内容源 `jailtpl/content/blog/*.md` 的两个投影:
 //!   HTML 镜像(爬虫读的静态全文页, 进 `frontend/dist/blog/`)与
 //!   ANSI 预渲染(终端里 `less -R` 读的排版文本, 进 `jailtpl/content/.rendered/`)。
-//! 同时产出文章列表页、sitemap.xml / atom.xml / robots.txt 与首页文章列表注入。
+//! 同时产出文章列表页、sitemap.xml / atom.xml / robots.txt。
 //!
 //! 用法(从仓库根):
 //!   content-build [--content jailtpl/content] [--dist frontend/dist]
@@ -301,18 +301,6 @@ fn main() -> Result<()> {
     }
     std::fs::write(cli.dist.join("robots.txt"), feed::robots(site_url.as_deref()))
         .with_context(|| format!("写 {}", cli.dist.join("robots.txt").display()))?;
-
-    // 首页注入(幂等)
-    if arts.is_empty() {
-        warns.push("无文章, 跳过首页文章列表注入".into());
-    } else {
-        let idx_path = cli.dist.join("index.html");
-        let src = std::fs::read_to_string(&idx_path)
-            .with_context(|| format!("读首页 {}", idx_path.display()))?;
-        let new = html::inject_homepage(&src, &arts, entry_js.as_deref().unwrap_or_default())
-            .ok_or_else(|| anyhow::anyhow!("首页 {} 缺少 </body>, 无法注入", idx_path.display()))?;
-        std::fs::write(&idx_path, new).with_context(|| format!("写 {}", idx_path.display()))?;
-    }
 
     // 摘要
     println!("content-build: {} 篇文章", arts.len());

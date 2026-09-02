@@ -1,4 +1,4 @@
-//! HTML 投影: 镜像页 / 列表页 / 首页注入。
+//! HTML 投影: 镜像页 / 列表页。
 
 use pulldown_cmark::{Event, HeadingLevel, Tag};
 
@@ -264,47 +264,6 @@ pub fn render_list_page(
     )
 }
 
-/// 首页注入(幂等): 无文章时返回 None(不注入);
-/// 否则给 dist/index.html 补 blog.css 引用(注入 1)与文章列表 footer 块(注入 2)。
-pub fn inject_homepage(index_html: &str, arts: &[Article], entry_js: &str) -> Option<String> {
-    if arts.is_empty() {
-        return None;
-    }
-    const BEGIN: &str = "<!--BEGIN termblog:blog-index-->";
-    const END: &str = "<!--END termblog:blog-index-->";
-
-    let mut items = String::new();
-    for a in arts {
-        items.push_str(&format!(
-            "    <li><span class=\"date\">{}</span><a href=\"/blog/{}/\">{}</a></li>\n",
-            a.date10,
-            a.slug,
-            attr_escape(&a.title)
-        ));
-    }
-    let block = format!(
-        "{BEGIN}\n<footer id=\"blog-index\">\n  <h2>文章</h2>\n  <ul>\n{items}  </ul>\n</footer>\n{END}"
-    );
-
-    let mut s = index_html.to_string();
-    // 幂等: 已存在的旧块整块删除后重插
-    if let (Some(b), Some(e)) = (s.find(BEGIN), s.find(END)) {
-        if e > b {
-            s.replace_range(b..e + END.len(), "");
-        }
-    }
-    // 注入 1: </head> 前补 blog.css(已含引用则跳过)
-    if !s.contains("blog.css") {
-        if let Some(h) = s.rfind("</head>") {
-            s.replace_range(h..h, &format!("<link rel=\"stylesheet\" href=\"{}\" />\n  ", blog_css_href(entry_js)));
-        }
-    }
-    // 注入 2: </body> 前插 footer 块
-    let b = s.rfind("</body>")?;
-    s.replace_range(b..b, &block);
-    Some(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,27 +347,6 @@ mod tests {
         assert!(!page.contains("assets/"), "列表页不引 entry JS");
         let page = render_list_page(std::slice::from_ref(&a), None, "~yzs", "index-abc123.js");
         assert!(!page.contains("atom.xml"));
-    }
-
-    #[test]
-    fn homepage_injection_idempotent() {
-        let idx = "<!doctype html>\n<html>\n<head>\n  <title>x</title>\n</head>\n<body>\n  <p>hi</p>\n</body>\n</html>\n";
-        let a = article("hello", "你好, 世界", "# 你好, 世界\n\n正文\n");
-        let once = inject_homepage(idx, std::slice::from_ref(&a), "index-abc123.js").unwrap();
-        assert!(once.contains("<!--BEGIN termblog:blog-index-->"));
-        assert!(once.contains("<!--END termblog:blog-index-->"));
-        assert!(once.contains("href=\"/blog/hello/\""));
-        assert!(once.contains("blog.css"));
-        // 注入两遍结果等于一遍
-        let twice = inject_homepage(&once, std::slice::from_ref(&a), "index-abc123.js").unwrap();
-        assert_eq!(once, twice);
-        assert_eq!(twice.matches("termblog:blog-index").count(), 2, "BEGIN+END 各一次");
-    }
-
-    #[test]
-    fn homepage_injection_skipped_when_empty() {
-        let idx = "<!doctype html>\n<html><head></head><body></body></html>\n";
-        assert!(inject_homepage(idx, &[], "index-abc123.js").is_none());
     }
 
     #[test]

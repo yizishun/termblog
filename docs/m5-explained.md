@@ -78,7 +78,7 @@ jail 里也因此不需要装任何 markdown 渲染器。
 得到一串事件, 再喂给两个渲染器:
 
 - **HTML 渲染器**产出:镜像页(每篇一个 `/blog/<slug>/index.html`)、列表页
-  `/blog/index.html`、首页文章列表注入、`sitemap.xml`/`atom.xml`(配置了
+  `/blog/index.html`、`sitemap.xml`/`atom.xml`(配置了
   `web.site_url` 才生成, 否则跳过)、`robots.txt`;
 - **ANSI 渲染器**产出:`.rendered/<slug>`(76 显示列折行、中文按 2 列计宽、
   标题加粗/表格对齐都已算好)与 `.rendered/.index`(文章列表, TSV:日期/标题)。
