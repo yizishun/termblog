@@ -15,6 +15,20 @@
 - `blog/` 下的 md 由 content-build 同时编译为网页镜像(frontend/dist/blog/)
   与终端预渲染(`.rendered/`, 与文章路径一一对应)。
 
+图片(构建期强制, 失败即构建失败, 不会线上 404):
+
+- 文章 `blog/hello.md` 的图片放同名资源目录 `blog/hello/`(沿用 demo.cast 先例),
+  md 里以**相对 md 所在目录**的相对路径引用: `![架构图](hello/arch.png)`;
+- 格式白名单(扩展名, 大小写不敏感): `png jpg jpeg webp gif`;
+  不支持 svg(安全)与 avif;
+- 资源文件路径(相对 `blog/`, 含目录)字符集限 `[a-z0-9/._-]`;
+- 预算(处理后字节): 单张位图 ≤ 256 KiB, gif ≤ 512 KiB(gif 不缩放不重编码,
+  保动画), 单篇文章图片总量 ≤ 1.5 MiB; 位图宽度 > 1080 px 自动缩小到 1080;
+- 外部图片(`https://…` 绝对 URL)原样透传, 不校验、不复制、不计预算;
+- 未被任何文章引用的资源不复制(仅告警);
+- 终端投影: 独占段落的图渲染为占位框(框内 URL 是可点击的 OSC 8 超链接),
+  段落中夹的行内图降级为 `[图: alt]` 链接。
+
 构建时 deploy-scripts/build-template.sh 把两块分别拷进 jail:
 
 - `blog/` → 访客家目录 `~/blog/`(与 URL 前缀 `/blog/` 一一对应);

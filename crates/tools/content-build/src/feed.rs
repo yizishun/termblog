@@ -58,7 +58,7 @@ pub fn atom(site_url: &str, site_title: &str, arts: &[Article], feed_updated: &s
     ));
     out.push_str(&format!("  <author><name>{}</name></author>\n", xml_escape(site_title)));
     for a in arts {
-        let body = crate::html::body_html(&a.events);
+        let body = crate::html::body_html(&a.events, &a.image_meta);
         out.push_str("  <entry>\n");
         out.push_str(&format!("    <title>{}</title>\n", xml_escape(&a.title)));
         out.push_str(&format!(
@@ -112,6 +112,8 @@ mod tests {
             date_rfc3339: "2026-08-29T10:00:00+08:00".into(),
             date_warned: false,
             events,
+            image_meta: Default::default(),
+            first_image: None,
         }
     }
 

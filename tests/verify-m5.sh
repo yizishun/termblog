@@ -13,6 +13,10 @@ curl -sf "$BASE/blog/hello/" | grep -q 'name="termblog-slug" content="hello"'
 check $? "镜像页带 termblog-slug meta"
 curl -sf -o /dev/null -w '%{http_code}' "$BASE/blog/hello" | grep -q 307
 check $? "无尾斜杠 307 → 尾斜杠(canonical 形态)"
+curl -sf "$BASE/blog/image-test/" | grep -q '<img src="/blog/image-test/pixel.png"'
+check $? "镜像页含重写后的 <img>"
+curl -sf -o /dev/null -w '%{http_code}' "$BASE/blog/image-test/pixel.png" | grep -q 200
+check $? "图片资源 HTTP 200"
 
 echo "== 2. 发现链路 =="
 if curl -sf "$BASE/" | grep -q 'termblog:blog-index'; then
@@ -49,6 +53,13 @@ check $? "ssh: blog 显示预渲染排版(ANSI 粗体)"
 (sleep 2; printf 'blog ~/blog/hello.md\n'; sleep 2; printf 'q'; sleep 1) | timeout 15 $SSH 2>&1 | cat -v \
   | grep -qF ']7777;url=/^G'
 check $? "ssh: 退出 less 后 OSC 复位 /"
+# 图片占位框: 不过 cat -v(它会把框线字符的 UTF-8 字节转成 M- 记法导致匹配失败);
+# OSC8 的 ]8;; 是可打印 ASCII, 原始字节流里直接可匹配
+out=$( (sleep 2; printf 'blog image-test\n'; sleep 3) | timeout 15 $SSH 2>&1 )
+printf '%s\n' "$out" | grep -qF '┌─ 图片'
+check $? "ssh: blog image-test 显示图片占位框"
+printf '%s\n' "$out" | grep -qF ']8;;'
+check $? "ssh: 占位框 URL 带 OSC8 超链接"
 
 echo ""
 echo "== 结果: $pass 通过, $fail 失败 =="

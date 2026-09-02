@@ -15,12 +15,14 @@
 mod ansi;
 mod feed;
 mod html;
+mod img;
 mod meta;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use pulldown_cmark::{Event, Options, Parser};
+use pulldown_cmark::{Event, Options, Parser, Tag};
 
 /// 一篇文章的编译中间态: 元数据 + 解析后的事件流。
 pub struct Article {
@@ -34,6 +36,11 @@ pub struct Article {
     /// 日期走了 mtime fallback(构建告警用)
     pub date_warned: bool,
     pub events: Vec<Event<'static>>,
+    /// 本地图 dest_url 原文 → (宽, 高, 重写后 /blog/ 路径); html.rs 查表用。
+    /// 外链不进表(html.rs 查不到 = External, 省略宽高)。
+    pub image_meta: HashMap<String, (u32, u32, String)>,
+    /// 文章第一张本地图的 /blog/ 路径(og:image 用)
+    pub first_image: Option<String>,
 }
 
 #[derive(Debug)]
@@ -71,12 +78,14 @@ fn parse_cli() -> Result<Cli> {
     Ok(cli)
 }
 
-/// 递归扫描 content/blog/, 收集 *.md 的相对路径(相对 blog 根),
+/// 递归扫描 content/blog/, 收集 *.md 的相对路径(相对 blog 根)与图片资源,
 /// 同时收集 slug 违规与非 md 文件告警。
+/// 资源分类: 图片扩展名白名单 → assets; .cast → 已知类型静默; 其它非 md → 告警。
 fn scan_blog(
     root: &Path,
     dir: &Path,
     out: &mut Vec<PathBuf>,
+    assets: &mut Vec<PathBuf>,
     slug_errors: &mut Vec<String>,
     warns: &mut Vec<String>,
 ) -> Result<()> {
@@ -84,10 +93,11 @@ fn scan_blog(
         let entry = entry.with_context(|| format!("读目录项 {}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            scan_blog(root, &path, out, slug_errors, warns)?;
+            scan_blog(root, &path, out, assets, slug_errors, warns)?;
         } else {
             let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext == "md" {
                 let slug = rel
                     .to_string_lossy()
                     .strip_suffix(".md")
@@ -98,12 +108,33 @@ fn scan_blog(
                 } else {
                     out.push(rel);
                 }
+            } else if img::is_image_ext(ext) {
+                // 资源路径字符集 [a-z0-9/._-](含目录部分), 违规与 slug 违规统一报出
+                let rel_str = rel.to_string_lossy();
+                if let Err(e) = img::validate_asset_path(&rel_str) {
+                    slug_errors.push(format!("{}: {e}", rel.display()));
+                } else {
+                    assets.push(rel);
+                }
+            } else if ext.eq_ignore_ascii_case("cast") {
+                // 已知类型(asciicast 录像): 静默
             } else {
                 warns.push(format!("忽略非 markdown 文件: {}", rel.display()));
             }
         }
     }
     Ok(())
+}
+
+/// 收集事件流里所有图片的 dest_url 原文(文档序, 含重复)。
+fn collect_image_dests(events: &[Event<'static>]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -127,10 +158,11 @@ fn main() -> Result<()> {
     // 扫描 + slug 校验(违规全部列出后统一失败)
     let blog_dir = cli.content.join("blog");
     let mut rel_paths: Vec<PathBuf> = vec![];
+    let mut assets: Vec<PathBuf> = vec![];
     let mut slug_errors: Vec<String> = vec![];
     let mut warns: Vec<String> = vec![];
     if blog_dir.is_dir() {
-        scan_blog(&blog_dir, &blog_dir, &mut rel_paths, &mut slug_errors, &mut warns)?;
+        scan_blog(&blog_dir, &blog_dir, &mut rel_paths, &mut assets, &mut slug_errors, &mut warns)?;
         if rel_paths.is_empty() {
             warns.push(format!("{} 下没有文章", blog_dir.display()));
         }
@@ -146,7 +178,14 @@ fn main() -> Result<()> {
     rel_paths.sort();
 
     // 逐篇: 读文件(BOM/CRLF 规范化)→ 解析(两投影共用同一套选项)→ 元数据 → 日期
+    // 同循环处理图片: resolve → 存在性校验 → 缩放/预算 → 记录 image_meta。
+    // 所有图片问题收集后统一 fail(宁构建失败, 不线上 404)。
     let mut arts: Vec<Article> = vec![];
+    let mut image_errors: Vec<String> = vec![];
+    let mut asset_bytes: HashMap<String, Vec<u8>> = HashMap::new(); // rel → 处理后字节
+    let mut referenced: HashSet<String> = HashSet::new(); // 被引用的资源 rel 路径
+    let mut total_imgs = 0usize;
+    let mut total_bytes = 0usize;
     for rel in &rel_paths {
         let path = blog_dir.join(rel);
         let src = std::fs::read(&path).with_context(|| format!("读文章 {}", path.display()))?;
@@ -172,7 +211,83 @@ fn main() -> Result<()> {
         if date_warned {
             warns.push(format!("「{}」无 git 历史, 日期回退到文件 mtime", rel.display()));
         }
-        arts.push(Article { slug, title, excerpt, date10, date_rfc3339, date_warned, events });
+
+        // 图片引用: 逐张 resolve + 处理, 单篇总量预算 1.5 MiB
+        let mut image_meta: HashMap<String, (u32, u32, String)> = HashMap::new();
+        let mut first_image: Option<String> = None;
+        let mut article_bytes = 0usize;
+        for dest in collect_image_dests(&events) {
+            let (rel_path, url) = match img::resolve_image_url(&slug, &dest) {
+                Err(e) => {
+                    image_errors.push(format!("「{slug}」图片 {dest}: {e}"));
+                    continue;
+                }
+                Ok(img::ResolvedImage::External(_)) => {
+                    if dest.starts_with('/') {
+                        warns.push(format!("「{slug}」站点绝对路径图片不受管线管理: {dest}"));
+                    }
+                    continue;
+                }
+                Ok(img::ResolvedImage::Local(url)) => {
+                    // resolve 成功则 normalize 必然成功
+                    let (rel_path, _) = img::normalize_local_path(&slug, &dest)
+                        .expect("已 resolve 的本地图")
+                        .expect("已 resolve 的本地图");
+                    (rel_path, url)
+                }
+            };
+            let img_path = blog_dir.join(&rel_path);
+            if !img_path.is_file() {
+                image_errors.push(format!("「{slug}」引用的图片不存在: {rel_path}"));
+                continue;
+            }
+            match img::process_image(&img_path, &rel_path, &slug) {
+                Err(e) => image_errors.push(format!("{e:#}")),
+                Ok(p) => {
+                    article_bytes += p.bytes.len();
+                    if article_bytes > img::MAX_ARTICLE_BYTES {
+                        image_errors.push(format!(
+                            "「{slug}」图片总量超过单篇预算: 已累计 {} KiB(上限 {} KiB, 超出来自 {rel_path}); 请压缩/减少图片",
+                            article_bytes / 1024,
+                            img::MAX_ARTICLE_BYTES / 1024
+                        ));
+                        continue;
+                    }
+                    total_imgs += 1;
+                    total_bytes += p.bytes.len();
+                    referenced.insert(rel_path.clone());
+                    asset_bytes.entry(rel_path).or_insert_with(|| p.bytes.clone());
+                    image_meta.insert(dest.clone(), (p.width, p.height, url.clone()));
+                    if first_image.is_none() {
+                        first_image = Some(url);
+                    }
+                }
+            }
+        }
+        arts.push(Article {
+            slug,
+            title,
+            excerpt,
+            date10,
+            date_rfc3339,
+            date_warned,
+            events,
+            image_meta,
+            first_image,
+        });
+    }
+    if !image_errors.is_empty() {
+        for e in &image_errors {
+            eprintln!("图片错误: {e}");
+        }
+        bail!("图片处理失败: {} 处问题, 请修复后重跑", image_errors.len());
+    }
+    // 未被引用的资源仅告警(不处理不复制, 如 demo.cast 的先例)
+    for a in &assets {
+        let rel_str = a.to_string_lossy().to_string();
+        if !referenced.contains(&rel_str) {
+            warns.push(format!("未被引用的图片资源(不复制): {rel_str}"));
+        }
     }
     // 排序: 日期倒序, 同日 slug 字典序升序
     arts.sort_by(|a, b| {
@@ -252,9 +367,23 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&rendered)
         .with_context(|| format!("创建 {}", rendered.display()))?;
 
+    // 复制被引用的图片资源进 dist/blog/(dist/blog 已整体先清, 僵尸资源天然清理)
+    for (rel_path, bytes) in &asset_bytes {
+        let p = dist_blog.join(rel_path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建 {}", parent.display()))?;
+        }
+        std::fs::write(p, bytes).with_context(|| format!("写图片 {}", dist_blog.join(rel_path).display()))?;
+    }
+
+    // ANSI 占位框里 URL 的基址: 有 site_url 拼完整 URL(SSH 用户可直接复制进浏览器),
+    // 无则用 /blog/... 站点路径(web 端 OSC8 点击相对当前域仍可达)
+    let link_base = site_url.as_deref().unwrap_or("");
+
     // 逐篇产出: HTML 镜像页 + ANSI 预渲染
     for a in &arts {
-        let ansi_out = ansi::render_ansi(&a.events);
+        let ansi_out = ansi::render_ansi(&a.events, &a.slug, link_base);
         let rp = rendered.join(&a.slug);
         if let Some(parent) = rp.parent() {
             std::fs::create_dir_all(parent)
@@ -268,6 +397,7 @@ fn main() -> Result<()> {
             entry_css.as_deref().unwrap_or_default(),
             site_url.as_deref(),
             &site_title,
+            a.first_image.as_deref(),
         );
         let hp = dist_blog.join(&a.slug).join("index.html");
         if let Some(parent) = hp.parent() {
@@ -307,6 +437,12 @@ fn main() -> Result<()> {
     println!("  镜像页:   {}/blog/<slug>/index.html", cli.dist.display());
     println!("  列表页:   {}/blog/index.html", cli.dist.display());
     println!("  ANSI 预渲染: {}/.rendered/", cli.content.display());
+    println!(
+        "  图片: {} 张, 共 {} KiB(预算 {} KiB/篇)",
+        total_imgs,
+        total_bytes / 1024,
+        img::MAX_ARTICLE_BYTES / 1024
+    );
     for w in &warns {
         println!("警告: {w}");
     }

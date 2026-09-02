@@ -61,7 +61,13 @@
   color: #6a737d;
 }
 #static-view article a { color: #0969da; }
-#static-view article img { max-width: 100%; }
+/* 镜像页图片: 内容编译期写死了 width/height 属性, height:auto 防拉伸 */
+#static-view article img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1em auto;
+}
 .post-meta { color: #6a737d; font-size: 13px; margin-top: 2.5em; }
 
 .mirror-status { color: #6a737d; font-size: 13px; margin: 0 0 1.5em; }

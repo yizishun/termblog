@@ -197,6 +197,8 @@ mod tests {
             date_rfc3339: date_rfc3339.into(),
             date_warned: false,
             events: vec![],
+            image_meta: Default::default(),
+            first_image: None,
         }
     }
 

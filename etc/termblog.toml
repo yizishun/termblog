@@ -6,7 +6,7 @@ listen = "0.0.0.0:8080"
 static_dir = "/usr/local/share/termblog/frontend"
 # 站点对外绝对地址(不带尾斜杠)。canonical/sitemap/atom/OG 用;不设则镜像页
 # 照常生成, 只是不产出 sitemap/atom 与 canonical(部署后务必设置!)
-# site_url = "https://your-real-domain.example.com"
+site_url = "http://192.168.0.100:8080"
 # 站点标题: 镜像页 <title> / og:site_name / atom feed 标题用
 site_title = "~yzs"
 

@@ -3,6 +3,7 @@
   --bg: #fafafa;
   --fg: #2e3338;
   --border: #d0d7de;
+  --mono-font: "Maple Mono", "Fira Code", "JetBrains Mono", "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
   /* CRT overlay tuning — strength of the texture layer over the terminal. */
   --crt-scan: rgba(0, 0, 0, 0.03);
   --crt-vignette: rgba(0, 0, 0, 0.13);
@@ -33,7 +34,7 @@ html, body {
   height: 100%;
   background: var(--bg);
   color: var(--fg);
-  font-family: "Maple Mono", "Fira Code", "JetBrains Mono", "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  font-family: var(--mono-font);
 }
 
 #app {
@@ -120,18 +121,120 @@ html, body {
   );
 }
 
-/* Visible scrollbars on the light theme (xterm's default thumb vanishes on white). */
-.xterm-viewport {
+/* xterm hard-codes the viewport to black. When the available height is not an
+   exact multiple of the cell height, that color otherwise leaks out as a
+   thick line below the last row. */
+#term-screen .xterm .xterm-viewport {
+  background-color: var(--bg);
+  overflow-x: hidden;
   scrollbar-width: thin;
   scrollbar-color: #c0c7cf transparent;
 }
-.xterm-viewport::-webkit-scrollbar { width: 10px; }
-.xterm-viewport::-webkit-scrollbar-track { background: transparent; }
-.xterm-viewport::-webkit-scrollbar-thumb {
+#term-screen .xterm .xterm-viewport::-webkit-scrollbar { width: 10px; }
+#term-screen .xterm .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+#term-screen .xterm .xterm-viewport::-webkit-scrollbar-thumb {
   background: #c0c7cf;
   border-radius: 5px;
 }
-.xterm-viewport::-webkit-scrollbar-thumb:hover { background: #a8afb7; }
+#term-screen .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover { background: #a8afb7; }
+
+/* Terminal link confirmation. The in-page dialog avoids window.confirm and
+   Safari suppressing the default action of a target="_blank" link. */
+.link-confirm {
+  width: min(520px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono-font);
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 20px;
+  box-shadow: none;
+  font-feature-settings: "liga" 1, "calt" 1;
+}
+.link-confirm::backdrop { background: rgba(46, 51, 56, 0.24); }
+.link-confirm::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 2;
+  background:
+    radial-gradient(ellipse 120% 120% at 50% 50%, transparent 55%, var(--crt-vignette) 100%),
+    repeating-linear-gradient(to bottom, var(--crt-scan) 0 1px, transparent 1px 3px);
+  mix-blend-mode: multiply;
+}
+.link-confirm form {
+  position: relative;
+  z-index: 1;
+  padding: 20px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
+.link-confirm h2 {
+  margin: 0 0 8px;
+  font: inherit;
+  font-weight: 400;
+}
+.link-confirm p { margin: 0 0 10px; color: var(--fg); font: inherit; }
+/* xterm renders CJK glyphs as two cells and adds 5px tracking to their DOM
+   spans. Mirror that spacing for the dialog's Chinese labels. */
+.link-confirm h2,
+.link-confirm form > p,
+.link-confirm-actions button {
+  letter-spacing: 5px;
+}
+.link-confirm-url {
+  display: block;
+  max-height: 8em;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  letter-spacing: normal;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.link-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+.link-confirm-actions button {
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  background: var(--bg);
+  font: inherit;
+  appearance: none;
+  -webkit-appearance: none;
+  text-decoration: none;
+  cursor: pointer;
+}
+.link-confirm-actions button:hover { background: rgba(46, 51, 56, 0.06); }
+.link-confirm-actions button:focus-visible {
+  outline: 1px solid currentColor;
+  outline-offset: 2px;
+}
+.link-confirm-open {
+  border-color: #0969da !important;
+  color: #0969da !important;
+}
+.link-confirm p.link-confirm-error {
+  margin: 8px 0 0 !important;
+  color: #cf222e !important;
+  font-size: 13px;
+  line-height: 18px;
+}
 
 /* Phones: the home ASCII banner needs ~35 cols. The default frame paddings eat
    too much horizontal space on a narrow screen and force the banner to wrap,

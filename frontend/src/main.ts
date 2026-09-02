@@ -1,5 +1,6 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import { installOsc } from "./osc";
 
@@ -36,6 +37,67 @@ let takeoverDone = false; // 静态层是否已交给终端(一次性)
 let autoArmed = false; // 新会话落地页: 等首帧数据后补敲 blog 命令
 let autoSent = false; // 自动命令已发出(一次性)
 
+// ── 终端内链接统一点击行为: 页面内确认后打开新标签 ──
+// 不依赖 window.confirm 或 <a target="_blank"> 的默认动作：Safari 可能在链接回调中
+// 静默压制它们，即使事件链和 xterm activate 都已正常触发。<dialog> 不受该策略影响；
+// 用户点击“打开”按钮会产生一次新的真实手势，可同步创建新标签页。
+let linkDialog: HTMLDialogElement | undefined;
+
+function ensureLinkDialog(): HTMLDialogElement {
+  if (linkDialog) return linkDialog;
+
+  const dialog = document.createElement("dialog");
+  dialog.className = "link-confirm";
+  dialog.setAttribute("aria-labelledby", "link-confirm-title");
+  dialog.innerHTML = `
+    <form method="dialog">
+      <h2 id="link-confirm-title">打开这个链接？</h2>
+      <p>链接将在新标签页中打开：</p>
+      <code class="link-confirm-url"></code>
+      <div class="link-confirm-actions">
+        <button value="cancel">取消</button>
+        <button type="button" class="link-confirm-open">打开</button>
+      </div>
+      <p class="link-confirm-error" role="alert" hidden></p>
+    </form>`;
+  dialog.querySelector<HTMLButtonElement>(".link-confirm-open")!.addEventListener("click", (event) => {
+    const button = event.currentTarget as HTMLButtonElement;
+    const target = button.dataset.href;
+    if (!target) return;
+
+    // 必须在这次真实 click 的同步调用栈内创建窗口, Safari 才认可用户手势。
+    const newWindow = window.open();
+    if (!newWindow) {
+      const error = dialog.querySelector<HTMLElement>(".link-confirm-error")!;
+      error.textContent = "无法打开，请复制上方链接。";
+      error.hidden = false;
+      return;
+    }
+    try { newWindow.opener = null; } catch { /* Safari 可能拒绝赋值, 忽略即可 */ }
+    newWindow.location.href = target;
+    dialog.close();
+  });
+  document.body.append(dialog);
+  linkDialog = dialog;
+  return dialog;
+}
+
+function confirmOpenLink(uri: string) {
+  let url: URL;
+  try {
+    url = new URL(uri, window.location.href);
+  } catch {
+    return;
+  }
+  if (!["http:", "https:"].includes(url.protocol)) return;
+
+  const dialog = ensureLinkDialog();
+  dialog.querySelector<HTMLElement>(".link-confirm-url")!.textContent = url.href;
+  dialog.querySelector<HTMLButtonElement>(".link-confirm-open")!.dataset.href = url.href;
+  dialog.querySelector<HTMLElement>(".link-confirm-error")!.hidden = true;
+  if (!dialog.open) dialog.showModal();
+}
+
 // ── 终端(视觉参数配合 style.css 的浅色 CRT 主题) ──
 const term = new Terminal({
   fontFamily: '"Maple Mono", monospace',
@@ -43,9 +105,14 @@ const term = new Terminal({
   cursorBlink: true,
   scrollback: 2000,
   theme: { background: "#fafafa", foreground: "#2e3338", cursor: "#2e3338" },
+  linkHandler: {
+    activate: (_event, uri) => confirmOpenLink(uri),
+  },
 });
 const fit = new FitAddon();
 term.loadAddon(fit);
+// 裸 URL 可点(图片占位框里的链接等); 回调与 OSC8 linkHandler 共用同一确认逻辑
+term.loadAddon(new WebLinksAddon((_event, uri) => confirmOpenLink(uri)));
 
 const TOKEN_KEY = "termblog.attach_token";
 let ws: WebSocket | undefined;

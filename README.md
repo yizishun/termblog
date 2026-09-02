@@ -13,7 +13,10 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
 - **content-build**: 把唯一内容源 `jailtpl/content/blog/*.md` 一次解析成两个投影 ——
   HTML 静态镜像(`frontend/dist/blog/<slug>/`, 爬虫不开 jail 读全文)与 ANSI 预渲染
   (`jailtpl/content/.rendered/`, 终端 `less -R` 可读), 并产出列表页/
-  sitemap/atom/robots。
+  sitemap/atom/robots。图片走资源管线: 相对引用构建期重写为 `/blog/...`、
+  超宽自动缩放、尺寸/字节预算 fail-fast; 镜像页出真图(`<img>` 带真实宽高 +
+  og:image), 终端出格式稳定的占位框(OSC 8 可点链接)。
+  写作约定见 `jailtpl/content/README.md`。
 - **jailbin**: 装进 jail 模板的访客命令多合一二进制(busybox 式), `blog`(cat 式
   文章阅读器: 读预渲染排版 + 同步地址栏)、`play`(asciicast 终端录像播放器,
   自包含实现: 定时回放 + 暂停/逐帧/倍速)与 `webctl`(发 OSC 7777)是其符号链接。

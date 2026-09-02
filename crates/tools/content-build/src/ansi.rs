@@ -8,6 +8,8 @@
 use pulldown_cmark::{Event, Tag, TagEnd};
 use unicode_width::UnicodeWidthChar;
 
+use crate::img::{resolve_image_url, ResolvedImage};
+
 /// 目标显示列宽。
 const WIDTH: usize = 76;
 
@@ -17,24 +19,36 @@ const ITALIC: u8 = 2;
 const DIM: u8 = 4;
 const CYAN: u8 = 8;
 
+/// OSC 8 超链接开/闭(ST 终止, 与 iTerm2/kitty 惯例一致; xterm.js 与现代 less 均认)。
+fn osc8_open(url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\")
+}
+const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
+
 #[derive(Clone)]
 struct Seg {
     s: u8,
     t: String,
+    /// OSC 8 链接目标(图片占位框的 URL / 行内图降级)
+    link: Option<String>,
 }
 
 fn push_seg(segs: &mut Vec<Seg>, s: u8, t: impl Into<String>) {
+    push_seg_link(segs, s, t, None);
+}
+
+fn push_seg_link(segs: &mut Vec<Seg>, s: u8, t: impl Into<String>, link: Option<String>) {
     let t = t.into();
     if t.is_empty() {
         return;
     }
     if let Some(last) = segs.last_mut() {
-        if last.s == s {
+        if last.s == s && last.link == link {
             last.t.push_str(&t);
             return;
         }
     }
-    segs.push(Seg { s, t });
+    segs.push(Seg { s, t, link });
 }
 
 enum Block {
@@ -45,11 +59,41 @@ enum Block {
     Quote(Vec<Block>),
     List { ordered: bool, start: u64, items: Vec<Vec<Block>> },
     Table { head: Vec<String>, rows: Vec<Vec<String>> },
+    /// 独占段落的图片 → 占位框。url 已按 link_base 拼好(终端可点可复制的完整形态)。
+    Image { alt: String, url: String },
+}
+
+/// 渲染上下文: 图片 URL 重写需要 slug(相对基准)与 link_base(站点根)。
+struct Ctx<'a> {
+    slug: &'a str,
+    link_base: &'a str,
+}
+
+/// md 里的 dest_url 原文 → 终端里用的 URL:
+/// 本地图 = link_base + /blog/...(有 site_url 时拼成完整 URL, 无则站点路径);
+/// 外链原样。resolve 失败主流程已 fail-fast, 这里兜底用原文。
+fn image_url(ctx: &Ctx, dest: &str) -> String {
+    match resolve_image_url(ctx.slug, dest) {
+        Ok(ResolvedImage::Local(p)) => format!("{}{}", ctx.link_base, p),
+        Ok(ResolvedImage::External(u)) => u,
+        Err(_) => dest.to_string(),
+    }
+}
+
+/// URL 的文件名部分(alt 为空时占位框的兜底文本)。
+fn url_basename(url: &str) -> &str {
+    let no_suffix = match url.find(['?', '#']) {
+        Some(idx) => &url[..idx],
+        None => url,
+    };
+    no_suffix.rsplit('/').next().unwrap_or(no_suffix)
 }
 
 /// 渲染入口: 事件流 → 完整 ANSI 文本(行尾 \n, 文件尾保证一个 \n)。
-pub fn render_ansi(events: &[Event<'static>]) -> String {
-    let (blocks, _) = parse_blocks(events);
+/// slug: 文章 slug(图片相对路径的解析基准); link_base: site_url 或空串。
+pub fn render_ansi(events: &[Event<'static>], slug: &str, link_base: &str) -> String {
+    let ctx = Ctx { slug, link_base };
+    let (blocks, _) = parse_blocks(events, &ctx);
     let mut lines: Vec<String> = vec![];
     let ind = Indent { first: String::new(), cont: String::new(), width: WIDTH };
     render_blocks(&blocks, &mut lines, 0, 0, &ind);
@@ -64,22 +108,75 @@ pub fn render_ansi(events: &[Event<'static>]) -> String {
 
 // ── 解析: 事件流 → 块树 ──
 
-fn parse_blocks(events: &[Event<'static>]) -> (Vec<Block>, usize) {
+/// 若 slice 以 Start(Image) 开头且与之配对的 End(Image) 即 slice 内唯一顶层元素
+/// (alt 内允许嵌套 inline 事件), 返回 End(Image) 的下标; 否则 None。
+fn sole_image(slice: &[Event<'static>]) -> Option<usize> {
+    if !matches!(slice.first(), Some(Event::Start(Tag::Image { .. }))) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (idx, e) in slice.iter().enumerate() {
+        match e {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 独占图片段落的 Block::Image: 收集 alt 纯文本, URL 按 ctx 重写。
+/// 调用前提: events[*i] 是 Start(Image) 且 sole_image 已确认。
+/// 推进 *i 到 End(Image) 之后。
+fn take_image_block(events: &[Event<'static>], i: &mut usize, ctx: &Ctx) -> Block {
+    let dest = match &events[*i] {
+        Event::Start(Tag::Image { dest_url, .. }) => dest_url.to_string(),
+        _ => unreachable!(),
+    };
+    let url = image_url(ctx, &dest);
+    *i += 1;
+    let mut alt_segs: Vec<Seg> = vec![];
+    parse_inline(events, i, 0, &mut alt_segs, ctx);
+    *i += 1; // End(Image)
+    let alt: String = alt_segs.iter().map(|s| s.t.as_str()).collect();
+    let alt = alt.trim().to_string();
+    let alt = if alt.is_empty() { url_basename(&url).to_string() } else { alt };
+    Block::Image { alt, url }
+}
+
+fn parse_blocks(events: &[Event<'static>], ctx: &Ctx) -> (Vec<Block>, usize) {
     let mut blocks = vec![];
     let mut i = 0;
     while i < events.len() {
         match &events[i] {
             Event::Start(Tag::Paragraph) => {
+                // 独占段落的图片(段落的 inline 事件恰好只有 Start(Image)..End(Image))
+                // → 占位框 Block 而非 Paragraph
+                let inner = &events[i + 1..];
+                if let Some(k) = sole_image(inner) {
+                    if matches!(inner.get(k + 1), Some(Event::End(TagEnd::Paragraph))) {
+                        i += 1;
+                        let b = take_image_block(events, &mut i, ctx);
+                        i += 1; // End(Paragraph)
+                        blocks.push(b);
+                        continue;
+                    }
+                }
                 let mut segs = vec![];
                 i += 1;
-                parse_inline(events, &mut i, 0, &mut segs);
+                parse_inline(events, &mut i, 0, &mut segs, ctx);
                 i += 1; // End(Paragraph)
                 blocks.push(Block::Paragraph(segs));
             }
             Event::Start(Tag::Heading { .. }) => {
                 let mut segs = vec![];
                 i += 1;
-                parse_inline(events, &mut i, BOLD, &mut segs);
+                parse_inline(events, &mut i, BOLD, &mut segs, ctx);
                 i += 1; // End(Heading)
                 blocks.push(Block::Heading(segs));
             }
@@ -106,7 +203,7 @@ fn parse_blocks(events: &[Event<'static>]) -> (Vec<Block>, usize) {
                 blocks.push(Block::Code(lines));
             }
             Event::Start(Tag::BlockQuote(_)) => {
-                let (inner, consumed) = parse_blocks(&events[i + 1..]);
+                let (inner, consumed) = parse_blocks(&events[i + 1..], ctx);
                 i += consumed + 2; // +1 切片偏移, +1 消费 End(BlockQuote)
                 blocks.push(Block::Quote(inner));
             }
@@ -118,7 +215,7 @@ fn parse_blocks(events: &[Event<'static>]) -> (Vec<Block>, usize) {
                 while i < events.len() {
                     match &events[i] {
                         Event::Start(Tag::Item) => {
-                            let (inner, consumed) = parse_blocks(&events[i + 1..]);
+                            let (inner, consumed) = parse_blocks(&events[i + 1..], ctx);
                             i += consumed + 2; // +1 切片偏移, +1 消费 End(Item)
                             items.push(inner);
                         }
@@ -143,7 +240,7 @@ fn parse_blocks(events: &[Event<'static>]) -> (Vec<Block>, usize) {
                         Event::Start(Tag::TableCell) => {
                             i += 1;
                             let mut segs = vec![];
-                            parse_inline(events, &mut i, 0, &mut segs);
+                            parse_inline(events, &mut i, 0, &mut segs, ctx);
                             i += 1; // End(TableCell)
                             current.push(segs.iter().map(|s| s.t.as_str()).collect());
                         }
@@ -171,7 +268,20 @@ fn parse_blocks(events: &[Event<'static>]) -> (Vec<Block>, usize) {
             }
             // 块级 HTML: 站点约定纯 markdown, 跳过
             Event::Html(_) => i += 1,
-            // 紧凑列表项没有 Paragraph 包装(裸 inline 事件): 按隐式段落处理
+            // 紧凑列表项没有 Paragraph 包装(裸 inline 事件): 按隐式段落处理;
+            // 裸独占图(如紧凑列表项里只有一张图)同样给占位框
+            Event::Start(Tag::Image { .. }) => {
+                let is_sole = sole_image(&events[i..])
+                    .is_some_and(|k| matches!(events.get(i + k + 1), Some(Event::End(_)) | None));
+                if is_sole {
+                    let b = take_image_block(events, &mut i, ctx);
+                    blocks.push(b);
+                } else {
+                    let mut segs = vec![];
+                    parse_inline(events, &mut i, 0, &mut segs, ctx);
+                    blocks.push(Block::Paragraph(segs));
+                }
+            }
             Event::Text(_)
             | Event::Code(_)
             | Event::SoftBreak
@@ -179,15 +289,9 @@ fn parse_blocks(events: &[Event<'static>]) -> (Vec<Block>, usize) {
             | Event::InlineHtml(_)
             | Event::FootnoteReference(_)
             | Event::TaskListMarker(_)
-            | Event::Start(
-                Tag::Emphasis
-                | Tag::Strong
-                | Tag::Strikethrough
-                | Tag::Link { .. }
-                | Tag::Image { .. },
-            ) => {
+            | Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. }) => {
                 let mut segs = vec![];
-                parse_inline(events, &mut i, 0, &mut segs);
+                parse_inline(events, &mut i, 0, &mut segs, ctx);
                 blocks.push(Block::Paragraph(segs));
             }
             _ => i += 1,
@@ -198,30 +302,30 @@ fn parse_blocks(events: &[Event<'static>]) -> (Vec<Block>, usize) {
 
 /// inline 解析: 消费 events[*i] 起的内容, 遇到任意 End 事件即返回(不消费)。
 /// 由调用方(段落/标题/单元格)消费该 End。
-fn parse_inline(events: &[Event<'static>], i: &mut usize, style: u8, segs: &mut Vec<Seg>) {
+fn parse_inline(events: &[Event<'static>], i: &mut usize, style: u8, segs: &mut Vec<Seg>, ctx: &Ctx) {
     loop {
         match &events[*i] {
             Event::End(_) => return,
             Event::Start(Tag::Strong) => {
                 *i += 1;
-                parse_inline(events, i, style | BOLD, segs);
+                parse_inline(events, i, style | BOLD, segs, ctx);
                 *i += 1; // 消费 End(Strong), 继续外层 inline
             }
             Event::Start(Tag::Emphasis) => {
                 *i += 1;
-                parse_inline(events, i, style | ITALIC, segs);
+                parse_inline(events, i, style | ITALIC, segs, ctx);
                 *i += 1; // 消费 End(Emphasis)
             }
             Event::Start(Tag::Strikethrough) => {
                 *i += 1;
-                parse_inline(events, i, style | DIM, segs);
+                parse_inline(events, i, style | DIM, segs, ctx);
                 *i += 1; // 消费 End(Strikethrough)
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let url = dest_url.to_string();
                 *i += 1;
                 let mut inner: Vec<Seg> = vec![];
-                parse_inline(events, i, style, &mut inner);
+                parse_inline(events, i, style, &mut inner, ctx);
                 *i += 1; // 消费 End(Link)
                 let text: String = inner.iter().map(|s| s.t.as_str()).collect();
                 if text.is_empty() || text == url {
@@ -234,13 +338,16 @@ fn parse_inline(events: &[Event<'static>], i: &mut usize, style: u8, segs: &mut 
                 }
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
-                let url = dest_url.to_string();
+                // 行内图(段落中夹图): [图: alt] DIM + OSC8 链接
+                let url = image_url(ctx, dest_url);
                 *i += 1;
                 let mut alt_segs: Vec<Seg> = vec![];
-                parse_inline(events, i, style, &mut alt_segs);
+                parse_inline(events, i, style, &mut alt_segs, ctx);
                 *i += 1; // 消费 End(Image)
                 let alt: String = alt_segs.iter().map(|s| s.t.as_str()).collect();
-                push_seg(segs, style | DIM, format!("image: {alt} {url}"));
+                let alt = alt.trim();
+                let alt = if alt.is_empty() { url_basename(&url) } else { alt };
+                push_seg_link(segs, style | DIM, format!("[图: {alt}]"), Some(url));
             }
             Event::Text(t) => {
                 push_seg(segs, style, t.as_ref());
@@ -356,14 +463,38 @@ fn render_block(b: &Block, lines: &mut Vec<String>, q: usize, level: usize, ind:
                 lines.push(format!("{}{}", ind.cont, r.join(" | ")));
             }
         }
+        Block::Image { alt, url } => {
+            // 占位框(格式稳定, v2 的 sidecar manifest 锚定它; Quote/List 内
+            // 沿用 ind 前缀, 宽度随 ind.width 收缩):
+            //   ┌─ 图片 ────…(─ 补齐到整宽)
+            //   │ <alt>(可折行, 内容宽 = 整宽 - 3)
+            //   │ <url>(CYAN + OSC8, 可折行)
+            //   └────……
+            let w = ind.width;
+            let head = "┌─ 图片 "; // 显示宽 8(┌ ─ ␣ 图 片 ␣ = 1+1+1+2+2+1)
+            let top = format!("{}{}", head, "─".repeat(w.saturating_sub(8)));
+            lines.push(format!("{}\x1b[2m{}\x1b[22m", ind.first, top));
+            let content_w = w.saturating_sub(3); // "│ " 前缀 2 列 + 1 列余量
+            let alt_segs = [Seg { s: 0, t: alt.clone(), link: None }];
+            for l in wrap_segments(&alt_segs, content_w) {
+                lines.push(format!("{}\x1b[2m│\x1b[22m {}", ind.cont, render_line(&l)));
+            }
+            let url_segs = [Seg { s: CYAN, t: url.clone(), link: Some(url.clone()) }];
+            for l in wrap_segments(&url_segs, content_w) {
+                lines.push(format!("{}\x1b[2m│\x1b[22m {}", ind.cont, render_line(&l)));
+            }
+            let bottom = format!("└{}", "─".repeat(w.saturating_sub(1)));
+            lines.push(format!("{}\x1b[2m{}\x1b[22m", ind.cont, bottom));
+        }
     }
 }
 
 /// 折行: 贪心填充, 逐字符(原子)累加显示宽度, 超宽即断。
 /// 断行机会: 空格之后(空格留在行尾); 或相邻两字符任一是宽字符之间。
+/// link 随原子原样携带(不动), 由 render_line 逐行开闭 OSC8, 多行链接天然正确。
 fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
-    let mut raw_lines: Vec<Vec<(u8, char)>> = vec![];
-    let mut cur: Vec<(u8, char)> = vec![];
+    let mut raw_lines: Vec<Vec<(u8, Option<&str>, char)>> = vec![];
+    let mut cur: Vec<(u8, Option<&str>, char)> = vec![];
     let mut curw = 0usize;
     let mut break_at: Option<usize> = None;
 
@@ -382,7 +513,7 @@ fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
                 // 否则用之前记录的机会(空格之后等); 都没有 → 硬切。
                 let at_boundary = matches!(
                     cur.last(),
-                    Some(&(_, prev)) if prev.width().unwrap_or(0) == 2 || w == 2
+                    Some(&(_, _, prev)) if prev.width().unwrap_or(0) == 2 || w == 2
                 );
                 let bp = if at_boundary { Some(cur.len() - 1) } else { break_at };
                 match bp {
@@ -390,7 +521,7 @@ fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
                         let rest = cur.split_off(bp + 1);
                         let keep = std::mem::replace(&mut cur, rest);
                         raw_lines.push(keep);
-                        curw = cur.iter().map(|&(_, ch)| ch.width().unwrap_or(0)).sum();
+                        curw = cur.iter().map(|&(_, _, ch)| ch.width().unwrap_or(0)).sum();
                         break_at = recompute_break(&cur);
                     }
                     None => {
@@ -403,12 +534,12 @@ fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
             }
             if c == ' ' {
                 break_at = Some(cur.len());
-            } else if let Some(&(_, prev)) = cur.last() {
+            } else if let Some(&(_, _, prev)) = cur.last() {
                 if prev.width().unwrap_or(0) == 2 || w == 2 {
                     break_at = Some(cur.len() - 1);
                 }
             }
-            cur.push((seg.s, c));
+            cur.push((seg.s, seg.link.as_deref(), c));
             curw += w;
         }
     }
@@ -416,12 +547,12 @@ fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
         raw_lines.push(cur);
     }
 
-    // 相邻同样式原子并回 Seg
+    // 相邻同样式同链接原子并回 Seg
     let mut out = vec![];
     for l in raw_lines {
         let mut line = vec![];
-        for (s, c) in l {
-            push_seg(&mut line, s, c.to_string());
+        for (s, link, c) in l {
+            push_seg_link(&mut line, s, c.to_string(), link.map(str::to_string));
         }
         out.push(line);
     }
@@ -429,13 +560,13 @@ fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
 }
 
 /// 重算一行内最后一个断行机会(断行后余下的原子之间可能仍有空格/宽字符)。
-fn recompute_break(cur: &[(u8, char)]) -> Option<usize> {
+fn recompute_break(cur: &[(u8, Option<&str>, char)]) -> Option<usize> {
     let mut bp = None;
-    for (idx, &(_, c)) in cur.iter().enumerate() {
+    for (idx, &(_, _, c)) in cur.iter().enumerate() {
         if c == ' ' {
             bp = Some(idx);
         } else if idx + 1 < cur.len() {
-            let next = cur[idx + 1].1;
+            let next = cur[idx + 1].2;
             if c.width().unwrap_or(0) == 2 || next.width().unwrap_or(0) == 2 {
                 bp = Some(idx);
             }
@@ -446,10 +577,17 @@ fn recompute_break(cur: &[(u8, char)]) -> Option<usize> {
 
 /// 一行内样式转换成 SGR: 开启/关闭一律成对(1/3/2/36 → 22/23/22/39)。
 /// 行尾若有活动样式发 \x1b[0m(断行后新行行首会按段重发)。
+/// OSC 8 超链接: 段首发射(先 SGR 后 OSC8), 段结束/行尾关闭(在 \x1b[0m 之前)。
 fn render_line(segs: &[Seg]) -> String {
     let mut out = String::new();
     let mut active: u8 = 0;
+    let mut active_link: Option<&str> = None;
     for seg in segs {
+        let seg_link = seg.link.as_deref();
+        // link 变化: 先闭旧链接(在任何 SGR 输出之前)
+        if active_link != seg_link && active_link.is_some() {
+            out.push_str(OSC8_CLOSE);
+        }
         let off = active & !seg.s;
         let on = seg.s & !active;
         if off & ITALIC != 0 {
@@ -481,8 +619,19 @@ fn render_line(segs: &[Seg]) -> String {
         if on & CYAN != 0 {
             out.push_str("\x1b[36m");
         }
+        // 开新链接: 先 SGR 后 OSC8
+        if active_link != seg_link {
+            if let Some(l) = seg_link {
+                out.push_str(&osc8_open(l));
+            }
+            active_link = seg_link;
+        }
         out.push_str(&seg.t);
         active = seg.s;
+    }
+    // 行尾仍有活动链接: 关闭, 在 \x1b[0m 之前
+    if active_link.is_some() {
+        out.push_str(OSC8_CLOSE);
     }
     if active != 0 {
         out.push_str("\x1b[0m");
@@ -496,24 +645,47 @@ mod tests {
     use pulldown_cmark::{Options, Parser};
 
     fn render(md: &str) -> String {
-        let parser = Parser::new_ext(md, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH);
-        let events: Vec<Event<'static>> = parser.map(|e| e.into_static()).collect();
-        render_ansi(&events)
+        render_with(md, "")
     }
 
-    /// 去掉 SGR 序列后的可见文本(按 \n 分行)。
+    fn render_with(md: &str, link_base: &str) -> String {
+        let parser = Parser::new_ext(md, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH);
+        let events: Vec<Event<'static>> = parser.map(|e| e.into_static()).collect();
+        render_ansi(&events, "post", link_base)
+    }
+
+    /// 去掉 SGR/OSC8 序列后的可见文本(按 \n 分行)。
     fn plain(out: &str) -> Vec<String> {
         out.lines().map(strip_sgr).collect()
     }
 
+    /// 剥掉 SGR(CSI, 到字母为止)与 OSC8(`\x1b]8;;…` 到 ST/BEL 为止)。
     fn strip_sgr(out: &str) -> String {
-        let mut s = out.to_string();
-        while let Some(i) = s.find('\x1b') {
-            let mut j = i + 1;
-            while j < s.len() && !s.as_bytes()[j].is_ascii_alphabetic() {
-                j += 1;
+        let mut s = String::with_capacity(out.len());
+        let mut it = out.chars().peekable();
+        while let Some(c) = it.next() {
+            if c == '\x1b' {
+                if it.peek() == Some(&']') {
+                    // OSC: 消费到 BEL 或 ST(\x1b\\)
+                    it.next();
+                    let mut prev_esc = false;
+                    for c2 in it.by_ref() {
+                        if c2 == '\x07' || (prev_esc && c2 == '\\') {
+                            break;
+                        }
+                        prev_esc = c2 == '\x1b';
+                    }
+                } else {
+                    // CSI 等: 消费到字母(含)
+                    for c2 in it.by_ref() {
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                s.push(c);
             }
-            s.replace_range(i..=j, "");
         }
         s
     }
@@ -613,5 +785,104 @@ mod tests {
         assert_eq!(lines[0], "a | b");
         assert!(lines[1].starts_with("---- | ----"));
         assert_eq!(lines[2], "1 | 2");
+    }
+
+    #[test]
+    fn block_image_box() {
+        // 独占段落图片 → 占位框(无 site_url: URL 为 /blog/... 站点路径)
+        let out = render("正文\n\n![架构图](post/arch.png)\n");
+        let lines = plain(&out);
+        assert!(lines.iter().any(|l| l.starts_with("┌─ 图片 ─")), "应有顶边: {lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("└")), "应有底边: {lines:?}");
+        assert!(lines.iter().any(|l| l == "│ 架构图"), "alt 行带 │ 前缀: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "│ /blog/post/arch.png"),
+            "无 site_url 时 URL 为 /blog/... 形态: {lines:?}"
+        );
+        // 顶边底边补齐到 76 显示列
+        let top = lines.iter().find(|l| l.starts_with("┌")).unwrap();
+        let bottom = lines.iter().find(|l| l.starts_with("└")).unwrap();
+        let w = |s: &str| s.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+        assert_eq!(w(top), 76, "顶边应 76 列: {top:?}");
+        assert_eq!(w(bottom), 76, "底边应 76 列: {bottom:?}");
+        // URL 行带 OSC8 开闭(ST 终止)
+        assert!(
+            out.contains("\x1b]8;;/blog/post/arch.png\x1b\\"),
+            "应有 OSC8 开: {out:?}"
+        );
+        assert!(out.contains("\x1b]8;;\x1b\\"), "应有 OSC8 闭: {out:?}");
+        // 旧降级形态不再出现
+        assert!(!out.contains("image:"), "不应再有旧 image: 降级: {out:?}");
+    }
+
+    #[test]
+    fn block_image_full_url_with_site() {
+        // 有 site_url: 拼完整 URL(SSH 用户可直接复制进浏览器)
+        let out = render_with("![a](post/x.png)\n", "https://blog.example.com");
+        assert!(out.contains("\x1b]8;;https://blog.example.com/blog/post/x.png\x1b\\"));
+        assert!(plain(&out).iter().any(|l| l == "│ https://blog.example.com/blog/post/x.png"));
+    }
+
+    #[test]
+    fn block_image_empty_alt_uses_filename() {
+        let out = render("![](post/x.png)\n");
+        assert!(plain(&out).iter().any(|l| l == "│ x.png"), "空 alt 应用文件名: {}", plain(&out)[1]);
+    }
+
+    #[test]
+    fn block_image_wraps_long_alt_and_url() {
+        // 长 alt(折行续行带 │ 前缀)+ 长 URL(折行后每行都有 OSC8 开闭)
+        let alt = "长".repeat(80); // 160 列 → 73 列内容宽折 3 行
+        let url_path = format!("post/{}.png", "u".repeat(120));
+        let out = render(&format!("![{alt}]({url_path})\n"));
+        let lines: Vec<&str> = out.lines().collect();
+        let plain_lines = plain(&out);
+        let alt_lines: Vec<&String> = plain_lines[1..].iter().take_while(|l| l.starts_with("│ ")).collect();
+        assert!(alt_lines.len() >= 4, "alt 折行续行都应带 │ 前缀: {plain_lines:?}");
+        // URL 折行: 每条 │ 行里若含 URL 片段, 对应原始行必须有 OSC8 开+闭
+        let url_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("]8;;"))
+            .collect();
+        assert!(url_lines.len() >= 2, "长 URL 应折成多行链接: {lines:?}");
+        for l in url_lines {
+            assert!(l.contains("\x1b]8;;/blog/"), "每行应有 OSC8 开: {l:?}");
+            assert!(l.contains("\x1b]8;;\x1b\\"), "每行应有 OSC8 闭: {l:?}");
+        }
+    }
+
+    #[test]
+    fn inline_image_marker_with_link() {
+        // 行内图(段落中夹图) → [图: alt] + OSC8 link
+        let out = render("前文 ![截图](post/s.png) 后文\n");
+        assert!(out.contains("[图: 截图]"), "行内图应为 [图: alt] 标记: {out:?}");
+        assert!(
+            out.contains("\x1b]8;;/blog/post/s.png\x1b\\"),
+            "行内图应带 OSC8: {out:?}"
+        );
+        // 空 alt 行内图 → 文件名
+        let out = render("前文 ![](post/s.png) 后文\n");
+        assert!(out.contains("[图: s.png]"), "空 alt 行内图应用文件名: {out:?}");
+        // 外链行内图: URL 原样
+        let out = render("看 ![外](https://cdn.example.com/a.png) 图\n");
+        assert!(out.contains("\x1b]8;;https://cdn.example.com/a.png\x1b\\"), "外链原样: {out:?}");
+    }
+
+    #[test]
+    fn block_image_in_quote_and_list() {
+        // 引用块内的独占图也给占位框(沿用引用前缀)
+        let out = render("> ![q](post/q.png)\n");
+        let lines = plain(&out);
+        assert!(lines.iter().any(|l| l.starts_with("> ┌─ 图片")), "引用内占位框带 > 前缀: {lines:?}");
+        // 紧凑列表项内的独占图
+        let out = render("- ![l](post/l.png)\n");
+        let lines = plain(&out);
+        assert!(lines.iter().any(|l| l.contains("┌─ 图片")), "列表内占位框: {lines:?}");
+    }
+
+    #[test]
+    fn strip_sgr_removes_osc8() {
+        let s = "\x1b[36m\x1b]8;;https://x.example\x1b\\链接文字\x1b]8;;\x1b\\\x1b[39m";
+        assert_eq!(strip_sgr(s), "链接文字");
     }
 }
