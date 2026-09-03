@@ -1,5 +1,6 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { ImageAddon } from "@xterm/addon-image";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import { installOsc } from "./osc";
@@ -111,6 +112,12 @@ const term = new Terminal({
 });
 const fit = new FitAddon();
 term.loadAddon(fit);
+// 图片二期: iTerm2 Inline Images Protocol(像素内嵌显示)。选项名是
+// iipSizeLimit(不是 sizeLimit), 单位字节; 1 MiB 与 jail 侧运行时硬上限
+// (§5.6.4)呼应(> 单图 683 KiB 上限, 留余量; 同时小于 parser 保护)。
+// sixelSupport 关闭(协议层只选 IIP)。xterm.js 6.0.0 默认 canvas renderer,
+// IIP 可用; 若未来启用 WebglAddon, 必须重新验证图像渲染。
+term.loadAddon(new ImageAddon({ sixelSupport: false, iipSizeLimit: 1 * 1024 * 1024 }));
 // 裸 URL 可点(图片占位框里的链接等); 回调与 OSC8 linkHandler 共用同一确认逻辑
 term.loadAddon(new WebLinksAddon((_event, uri) => confirmOpenLink(uri)));
 
@@ -172,6 +179,9 @@ function connect() {
       rows: term.rows,
       attach_token: sessionStorage.getItem(TOKEN_KEY),
       fresh: onMirror,
+      // 能力通告: 本终端链路支持 iTerm2 Inline Images Protocol(jaild 白名单
+      // 过滤后映射为 jail 里的 TERMBLOG_IMG, blog 据此走 TUI 阅读器)
+      caps: ["img-iterm2"],
     }));
 
     // 键入原样进 WS(不做行缓冲/命令拦截, 否则会与 zsh ZLE、vim 打架)

@@ -8,7 +8,11 @@ anyhow.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 # 图片管线: 解码拿真实尺寸 + 超宽缩小重编码。gif 只解码不重编码(保动画);
 # 明确不支持 svg(同域脚本风险)/avif(编码支持不成熟)。
+# webp 只用于解码: 产物统一转 png(图片二期: 处理后产物只含 png/jpeg/gif,
+# 收窄 xterm.js addon-image 的载荷兼容面)。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 pulldown-cmark = "0.13"
+serde.workspace = true
+serde_json.workspace = true
 termblog-config = { path = "../../config" }
 unicode-width = "0.2"

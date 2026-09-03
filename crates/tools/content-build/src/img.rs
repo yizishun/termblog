@@ -127,12 +127,19 @@ pub struct ProcessedImage {
     pub bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// 最终产物文件名(相对 blog/)。webp 产物统一转 png, 此字段会换扩展名;
+    /// 其余格式与输入 rel 相同。
+    pub dist_rel: String,
 }
 
 /// 处理一张本地图: 读原字节 → gif 原样采用(只解码拿尺寸);
-/// 位图宽 > 1080 则缩小重编码(重编码变大则回退原字节, 此时尺寸按原图报告)。
+/// 位图宽 > 1080 则缩小重编码(重编码变大则回退原字节, 此时尺寸按原图报告);
+/// **webp 产物(含回退原字节分支)统一转 png** —— 构建期格式保证: 处理后产物
+/// 只含 png/jpeg/gif(收窄 addon-image 载荷兼容面; webp 只出现在 lossless
+/// 场景, 转 png 字节级等价)。预算按转换后字节核算。
 /// 所有预算违规 bail, 报错含文章 slug / 文件路径 / 实际大小 / 建议。
 pub fn process_image(path: &Path, rel: &str, article_slug: &str) -> Result<ProcessedImage> {
+    use image::ImageEncoder;
     let raw = std::fs::read(path).with_context(|| format!("读图片 {}", path.display()))?;
     let ext = path
         .extension()
@@ -151,14 +158,19 @@ pub fn process_image(path: &Path, rel: &str, article_slug: &str) -> Result<Proce
         }
         let img = image::load_from_memory_with_format(&raw, image::ImageFormat::Gif)
             .with_context(|| format!("「{article_slug}」的 gif 无法解码: {rel}"))?;
-        return Ok(ProcessedImage { bytes: raw, width: img.width(), height: img.height() });
+        return Ok(ProcessedImage {
+            bytes: raw,
+            width: img.width(),
+            height: img.height(),
+            dist_rel: rel.to_string(),
+        });
     }
 
     let img = image::load_from_memory(&raw)
         .with_context(|| format!("「{article_slug}」的图片无法解码: {rel}"))?;
     let (w, h) = (img.width(), img.height());
 
-    let (bytes, fw, fh) = if w > MAX_WIDTH {
+    let (mut bytes, mut fw, mut fh) = if w > MAX_WIDTH {
         let nh = ((h as u64 * MAX_WIDTH as u64) / w as u64).max(1) as u32;
         let resized =
             image::imageops::resize(&img, MAX_WIDTH, nh, image::imageops::FilterType::Triangle);
@@ -175,6 +187,27 @@ pub fn process_image(path: &Path, rel: &str, article_slug: &str) -> Result<Proce
         (raw, w, h)
     };
 
+    // webp → png: 处理后产物只含 png/jpeg/gif(见文件头注释)。重解码拿像素
+    // 再编码 PNG, 尺寸从 PNG 解码结果取(与 reader 读到的字节同源)。
+    let dist_rel = if ext == "webp" {
+        let img = image::load_from_memory(&bytes)
+            .with_context(|| format!("「{article_slug}」的 webp 产物无法解码(转 png 前): {rel}"))?;
+        let rgba = img.to_rgba8();
+        let mut png_buf: Vec<u8> = vec![];
+        image::codecs::png::PngEncoder::new(&mut png_buf).write_image(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            image::ExtendedColorType::Rgba8,
+        )?;
+        bytes = png_buf;
+        fw = rgba.width();
+        fh = rgba.height();
+        with_png_ext(rel)
+    } else {
+        rel.to_string()
+    };
+
     if bytes.len() > MAX_BITMAP_BYTES {
         bail!(
             "「{article_slug}」的图片 {rel} 处理后为 {} KiB, 超过单张预算 {} KiB; 请自行压缩/缩小",
@@ -182,7 +215,15 @@ pub fn process_image(path: &Path, rel: &str, article_slug: &str) -> Result<Proce
             MAX_BITMAP_BYTES / 1024
         );
     }
-    Ok(ProcessedImage { bytes, width: fw, height: fh })
+    Ok(ProcessedImage { bytes, width: fw, height: fh, dist_rel })
+}
+
+/// rel 的扩展名换成 .png(webp 产物转 png 后的最终文件名)。
+fn with_png_ext(rel: &str) -> String {
+    match rel.rfind('.') {
+        Some(i) if i > rel.rfind('/').unwrap_or(0) => format!("{}.png", &rel[..i]),
+        _ => format!("{rel}.png"),
+    }
 }
 
 /// 按扩展名重编码: jpg/jpeg → JPEG q80; png → PNG 默认; webp → WebP(lossless,

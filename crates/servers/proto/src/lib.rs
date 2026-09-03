@@ -34,6 +34,12 @@ pub struct Open {
     /// jaild 据此做每 IP 配额判定(单一事实来源)。
     #[serde(default)]
     pub peer_ip: Option<String>,
+    /// 客户端能力通告(白名单字符串; 空 = 无增强能力)。已知值:
+    ///   "img-iterm2" —— 终端链路支持 iTerm2 Inline Images Protocol
+    /// 旧客户端/旧网关不填此字段即可互通(serde default); 内容不在此层校验,
+    /// 白名单过滤在 jaild(它把能力映射为 jail 里的提示性环境变量)。
+    #[serde(default)]
+    pub caps: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -110,11 +116,44 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let f = Frame::json(OPEN, &Open { cols: 80, rows: 24, attach_token: None, fresh: false, peer_ip: None });
+        let f = Frame::json(
+            OPEN,
+            &Open {
+                cols: 80,
+                rows: 24,
+                attach_token: None,
+                fresh: false,
+                peer_ip: None,
+                caps: vec![],
+            },
+        );
         let got = decode_one(&encode(&f)).expect("frame");
         assert_eq!(got.kind, OPEN);
         let o: Open = got.parse().unwrap();
         assert_eq!(o.cols, 80);
+    }
+
+    #[test]
+    fn old_json_without_caps_deserializes() {
+        // 旧客户端/旧网关 JSON 没有 caps 字段: 向后兼容(serde default)
+        let json = r#"{"cols":80,"rows":24,"attach_token":null,"fresh":false,"peer_ip":"1.2.3.4"}"#;
+        let o: Open = serde_json::from_str(json).unwrap();
+        assert!(o.caps.is_empty());
+    }
+
+    #[test]
+    fn caps_roundtrip() {
+        let o = Open {
+            cols: 80,
+            rows: 24,
+            attach_token: None,
+            fresh: true,
+            peer_ip: None,
+            caps: vec!["img-iterm2".into()],
+        };
+        let json = serde_json::to_string(&o).unwrap();
+        let back: Open = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.caps, vec!["img-iterm2".to_string()]);
     }
 
     #[test]

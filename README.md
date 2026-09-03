@@ -15,11 +15,17 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
   (`jailtpl/content/.rendered/`, 终端 `less -R` 可读), 并产出列表页/
   sitemap/atom/robots。图片走资源管线: 相对引用构建期重写为 `/blog/...`、
   超宽自动缩放、尺寸/字节预算 fail-fast; 镜像页出真图(`<img>` 带真实宽高 +
-  og:image), 终端出格式稳定的占位框(OSC 8 可点链接)。
+  og:image), 终端出格式稳定的占位框(OSC 8 可点链接)。带图文章另产
+  sidecar `~/.rendered/<slug>.images.json`(占位框行号区间 + 几何)与
+  处理后图片 `~/.rendered-assets/`(webp 统一转 png, 与 dist/blog 同字节)。
   写作约定见 `jailtpl/content/README.md`。
 - **jailbin**: 装进 jail 模板的访客命令多合一二进制(busybox 式), `blog`(cat 式
   文章阅读器: 读预渲染排版 + 同步地址栏)、`play`(asciicast 终端录像播放器,
   自包含实现: 定时回放 + 暂停/逐帧/倍速)与 `webctl`(发 OSC 7777)是其符号链接。
+  带图文章在有能力的会话(前端传 caps `img-iterm2` → jail 里 `TERMBLOG_IMG=iterm2`)
+  改走自写 TUI 阅读器: 图片以 iTerm2 Inline Images Protocol 像素内嵌
+  (ratatui + crossterm, 全链路有界队列背压、字节零丢失), 无能力会话
+  (SSH/旧前端)自动回落 v1 占位框。
 
 ## 目录
 
@@ -48,6 +54,12 @@ frontend/        # xterm.js 前端(vite)
 
 部署目标内嵌 sudo, 直接 `make tpl` / `make deploy` / `make content` 即可
 (会提示输入密码)。部署脚本不依赖 Makefile; Makefile 只是薄入口。
+
+> **图片二期升级注意**: 新 jailbin、`~/.rendered-assets/` 与图片 sidecar 只存在于
+> 重建后的模板数据集里, `make deploy` 不会替换已有 jail 模板。升级后必须带
+> `--replace` 重建模板(零停机换面, 旧会话继续用旧模板):
+> `make build && sudo sh deploy-scripts/deploy.sh && sudo sh deploy-scripts/build-template.sh --replace`。
+> 后续只改文章仍走 `make content`(内部已含 `--replace`)。
 
 配置: `/usr/local/etc/termblog.toml`(仓库 `etc/termblog.toml` 为样例)。
 部署后务必设 `web.site_url`(不设则不产 sitemap/atom/canonical);

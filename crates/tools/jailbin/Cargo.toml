@@ -9,6 +9,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# IIP payload 的 base64 编码(§5.6.7 锁版本)
+base64 = "0.22"
+# TUI 阅读器(§5.6.7 锁版本: ratatui 0.30.2 + crossterm 0.29.0, 不引
+# ratatui-image —— 其 iterm2 后端每次 render 重编码 PNG、默认 chafa-dyn
+# 特性要链 jail 里没有的 libchafa、Picker API 已漂移; IIP 编码自写)
+crossterm = "=0.29.0"
+# 切片裁剪/重编码(png/jpeg/gif 三种处理后产物格式; 版本锁定)
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
 nix = { workspace = true, features = ["poll"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+# alt 行按显示列截断(CJK=2)
+unicode-width = "0.2"

@@ -15,10 +15,17 @@ use nix::unistd::Pid;
 use std::os::unix::io::AsRawFd;
 use termblog_core::{Control, SessionHandle};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use crate::jail::JailBackend;
 use crate::pty::{set_winsize, ShellChild};
+
+/// 输出队列容量(条; PTY 读块 ≤ 8192B, ≈ 1 MiB)。终端字节流是有状态协议
+/// (ANSI/IIP 无帧界), 任意丢一块都会破坏后续序列且不能靠"下次重绘"自愈,
+/// 所以这里从 broadcast(慢消费者丢帧)改为有界 mpsc + 背压: 队列满时停读
+/// PTY → 内核 PTY 缓冲填满 → 子进程 write(2) 阻塞 = 端到端背压, 字节零丢失。
+/// 单消费者链路(jaild → core → web)用 mpsc 语义正合适。
+const OUTPUT_CHUNKS: usize = 128;
 
 pub struct Quota {
     pub max_total: usize,
@@ -44,7 +51,15 @@ impl SessionManager {
     }
 
     /// 开一个会话: 配额检查(入口直接拒绝, 不排队) -> spawn shell -> 启动读写泵
-    pub async fn create(&self, peer: IpAddr, cols: u16, rows: u16) -> Result<SessionHandle> {
+    /// caps: 能力白名单值(见 main.rs 的 filter_caps), 传给 backend 注入
+    /// TERMBLOG_IMG 环境变量。
+    pub async fn create(
+        &self,
+        peer: IpAddr,
+        cols: u16,
+        rows: u16,
+        caps: Vec<String>,
+    ) -> Result<SessionHandle> {
         let inner = &self.0;
 
         static NEXT_SID: AtomicU64 = AtomicU64::new(1);
@@ -62,7 +77,7 @@ impl SessionManager {
             table.insert(sid.clone(), peer);
         }
 
-        let child = match inner.backend.spawn(&sid, cols, rows).await {
+        let child = match inner.backend.spawn(&sid, cols, rows, &caps).await {
             Ok(c) => c,
             Err(e) => {
                 inner.table.lock().unwrap().remove(&sid); // 释放占位
@@ -72,7 +87,7 @@ impl SessionManager {
 
         let (input_tx, input_rx) = mpsc::channel(64);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
-        let (out_tx, out_rx) = broadcast::channel(256); // 慢消费者丢帧, 由 xterm.js 重绘
+        let (out_tx, out_rx) = mpsc::channel(OUTPUT_CHUNKS); // 有界: 满即背压(见泵)
 
         tokio::spawn(pump(self.0.clone(), sid.clone(), child, input_rx, ctrl_rx, out_tx));
 
@@ -88,7 +103,7 @@ async fn pump(
     child: ShellChild,
     mut input: mpsc::Receiver<Bytes>,
     mut ctrl: mpsc::Receiver<Control>,
-    out: broadcast::Sender<Bytes>,
+    out: mpsc::Sender<Bytes>,
 ) {
     let master = match AsyncFd::new(child.master) {
         Ok(m) => m,
@@ -121,12 +136,20 @@ async fn pump(
                 }
                 None => { why = "control 通道关闭(接入层断开)"; break; }
             },
-            // PTY 输出 -> 广播给观察者
+            // PTY 输出 -> 有界队列(背压)
             ready = master.readable() => {
                 let mut g = match ready { Ok(g) => g, Err(_) => { why = "master readable 错误"; break; } };
                 match nix::unistd::read(master.as_raw_fd(), &mut buf) {
                     Ok(0) => { why = "PTY EOF(shell 退出)"; break; }
-                    Ok(n) => { let _ = out.send(Bytes::copy_from_slice(&buf[..n])); }
+                    Ok(n) => {
+                        // 队列满时停读 PTY: 内核 PTY 缓冲填满 -> 子进程
+                        // write(2) 阻塞 = 端到端背压, 字节零丢失。
+                        // 队列只被背压瞬间填满, 正常情况远小于容量。
+                        if out.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                            why = "输出通道关闭(接入层断开)";
+                            break;
+                        }
+                    }
                     Err(nix::errno::Errno::EAGAIN) => g.clear_ready(),
                     Err(_) => { why = "PTY 读错误"; break; }
                 }
@@ -143,7 +166,7 @@ async fn pump(
     let _ = inner.backend.cleanup(&sid).await;
     tracing::info!(sid, "backend 清理完成, 移出会话表");
     inner.table.lock().unwrap().remove(&sid);
-    // out(broadcast::Sender) 随本 task 结束被 drop => 观察者收到 Closed, 得知会话终结
+    // out(mpsc::Sender) 随本 task 结束被 drop => 接入层收到 None, 得知会话终结
 }
 
 /// 等 shell 退出并收尸。waitpid 是阻塞调用, 放 blocking 线程;

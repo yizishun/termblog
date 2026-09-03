@@ -5,7 +5,7 @@
 //! 因此两侧代码可以共用这一份类型定义。
 
 use bytes::Bytes;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 pub enum Control {
     Resize { cols: u16, rows: u16 },
@@ -16,6 +16,6 @@ pub enum Control {
 pub struct SessionHandle {
     pub id: String,
     pub input: mpsc::Sender<Bytes>,          // 键入 -> PTY master 写
-    pub output: broadcast::Receiver<Bytes>,  // PTY master 读 -> 所有观察者
+    pub output: mpsc::Receiver<Bytes>,       // PTY master 读 -> 唯一消费者(单播)
     pub control: mpsc::Sender<Control>,      // Resize
 }

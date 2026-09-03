@@ -39,6 +39,9 @@ pub struct Article {
     /// 本地图 dest_url 原文 → (宽, 高, 重写后 /blog/ 路径); html.rs 查表用。
     /// 外链不进表(html.rs 查不到 = External, 省略宽高)。
     pub image_meta: HashMap<String, (u32, u32, String)>,
+    /// 本地图 dest_url 原文 → (源 rel 路径, 处理后产物 rel 路径)。
+    /// 图片二期 manifest 锚点用(webp 转 png 后两个扩展名不同)。
+    pub dest_paths: HashMap<String, (String, String)>,
     /// 文章第一张本地图的 /blog/ 路径(og:image 用)
     pub first_image: Option<String>,
 }
@@ -214,10 +217,11 @@ fn main() -> Result<()> {
 
         // 图片引用: 逐张 resolve + 处理, 单篇总量预算 1.5 MiB
         let mut image_meta: HashMap<String, (u32, u32, String)> = HashMap::new();
+        let mut dest_paths: HashMap<String, (String, String)> = HashMap::new(); // dest → (源 rel, 产物 rel)
         let mut first_image: Option<String> = None;
         let mut article_bytes = 0usize;
         for dest in collect_image_dests(&events) {
-            let (rel_path, url) = match img::resolve_image_url(&slug, &dest) {
+            let (rel_path, suffix) = match img::resolve_image_url(&slug, &dest) {
                 Err(e) => {
                     image_errors.push(format!("「{slug}」图片 {dest}: {e}"));
                     continue;
@@ -228,12 +232,12 @@ fn main() -> Result<()> {
                     }
                     continue;
                 }
-                Ok(img::ResolvedImage::Local(url)) => {
+                Ok(img::ResolvedImage::Local(_)) => {
                     // resolve 成功则 normalize 必然成功
-                    let (rel_path, _) = img::normalize_local_path(&slug, &dest)
+                    let (rel_path, suffix) = img::normalize_local_path(&slug, &dest)
                         .expect("已 resolve 的本地图")
                         .expect("已 resolve 的本地图");
-                    (rel_path, url)
+                    (rel_path, suffix)
                 }
             };
             let img_path = blog_dir.join(&rel_path);
@@ -255,9 +259,12 @@ fn main() -> Result<()> {
                     }
                     total_imgs += 1;
                     total_bytes += p.bytes.len();
-                    referenced.insert(rel_path.clone());
-                    asset_bytes.entry(rel_path).or_insert_with(|| p.bytes.clone());
+                    referenced.insert(p.dist_rel.clone());
+                    asset_bytes.entry(p.dist_rel.clone()).or_insert_with(|| p.bytes.clone());
+                    // 产物 URL: webp 已转 png, 路径用转换后的扩展名
+                    let url = format!("/blog/{}{suffix}", p.dist_rel);
                     image_meta.insert(dest.clone(), (p.width, p.height, url.clone()));
+                    dest_paths.insert(dest.clone(), (rel_path, p.dist_rel));
                     if first_image.is_none() {
                         first_image = Some(url);
                     }
@@ -273,6 +280,7 @@ fn main() -> Result<()> {
             date_warned,
             events,
             image_meta,
+            dest_paths,
             first_image,
         });
     }
@@ -366,30 +374,67 @@ fn main() -> Result<()> {
     }
     std::fs::create_dir_all(&rendered)
         .with_context(|| format!("创建 {}", rendered.display()))?;
+    // 处理后图片的第二投影(jail 内 TUI 阅读器的读取源): 与 dist/blog 同字节、
+    // 同路径; 目录与 dist/blog 一样每轮先清后写, 僵尸资源天然清理。
+    let rendered_assets = cli.content.join(".rendered-assets");
+    if rendered_assets.exists() {
+        std::fs::remove_dir_all(&rendered_assets)
+            .with_context(|| format!("清理 {}", rendered_assets.display()))?;
+    }
+    std::fs::create_dir_all(&rendered_assets)
+        .with_context(|| format!("创建 {}", rendered_assets.display()))?;
 
     // 复制被引用的图片资源进 dist/blog/(dist/blog 已整体先清, 僵尸资源天然清理)
+    // 与 .rendered-assets/(与 dist/blog 同字节、同路径)
     for (rel_path, bytes) in &asset_bytes {
         let p = dist_blog.join(rel_path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建 {}", parent.display()))?;
         }
-        std::fs::write(p, bytes).with_context(|| format!("写图片 {}", dist_blog.join(rel_path).display()))?;
+        std::fs::write(&p, bytes).with_context(|| format!("写图片 {}", p.display()))?;
+        let q = rendered_assets.join(rel_path);
+        if let Some(parent) = q.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建 {}", parent.display()))?;
+        }
+        std::fs::write(&q, bytes).with_context(|| format!("写处理后图片 {}", q.display()))?;
     }
 
     // ANSI 占位框里 URL 的基址: 有 site_url 拼完整 URL(SSH 用户可直接复制进浏览器),
     // 无则用 /blog/... 站点路径(web 端 OSC8 点击相对当前域仍可达)
     let link_base = site_url.as_deref().unwrap_or("");
 
-    // 逐篇产出: HTML 镜像页 + ANSI 预渲染
+    // 逐篇产出: HTML 镜像页 + ANSI 预渲染(+ 图片 sidecar manifest)
     for a in &arts {
-        let ansi_out = ansi::render_ansi(&a.events, &a.slug, link_base);
+        // 锚点查表: dest 原文 → (源 rel, 产物 rel, 宽, 高)。外链/行内图查不到
+        // → 不产锚点, 占位框保持纯文本形态。
+        let lookup = |dest: &str| -> Option<ansi::ImgMeta> {
+            let (w, h, _) = *a.image_meta.get(dest)?;
+            let (path, asset) = a
+                .dest_paths
+                .get(dest)
+                .cloned()
+                .unwrap_or_else(|| (dest.to_string(), dest.to_string()));
+            Some(ansi::ImgMeta { path, asset, w, h })
+        };
+        let (ansi_out, anchors) = ansi::render_ansi(&a.events, &a.slug, link_base, &lookup);
         let rp = rendered.join(&a.slug);
         if let Some(parent) = rp.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建 {}", parent.display()))?;
         }
         std::fs::write(&rp, ansi_out).with_context(|| format!("写 {}", rp.display()))?;
+        // 有图才写 manifest(无图文章不写文件, reader 据此快速判断无图)
+        if !anchors.is_empty() {
+            let mp = rendered.join(format!("{}.images.json", a.slug));
+            if let Some(parent) = mp.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("创建 {}", parent.display()))?;
+            }
+            std::fs::write(&mp, ansi::Manifest { version: 1, images: anchors }.to_json())
+                .with_context(|| format!("写 {}", mp.display()))?;
+        }
 
         let page = html::render_mirror_page(
             a,
@@ -443,6 +488,7 @@ fn main() -> Result<()> {
         total_bytes / 1024,
         img::MAX_ARTICLE_BYTES / 1024
     );
+    println!("  处理后图片: {}/.rendered-assets/", cli.content.display());
     for w in &warns {
         println!("警告: {w}");
     }

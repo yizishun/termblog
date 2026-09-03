@@ -2,7 +2,8 @@
 //!
 //! 单二进制按 argv[0] 分发: `/usr/local/bin/blog` 与 `/usr/local/bin/webctl`
 //! 是指向 jailbin 的符号链接(模板构建时建立), 访客视角与 shell 版完全一致。
-//! 未来新命令 = 新模块 + 模板里多一条 symlink。
+//! 未来新命令 = 新模块(文件或目录, 如 blog/ 带自己的私有子模块)+ 模板里
+//! 多一条 symlink。
 
 mod blog;
 mod play;

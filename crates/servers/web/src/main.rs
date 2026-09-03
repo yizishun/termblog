@@ -24,10 +24,9 @@ use futures::{SinkExt, StreamExt};
 use termblog_config::Config;
 use termblog_core::{Control, SessionClient};
 use termblog_proto as proto;
-use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
-use sessions::SessionStore;
+use sessions::{CloseReason, SessionStore};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,7 +58,11 @@ async fn main() -> anyhow::Result<()> {
         cfg.web.listen,
         cfg.jail.socket.display()
     );
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -99,10 +102,24 @@ async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {
     }
     let conn = match conn {
         Some(c) => c,
-        None => match store.create(peer, open.cols, open.rows, open.attach_token.clone()).await {
+        None => match store
+            .create(
+                peer,
+                open.cols,
+                open.rows,
+                open.attach_token.clone(),
+                open.caps,
+            )
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
-                let f = proto::Frame::json(proto::CLOSED, &proto::Closed { reason: e.to_string() });
+                let f = proto::Frame::json(
+                    proto::CLOSED,
+                    &proto::Closed {
+                        reason: e.to_string(),
+                    },
+                );
                 let _ = ws_tx.send(Message::Binary(proto::encode(&f))).await;
                 return;
             }
@@ -111,33 +128,85 @@ async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {
 
     // 3) 同步窗口尺寸: attach 回来的连接尺寸可能变了; 顺带触发 SIGWINCH
     //    让 vim/less 等前台程序在回放内容之上重绘到最新画面
-    let _ = conn.control.send(Control::Resize { cols: open.cols, rows: open.rows }).await;
+    let _ = conn
+        .control
+        .send(Control::Resize {
+            cols: open.cols,
+            rows: open.rows,
+        })
+        .await;
 
-    let f = proto::Frame::json(proto::OPENED, &proto::Opened {
-        session_id: conn.sid.clone(),
-        attach_token: conn.token.clone(),
-        attached: conn.attached,
-    });
-    if ws_tx.send(Message::Binary(proto::encode(&f))).await.is_err() {
-        store.detach(&conn.token);
+    let f = proto::Frame::json(
+        proto::OPENED,
+        &proto::Opened {
+            session_id: conn.sid.clone(),
+            attach_token: conn.token.clone(),
+            attached: conn.attached,
+        },
+    );
+    if ws_tx
+        .send(Message::Binary(proto::encode(&f)))
+        .await
+        .is_err()
+    {
+        store.detach(&conn.token, conn.id);
         return;
     }
 
-    // 4) 下行泵: 会话输出 -> WS(纯透传, 套上 Data 帧头)
+    // 4) 下行泵: 会话输出 -> WS。新 attach 接管或慢消费者时,
+    //    forward task 会通知本 WS 主动关闭。
     let mut output = conn.output;
+    let mut close_rx = conn.close_rx;
+    let mut close_rx_open = true;
     let down = tokio::spawn(async move {
         loop {
-            let frame = match output.recv().await {
-                Ok(bytes) => proto::Frame::data(bytes),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue, // 慢消费者丢帧
-                Err(broadcast::error::RecvError::Closed) => {
-                    // 会话已终结(shell 退出 / 宽限期耗尽被回收), 告知前端后收尾
-                    proto::Frame::json(proto::CLOSED, &proto::Closed { reason: "exit".into() })
+            tokio::select! {
+                biased;
+                signal = &mut close_rx, if close_rx_open => {
+                    match signal {
+                        Ok(reason) => {
+                            let message = reason.message();
+                            // slow consumer 是会话级错误, 前端应丢掉 token;
+                            // Replaced 只是刷新接管, 不发 CLOSED, 避免旧页面误删 token。
+                            let code = match reason {
+                                CloseReason::Replaced => 1000,
+                                CloseReason::SlowConsumer => {
+                                    let f = proto::Frame::json(
+                                        proto::CLOSED,
+                                        &proto::Closed { reason: message.into() },
+                                    );
+                                    let _ = ws_tx
+                                        .send(Message::Binary(proto::encode(&f)))
+                                        .await;
+                                    1008 // policy violation
+                                }
+                            };
+                            let _ = ws_tx
+                                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                    code,
+                                    reason: message.into(),
+                                })))
+                                .await;
+                            break;
+                        }
+                        // 会话终结时 sender 与输出队列一起 drop。关闭本分支,
+                        // 由 output=None 走正常 exit 路径。
+                        Err(_) => close_rx_open = false,
+                    }
                 }
-            };
-            let closed = frame.kind == proto::CLOSED;
-            if ws_tx.send(Message::Binary(proto::encode(&frame))).await.is_err() || closed {
-                break;
+                msg = output.recv() => {
+                    let frame = match msg {
+                        Some(bytes) => proto::Frame::data(bytes),
+                        None => {
+                            // 会话已终结(shell 退出 / 宽限期耗尽被回收), 告知前端后收尾
+                            proto::Frame::json(proto::CLOSED, &proto::Closed { reason: "exit".into() })
+                        }
+                    };
+                    let closed = frame.kind == proto::CLOSED;
+                    if ws_tx.send(Message::Binary(proto::encode(&frame))).await.is_err() || closed {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -150,7 +219,9 @@ async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {
                 _ => continue, // Ping/Pong 由 axum 自动应答, Text 忽略
             }
         };
-        let Some(f) = proto::decode_one(&b) else { continue };
+        let Some(f) = proto::decode_one(&b) else {
+            continue;
+        };
         match f.kind {
             proto::DATA => {
                 if conn.input.send(f.payload).await.is_err() {
@@ -159,7 +230,13 @@ async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {
             }
             proto::RESIZE => {
                 if let Ok(r) = f.parse::<proto::Resize>() {
-                    let _ = conn.control.send(Control::Resize { cols: r.cols, rows: r.rows }).await;
+                    let _ = conn
+                        .control
+                        .send(Control::Resize {
+                            cols: r.cols,
+                            rows: r.rows,
+                        })
+                        .await;
                 }
             }
             _ => {}
@@ -168,5 +245,5 @@ async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {
 
     // 6) WS 断开: 停下行泵; 会话不杀, 由 detach 的宽限定时器兜底回收
     down.abort();
-    store.detach(&conn.token);
+    store.detach(&conn.token, conn.id);
 }

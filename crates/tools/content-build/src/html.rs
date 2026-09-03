@@ -353,6 +353,7 @@ mod tests {
             date_warned: false,
             events: parse(md),
             image_meta: HashMap::new(),
+            dest_paths: Default::default(),
             first_image: None,
         }
     }

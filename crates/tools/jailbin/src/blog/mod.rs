@@ -12,6 +12,16 @@
 //! 读 ~/blog/ 下文章时: 进入同步地址栏 /blog/<slug>/(尾斜杠 = canonical 形态),
 //! 退出分页器后复位 /。交互终端用 less -RXc 分页(-R 解释颜色/粗体, -X 不进
 //! 备用屏不闪屏, -c 清屏重画, attach 回放不叠旧画面), 非交互管道直接 cat。
+//!
+//! 图片二期: 满足 reader 的全部进入条件(TERMBLOG_IMG=iterm2 等, 见
+//! blog/reader.rs)时, 带图文章改走自写 TUI 阅读器(图片以 IIP 像素内嵌);
+//! 任一条件不满足 → 现状 less 路径一字不动(v1 占位框降级)。
+//!
+//! reader(TUI 阅读器)与 iip(IIP 编码器)是 blog 命令的私有实现, 不是独立
+//! 命令, 故作为本模块的子模块放在 blog/ 目录下。
+
+mod iip;
+mod reader;
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +39,11 @@ pub fn run(args: &[String]) -> i32 {
     };
     let blog_dir = home.join("blog");
     let rendered_dir = home.join(".rendered");
+
+    // 测试钩子(§5.6.6): 渲染单帧 IIP 到 stdout, 不进入交互
+    if args.first().map(String::as_str) == Some("--dump-image-frame") {
+        return self::reader::dump_cli(&args[1..], &home);
+    }
 
     // 裸 blog(含 shell 版 blog "" 的等价行为)列出文章
     if args.is_empty() || (args.len() == 1 && args[0].is_empty()) {
@@ -73,6 +88,16 @@ pub fn run(args: &[String]) -> i32 {
 
     if !slug.is_empty() {
         emit_osc(&format!("/blog/{slug}/"));
+        // 图片二期: 带图文章在有能力的会话里走 TUI 阅读器(进入条件与
+        // §5.6.1 预检全在 reader::try_run 里; 任一失败回落下面 less 路径)。
+        // TUI 只替换中间的分页器环节, 前后的 OSC 时序不变(§5.9)。
+        let rp = rendered_dir.join(&slug);
+        if rp.is_file() {
+            if let Some(code) = self::reader::try_run(&slug, &home, &rp) {
+                emit_osc("/");
+                return code;
+            }
+        }
     }
 
     // 内容源: 文章优先读预渲染排版; 无产物(模板建成后才加的 md)退回原始文件

@@ -27,7 +27,6 @@ use termblog_config::Config;
 use termblog_core::link::{Link, LinkListener};
 use termblog_core::Control;
 use termblog_proto as proto;
-use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use crate::jail::{ensure_devfs_ruleset, JailBackend};
@@ -35,6 +34,27 @@ use crate::session::{Quota, SessionManager};
 
 /// 握手超时: 首帧必须是 Open
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 能力白名单(图片二期): 已知值只有 img-iterm2(终端链路支持
+/// iTerm2 Inline Images Protocol)。未知值丢弃。
+///
+/// 安全论证: caps 来自客户端、不可信, 但它只影响该访客自己会话的一个
+/// 提示性环境变量(TERMBLOG_IMG=iterm2), 最坏后果是自己的终端收到图像
+/// 字节; 无横向风险。白名单过滤是为了防止环境变量值被注入奇怪字符串
+/// (jaild 把 cap 值原样写进 execve 的 envp)。
+fn filter_caps(caps: &[String]) -> Vec<String> {
+    const KNOWN: &[&str] = &["img-iterm2"];
+    caps.iter()
+        .filter(|c| {
+            let known = KNOWN.contains(&c.as_str());
+            if !known {
+                warn!(cap = %c, "丢弃未知能力通告(白名单之外)");
+            }
+            known
+        })
+        .cloned()
+        .collect()
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -121,8 +141,11 @@ async fn handle_conn(mgr: SessionManager, link: Link) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
-    // 2) 开会话: 配额超限等失败在此被拒(Closed 帧告知原因)
-    let session = match mgr.create(peer, open.cols, open.rows).await {
+    // 2) 开会话: 配额超限等失败在此被拒(Closed 帧告知原因)。
+    //    caps 经白名单过滤(只认已知能力值), 映射为该会话 jail 里的
+    //    提示性环境变量 TERMBLOG_IMG(见 jail.rs)。
+    let caps = filter_caps(&open.caps);
+    let session = match mgr.create(peer, open.cols, open.rows, caps).await {
         Ok(s) => s,
         Err(e) => {
             let f = proto::Frame::json(proto::CLOSED, &proto::Closed { reason: e.to_string() });
@@ -167,13 +190,12 @@ async fn handle_conn(mgr: SessionManager, link: Link) {
                 Err(_) => break, // socket EOF / 协议错误: 接入层断开
             },
             msg = output.recv() => match msg {
-                Ok(bytes) => {
+                Some(bytes) => {
                     if link.send(&proto::Frame::data(bytes)).await.is_err() {
                         break; // 对端已断开
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue, // 慢消费者丢帧
-                Err(broadcast::error::RecvError::Closed) => {
+                None => {
                     // shell 已退出/会话被回收: 告知接入层后收尾
                     let f = proto::Frame::json(proto::CLOSED, &proto::Closed { reason: "exit".into() });
                     let _ = link.send(&f).await;
@@ -184,4 +206,18 @@ async fn handle_conn(mgr: SessionManager, link: Link) {
     }
     tracing::info!(sid = %session.id, "连接结束, 会话交还(立即回收)");
     // session(input/control/output) 随本函数结束被 drop => 泵回收 shell 并销毁 jail
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caps_whitelist_filter() {
+        // 已知值保留, 未知值丢弃(顺序保留)
+        let caps = vec!["img-iterm2".to_string(), "evil; rm -rf".to_string(), "IMG_ITERM2".to_string()];
+        assert_eq!(filter_caps(&caps), vec!["img-iterm2".to_string()]);
+        assert!(filter_caps(&[]).is_empty());
+        assert!(filter_caps(&["img-sixel".to_string()]).is_empty());
+    }
 }

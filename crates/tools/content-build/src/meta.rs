@@ -198,6 +198,7 @@ mod tests {
             date_warned: false,
             events: vec![],
             image_meta: Default::default(),
+            dest_paths: Default::default(),
             first_image: None,
         }
     }

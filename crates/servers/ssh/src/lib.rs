@@ -24,7 +24,7 @@ use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Config, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, Pty};
 use termblog_core::{Control, SessionClient};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 /// SSH 接入层配置
 pub struct SshConfig {
@@ -159,7 +159,9 @@ impl Handler for SshHandler {
 
     async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
         let (cols, rows) = self.winsize;
-        match self.client.open(self.peer, cols, rows, None).await {
+        // SSH 侧显式空 caps: 不做终端能力探测(DA1/sixel 主动查询是非目标),
+        // SSH 访客固定走 v1 占位框降级。
+        match self.client.open(self.peer, cols, rows, None, vec![]).await {
             Ok(s) => {
                 tracing::info!(peer = %self.peer, sid = %s.id, "会话创建成功");
                 let termblog_core::SessionHandle {
@@ -174,13 +176,12 @@ impl Handler for SshHandler {
                 let pump = tokio::spawn(async move {
                     loop {
                         match output.recv().await {
-                            Ok(bytes) => {
+                            Some(bytes) => {
                                 if handle.data(channel, bytes).await.is_err() {
                                     break; // channel 已被客户端关闭
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue, // 慢消费者丢帧
-                            Err(broadcast::error::RecvError::Closed) => {
+                            None => {
                                 let _ = handle.exit_status_request(channel, 0).await;
                                 let _ = handle.close(channel).await;
                                 break;

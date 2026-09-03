@@ -94,12 +94,17 @@ echo '录像: 敲 play 列出终端录像(.cast), 播一个: play hello/demo (�
 EOF
 
 # 8. 博客内容: 文章进 ~/blog(与 URL /blog/ 一一对应), 预渲染产物进 ~/.rendered
-#    (hidden 工具目录, 不混进文章); README 是仓库侧写作规范, 不进 jail
+#    (hidden 工具目录, 不混进文章); 处理后图片进 ~/.rendered-assets(图片二期:
+#    TUI 阅读器读的像素图源, 与 dist/blog 同字节同路径); README 是仓库侧
+#    写作规范, 不进 jail
 if [ -d "$REPO/jailtpl/content" ]; then
-    mkdir -p "$BUILD_MOUNT/home/$GUEST/blog" "$BUILD_MOUNT/home/$GUEST/.rendered"
+    mkdir -p "$BUILD_MOUNT/home/$GUEST/blog" "$BUILD_MOUNT/home/$GUEST/.rendered" "$BUILD_MOUNT/home/$GUEST/.rendered-assets"
     cp -R "$REPO/jailtpl/content/blog/." "$BUILD_MOUNT/home/$GUEST/blog/"
     if [ -d "$REPO/jailtpl/content/.rendered" ]; then
         cp -R "$REPO/jailtpl/content/.rendered/." "$BUILD_MOUNT/home/$GUEST/.rendered/"
+    fi
+    if [ -d "$REPO/jailtpl/content/.rendered-assets" ]; then
+        cp -R "$REPO/jailtpl/content/.rendered-assets/." "$BUILD_MOUNT/home/$GUEST/.rendered-assets/"
     fi
 fi
 chown -R 1001:1001 "$BUILD_MOUNT/home/$GUEST"

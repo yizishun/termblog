@@ -82,12 +82,19 @@ impl JailBackend {
 
 impl JailBackend {
     /// 建一个会话 jail 并 fork 出 PTY 上的 shell。重活放 blocking 线程,
-    /// 不占 tokio worker。
-    pub async fn spawn(&self, sid: &str, cols: u16, rows: u16) -> Result<ShellChild> {
+    /// 不占 tokio worker。caps: 白名单能力值(决定 TERMBLOG_IMG 环境变量)。
+    pub async fn spawn(
+        &self,
+        sid: &str,
+        cols: u16,
+        rows: u16,
+        caps: &[String],
+    ) -> Result<ShellChild> {
         let cfg = self.cfg.clone();
         let sid = sid.to_string();
+        let caps = caps.to_vec();
         let osreldate = self.osreldate;
-        tokio::task::spawn_blocking(move || spawn_sync(&cfg, &sid, cols, rows, osreldate))
+        tokio::task::spawn_blocking(move || spawn_sync(&cfg, &sid, cols, rows, &caps, osreldate))
             .await
             .context("jail spawn task panicked")?
     }
@@ -102,13 +109,20 @@ impl JailBackend {
     }
 }
 
-fn spawn_sync(cfg: &JailConfig, sid: &str, cols: u16, rows: u16, osreldate: u32) -> Result<ShellChild> {
+fn spawn_sync(
+    cfg: &JailConfig,
+    sid: &str,
+    cols: u16,
+    rows: u16,
+    caps: &[String],
+    osreldate: u32,
+) -> Result<ShellChild> {
     let ds = format!("{}{}", cfg.dataset_prefix, sid);
     let path = format!("{}/s-{sid}", cfg.path_prefix);
     let name = format!("s-{sid}");
 
     // 失败兜底: 任何一步失败都把已建资源全部销毁(幂等), 不留半成品
-    let res = spawn_inner(cfg, sid, cols, rows, osreldate, &ds, &path, &name);
+    let res = spawn_inner(cfg, sid, cols, rows, caps, osreldate, &ds, &path, &name);
     if let Err(e) = &res {
         // 失败原因必须落日志: 否则只剩 socket 上的 Closed 帧, 排障无门
         error!(sid, error = %e, "jail spawn 失败");
@@ -123,6 +137,7 @@ fn spawn_inner(
     sid: &str,
     cols: u16,
     rows: u16,
+    caps: &[String],
     osreldate: u32,
     ds: &str,
     path: &str,
@@ -210,14 +225,17 @@ fn spawn_inner(
     let zsh = CString::new(cfg.zsh.clone())?;
     let arg0 = CString::new("-zsh")?; // argv[0] 以 '-' 开头 => login shell
     let argv: [*const c_char; 2] = [arg0.as_ptr(), std::ptr::null()];
-    let home_c = CString::new(format!("HOME={home}"))?;
     // chdir(2) 要裸路径("HOME=/home/guest" 是环境串, 传它会 ENOENT 且静默
     // 留在 /); 环境串与路径分开备好(子进程里不分配内存)
     let home_dir = CString::new(home.clone())?;
-    let term_c = CString::new("TERM=xterm-256color")?;
-    let path_c = CString::new("PATH=/usr/local/bin:/usr/bin:/bin")?;
-    let envp: [*const c_char; 4] =
-        [term_c.as_ptr(), path_c.as_ptr(), home_c.as_ptr(), std::ptr::null()];
+    // 环境变量: fork 前构建 Vec<CString> + Vec<*const c_char>(fork 前分配
+    // 是安全的, 现有代码同此模式; 子进程只用指针)。内容见 env_strings。
+    let envs: Vec<CString> = env_strings(&home, caps)
+        .into_iter()
+        .map(|e| CString::new(e).expect("环境串无 NUL"))
+        .collect();
+    let mut envp: Vec<*const c_char> = envs.iter().map(|e| e.as_ptr()).collect();
+    envp.push(std::ptr::null());
 
     match unsafe { fork() }.context("fork")? {
         ForkResult::Parent { child } => {
@@ -257,6 +275,22 @@ fn spawn_inner(
             libc::_exit(127);
         },
     }
+}
+
+/// 会话 shell 的环境变量内容(独立成纯函数便于单测):
+/// caps 含 img-iterm2 时含 TERMBLOG_IMG=iterm2(图片二期: 告知 jailbin 的
+/// blog 可以走 TUI 阅读器); **否则完全不设置该变量** —— 绝不设空值,
+/// 空环境变量仍"存在", 会误导 reader 的严格相等判断。
+fn env_strings(home: &str, caps: &[String]) -> Vec<String> {
+    let mut e = vec![
+        format!("HOME={home}"),
+        "TERM=xterm-256color".into(),
+        "PATH=/usr/local/bin:/usr/bin:/bin".into(),
+    ];
+    if caps.iter().any(|c| c == "img-iterm2") {
+        e.push("TERMBLOG_IMG=iterm2".into());
+    }
+    e
 }
 
 /// 用 `jls -j <name> jid` 查 jail 的 jid(创建后立刻可用)。
@@ -360,4 +394,22 @@ fn run(prog: &str, args: &[&str]) -> Result<()> {
 
 fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envp_contains_termblog_img_only_with_cap() {
+        // caps 含 img-iterm2 → 设置 TERMBLOG_IMG=iterm2
+        let envs = env_strings("/home/guest", &["img-iterm2".to_string()]);
+        assert!(envs.iter().any(|e| e == "TERMBLOG_IMG=iterm2"), "{envs:?}");
+        assert!(envs.iter().any(|e| e == "HOME=/home/guest"));
+        // 无 caps / 未知 caps → 完全不设置该变量(不是设空值)
+        let envs = env_strings("/home/guest", &[]);
+        assert!(!envs.iter().any(|e| e.starts_with("TERMBLOG_IMG")), "{envs:?}");
+        let envs = env_strings("/home/guest", &["img-sixel".to_string()]);
+        assert!(!envs.iter().any(|e| e.starts_with("TERMBLOG_IMG")), "{envs:?}");
+    }
 }
