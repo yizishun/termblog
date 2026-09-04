@@ -114,27 +114,9 @@ pub fn page_limit(limit: Option<u16>) -> Result<usize, &'static str> {
     Ok(n as usize)
 }
 
-/// 合法 target: /、/blog/ 或 /blog/<slug>/，slug 与内容编译器完全同型。
+/// 合法 target: `/` 或任意规范的 content/HOME 相对目录 route。
 pub fn valid_target(target: &str) -> bool {
-    if target.len() > 200 {
-        return false;
-    }
-    if target == "/" || target == "/blog/" {
-        return true;
-    }
-    let Some(slug) = target
-        .strip_prefix("/blog/")
-        .and_then(|s| s.strip_suffix('/'))
-    else {
-        return false;
-    };
-    !slug.is_empty()
-        && !slug.starts_with('/')
-        && !slug.ends_with('/')
-        && !slug.contains("//")
-        && slug
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'/' || b == b'-')
+    termblog_content_model::validate_target(target).is_ok()
 }
 
 #[cfg(test)]
@@ -143,7 +125,7 @@ mod tests {
 
     #[test]
     fn target_validation() {
-        for good in ["/", "/blog/", "/blog/hello/", "/blog/a/b-2/"] {
+        for good in ["/", "/blog/", "/notes/", "/projects/demo/", "/blog/a/b-2/"] {
             assert!(valid_target(good), "{good}");
         }
         for bad in [

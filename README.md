@@ -10,18 +10,19 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
   ZFS clone 出一个会话 jail(rctl 限额 + 4M 磁盘配额), PTY 经 Unix socket 供接入层使用。
 - **commentd**(root, 评论单写者): 用独立 root-only JSONL 数据库存储待审/通过/删除状态，
   通过 public/private 两个 Unix socket 分隔只读查询与投稿、审核；访客向 jail 内 FIFO
-  写一行即可投稿。文章评论绑定直属目录，同目录文章共享一个 FIFO；无直属文章的目录不创建。
+  写一行即可投稿。评论 attachment 由内容配置显式列出；同目录文章共享一个 FIFO，
+  空目录也可独立启用评论。
 - **termblog-web / termblog-ssh**(降权 www): 浏览器(WS)/ SSH 两个接入网关,
   经 SEQPACKET Unix socket 连 jaild, 零协议转换。
-- **content-build**: 把唯一内容源 `jailtpl/content/blog/*.md` 一次解析成两个投影 ——
-  HTML 静态镜像(`frontend/dist/blog/<slug>/`, 爬虫不开 jail 读全文)与 ANSI 预渲染
+- **content-build**: 把 `jailtpl/content/` 可见目录中的全部 `.md` 一次解析成两个投影 ——
+  HTML 静态镜像(输出路径直接对应文章 route，爬虫不开 jail 也能读全文)与 ANSI 预渲染
   (`jailtpl/content/.rendered/`, 终端 `less -R` 可读), 并产出列表页/
-  sitemap/atom/robots。图片走资源管线: 相对引用构建期重写为 `/blog/...`、
+  sitemap/atom/robots。图片走资源管线: 相对 Markdown 目录解析并改写为站点绝对路径、
   超宽自动缩放、尺寸/字节预算 fail-fast; 镜像页出真图(`<img>` 带真实宽高 +
   og:image), 终端出格式稳定的占位框(OSC 8 可点链接)。带图文章另产
-  sidecar `~/.rendered/<slug>.images.json`(占位框行号区间 + 几何)与
-  处理后图片 `~/.rendered-assets/`(webp 统一转 png, 与 dist/blog 同字节)。
-  写作约定见 `jailtpl/content/README.md`。
+  sidecar `~/.rendered/<article-key>.images.json`(占位框行号区间 + 几何)与
+  处理后图片 `~/.rendered-assets/`(webp 统一转 png, 与 Web 产物同字节)。
+  路径映射、评论配置和写作约定见 `docs/content-authoring.md`。
 - **jailbin**: 装进 jail 模板的访客命令多合一二进制(busybox 式), `blog`(cat 式
   文章阅读器: 读预渲染排版 + 同步地址栏)、`play`(asciicast 终端录像播放器,
   自包含实现: 定时回放 + 暂停/逐帧/倍速)与 `webctl`(发 OSC 7777)是其符号链接。
@@ -36,11 +37,12 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
 crates/
   config/        # termblog-config: TOML 配置(servers 与 content-build 共用)
   servers/       # proto(线协议) core(会话运行时) web ssh jaild commentd
+  content-model/ # content/HOME 路径、公开 route、评论 attachment 的共享模型
   tools/         # content-build(内容编译器) jailbin(jail 内命令)
 deploy-scripts/  # build-template.sh(模板构建/零停机换面) deploy.sh(全量部署)
-tests/           # verify-m3.sh verify-m5.sh e2e-reconnect.mjs(验收脚本)
-jailtpl/content/ # 唯一内容源: help.md + blog/*.md(每篇可带同名资源目录, 如录像 .cast)
-                 # + .rendered 产物(README 写作规范只留仓库)
+tests/           # verify 脚本与无 blog 目录的 content path 端到端验收
+jailtpl/content/ # guest HOME 蓝图；任意可见 *.md 是文章，blog/ 无特殊语义
+                 # 隐藏配置和 .rendered 等生成物不按普通内容复制
 etc/             # termblog.toml 样例 + rc.d + newsyslog
 frontend/        # xterm.js 前端(vite)
 ```
@@ -74,6 +76,7 @@ frontend/        # xterm.js 前端(vite)
 - `sh tests/verify-m5.sh`: 镜像页 / 发现链路 / feed / robots + ssh 侧 blog 行为
 - `sh tests/verify-comments.sh`(root): 双 socket / FIFO 投稿 / 审核 / API / 初始会话快照
 - `node tests/e2e-reconnect.mjs`: 断线重连协议
+- `node tests/e2e-content-paths.mjs`: 通用 content/HOME 路径、清理与冲突回归
 
 ## 开发
 

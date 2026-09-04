@@ -1,10 +1,10 @@
 //! play —— asciicast 终端录像播放器(自包含, 不依赖 asciinema 二进制)。
 //!
 //! 解析 asciicast v1/v2/v3, 按事件时间戳把输出字节回放进当前终端。
-//! 录像随博文走: 每篇博文的资源目录放 .cast, 如 ~/blog/hello/demo.cast。
+//! `.cast` 可放在 HOME 任意可见目录，路径不依赖文章布局。
 //!
-//!   play                    列出 ~/blog 下可播的 .cast
-//!   play hello/demo         = play ~/blog/hello/demo(.cast 可省)
+//!   play                    递归列出 HOME 下可播的 .cast
+//!   play demos/boot         = play ~/demos/boot.cast
 //!   play 任意路径/文件.cast  相对 cwd / 绝对路径原样找
 //!   play -s 2 -i 1.5 xxx    2 倍速 + 空闲压缩到 1.5s
 //!
@@ -55,7 +55,10 @@ pub fn parse_cast(text: &str) -> Result<Cast, String> {
     }
 
     // v2/v3: 首行 header JSON, 其余每行一个 [time, code, data] 事件
-    let mut lines = text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty());
+    let mut lines = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty());
     let (ln, first) = lines.next().ok_or_else(|| "空文件".to_string())?;
     let header: Value = serde_json::from_str(first)
         .map_err(|e| format!("第 {} 行: 不是合法的 header JSON: {e}", ln + 1))?;
@@ -86,7 +89,10 @@ pub fn parse_cast(text: &str) -> Result<Cast, String> {
         };
         prev_t = t;
         if ev.1 == "o" {
-            events.push(OutEvent { t, data: ev.2.into_bytes() });
+            events.push(OutEvent {
+                t,
+                data: ev.2.into_bytes(),
+            });
         }
     }
     Ok(Cast { events, ..cast })
@@ -105,7 +111,10 @@ fn parse_v1(doc: &Value) -> Result<Cast, String> {
         let pair: (f64, String) = serde_json::from_value(item.clone())
             .map_err(|_| format!("stdout[{i}]: 不是 [延迟, 数据] 二元组"))?;
         acc += pair.0.max(0.0); // v1 是相对延迟, 累加成绝对时间
-        events.push(OutEvent { t: acc, data: pair.1.into_bytes() });
+        events.push(OutEvent {
+            t: acc,
+            data: pair.1.into_bytes(),
+        });
     }
     Ok(Cast {
         version: 1,
@@ -129,7 +138,10 @@ fn parse_v23(version: u64, header: &Value) -> Result<Cast, String> {
         version,
         cols,
         rows,
-        title: header.get("title").and_then(Value::as_str).map(String::from),
+        title: header
+            .get("title")
+            .and_then(Value::as_str)
+            .map(String::from),
         idle_time_limit: header.get("idle_time_limit").and_then(Value::as_f64),
         events: Vec::new(),
     })
@@ -146,7 +158,7 @@ fn get_u16(v: &Value, key: &str) -> Result<u16, String> {
 
 /// 空闲压缩: 相邻事件间隔超过 limit 的部分扣掉(算法同 asciinema)。
 pub fn apply_idle_limit(events: &mut [OutEvent], limit: f64) {
-    if !(limit > 0.0) {
+    if !limit.is_finite() || limit <= 0.0 {
         return;
     }
     let mut prev = 0.0f64;
@@ -258,7 +270,7 @@ fn wait_key(stdin_open: &mut bool, timeout: Option<Duration>) -> Option<u8> {
     let to: PollTimeout = match timeout {
         None => PollTimeout::NONE,
         Some(d) => {
-            let ms = (d.as_nanos() + 999_999) / 1_000_000;
+            let ms = d.as_nanos().div_ceil(1_000_000);
             PollTimeout::try_from(ms).unwrap_or(PollTimeout::MAX)
         }
     };
@@ -296,10 +308,10 @@ impl TtyGuard {
             return None;
         }
         let fd = unsafe { BorrowedFd::borrow_raw(0) };
-        let orig = tcgetattr(&fd).ok()?;
+        let orig = tcgetattr(fd).ok()?;
         let mut raw = orig.clone();
         cfmakeraw(&mut raw);
-        tcsetattr(&fd, SetArg::TCSANOW, &raw).ok()?;
+        tcsetattr(fd, SetArg::TCSANOW, &raw).ok()?;
         Some(Self { orig })
     }
 }
@@ -310,7 +322,7 @@ impl Drop for TtyGuard {
         use std::os::fd::BorrowedFd;
 
         let fd = unsafe { BorrowedFd::borrow_raw(0) };
-        let _ = tcsetattr(&fd, SetArg::TCSANOW, &self.orig);
+        let _ = tcsetattr(fd, SetArg::TCSANOW, &self.orig);
     }
 }
 
@@ -320,16 +332,22 @@ pub fn run(args: &[String]) -> i32 {
     let mut speed: f64 = 1.0;
     let mut idle_override: Option<f64> = None;
     let mut file: Option<String> = None;
+    let mut end_options = false;
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        if a == "--" && !end_options {
+            end_options = true;
+            i += 1;
+            continue;
+        }
         match a {
-            "-h" | "--help" => {
+            "-h" | "--help" if !end_options => {
                 print!("{USAGE}");
                 return 0;
             }
-            "-s" | "--speed" => {
+            "-s" | "--speed" if !end_options => {
                 i += 1;
                 match args.get(i).and_then(|s| s.parse::<f64>().ok()) {
                     Some(v) if v > 0.0 && v.is_finite() => speed = v,
@@ -339,7 +357,7 @@ pub fn run(args: &[String]) -> i32 {
                     }
                 }
             }
-            "-i" | "--idle-limit" => {
+            "-i" | "--idle-limit" if !end_options => {
                 i += 1;
                 match args.get(i).and_then(|s| s.parse::<f64>().ok()) {
                     Some(v) if v > 0.0 && v.is_finite() => idle_override = Some(v),
@@ -349,21 +367,25 @@ pub fn run(args: &[String]) -> i32 {
                     }
                 }
             }
-            s if let Some(v) = s.strip_prefix("--speed=") => match v.parse::<f64>() {
-                Ok(v) if v > 0.0 && v.is_finite() => speed = v,
-                _ => {
-                    eprintln!("play: --speed 需要一个正数");
-                    return 2;
+            s if !end_options && s.starts_with("--speed=") => {
+                match s["--speed=".len()..].parse::<f64>() {
+                    Ok(v) if v > 0.0 && v.is_finite() => speed = v,
+                    _ => {
+                        eprintln!("play: --speed 需要一个正数");
+                        return 2;
+                    }
                 }
-            },
-            s if let Some(v) = s.strip_prefix("--idle-limit=") => match v.parse::<f64>() {
-                Ok(v) if v > 0.0 && v.is_finite() => idle_override = Some(v),
-                _ => {
-                    eprintln!("play: --idle-limit 需要一个正数(秒)");
-                    return 2;
+            }
+            s if !end_options && s.starts_with("--idle-limit=") => {
+                match s["--idle-limit=".len()..].parse::<f64>() {
+                    Ok(v) if v > 0.0 && v.is_finite() => idle_override = Some(v),
+                    _ => {
+                        eprintln!("play: --idle-limit 需要一个正数(秒)");
+                        return 2;
+                    }
                 }
-            },
-            s if s.starts_with('-') && s.len() > 1 => {
+            }
+            s if !end_options && s.starts_with('-') && s.len() > 1 => {
                 eprintln!("play: 未知选项 {s} (-h 看用法)");
                 return 2;
             }
@@ -433,36 +455,35 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// 文件解析顺序(与 blog 同款): 原样(相对 cwd / 绝对) → ~/blog/<arg> → ~/blog/<arg>.cast
+/// 文件解析顺序: 原样(相对 cwd / 绝对) → $HOME/<arg> → $HOME/<arg>.cast。
 fn resolve(arg: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let blog = home.join("blog");
-    for cand in [
-        PathBuf::from(arg),
-        blog.join(arg),
-        blog.join(format!("{arg}.cast")),
-    ] {
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
+    resolve_in_home(arg, &home)
 }
 
-/// 裸 play: 列出 ~/blog 下的 .cast(相对路径, 去后缀, 直接可当参数用)。
+fn resolve_in_home(arg: &str, home: &Path) -> Option<PathBuf> {
+    [
+        PathBuf::from(arg),
+        home.join(arg),
+        home.join(format!("{arg}.cast")),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+/// 裸 play: 递归列出 HOME 下非隐藏的 .cast（相对路径，去后缀）。
 fn list_casts() -> i32 {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         eprintln!("play: HOME 未设置");
         return 1;
     };
-    let blog = home.join("blog");
     let mut found: Vec<String> = vec![];
-    walk_casts(&blog, &blog, &mut found);
+    walk_casts(&home, &home, &mut found);
     if found.is_empty() {
-        println!("还没有录像(.cast)。把录像放进 ~/blog/<博文目录>/ 再敲 play。");
+        println!("还没有录像(.cast)。把录像放进 HOME 的非隐藏目录后再敲 play。");
     } else {
         found.sort();
-        println!("可播录像(~/blog 下):");
+        println!("可播录像（HOME 相对路径）:");
         for f in &found {
             println!("  {f}");
         }
@@ -472,12 +493,25 @@ fn list_casts() -> i32 {
 }
 
 fn walk_casts(root: &Path, dir: &Path, out: &mut Vec<String>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for entry in rd.flatten() {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
             walk_casts(root, &path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("cast") {
+        } else if metadata.is_file() && path.extension().and_then(|e| e.to_str()) == Some("cast") {
             if let Ok(rel) = path.strip_prefix(root) {
                 let s = rel.to_string_lossy();
                 out.push(s.strip_suffix(".cast").unwrap_or(&s).to_string());
@@ -489,11 +523,11 @@ fn walk_casts(root: &Path, dir: &Path, out: &mut Vec<String>) {
 const USAGE: &str = "\
 用法: play [选项] <录像>
 
-播放 asciicast 终端录像(v1/v2/v3)。录像随博文存放:
-~/blog/<博文目录>/<名字>.cast, 如 ~/blog/hello/demo.cast → play hello/demo
+播放 asciicast 终端录像(v1/v2/v3)。录像可放在 HOME 任意可见目录，
+例如 ~/demos/boot.cast → play demos/boot。
 
-查找顺序: 原样路径(相对 cwd / 绝对) → ~/blog/<录像> → ~/blog/<录像>.cast
-不带参数时列出 ~/blog 下全部可播录像。
+查找顺序: 原样路径(相对 cwd / 绝对) → ~/<录像> → ~/<录像>.cast
+不带参数时递归列出 HOME 下全部可播录像；隐藏路径和符号链接不参与发现。
 
 选项:
   -s, --speed N        倍速播放 (默认 1.0)
@@ -508,7 +542,10 @@ mod tests {
     use super::*;
 
     fn ev(t: f64, s: &str) -> OutEvent {
-        OutEvent { t, data: s.as_bytes().to_vec() }
+        OutEvent {
+            t,
+            data: s.as_bytes().to_vec(),
+        }
     }
 
     #[test]
@@ -568,7 +605,10 @@ mod tests {
         assert!((ts[1] - 1.000001).abs() < 1e-9);
         assert!((ts[2] - 13.400002).abs() < 1e-9);
         let datas: Vec<&[u8]> = cast.events.iter().map(|e| e.data.as_slice()).collect();
-        assert_eq!(datas, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            datas,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
     }
 
     #[test]
@@ -580,7 +620,10 @@ mod tests {
         let ts: Vec<f64> = cast.events.iter().map(|e| e.t).collect();
         assert_eq!(ts, vec![0.5, 1.75, 2.0]); // 相对延迟累加
         let datas: Vec<&[u8]> = cast.events.iter().map(|e| e.data.as_slice()).collect();
-        assert_eq!(datas, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            datas,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
     }
 
     #[test]
@@ -589,13 +632,20 @@ mod tests {
         assert!(parse_cast("not json").is_err());
         assert!(parse_cast(r#"{"version": 9}"#).is_err());
         assert!(parse_cast(r#"{"version": 2}"#).is_err()); // 缺 width
-        assert!(parse_cast("{\"version\": 2, \"width\": 80, \"height\": 24}\n[1, 2]").is_err()); // 事件不是三元组
+        assert!(parse_cast("{\"version\": 2, \"width\": 80, \"height\": 24}\n[1, 2]").is_err());
+        // 事件不是三元组
     }
 
     #[test]
     fn idle_limit_matches_asciinema() {
         // 与 asciinema limit_idle_time 单测同一组数据
-        let mut events = vec![ev(0.0, "a"), ev(1.0, "b"), ev(3.5, "c"), ev(4.0, "d"), ev(7.5, "e")];
+        let mut events = vec![
+            ev(0.0, "a"),
+            ev(1.0, "b"),
+            ev(3.5, "c"),
+            ev(4.0, "d"),
+            ev(7.5, "e"),
+        ];
         apply_idle_limit(&mut events, 2.0);
         let ts: Vec<f64> = events.iter().map(|e| e.t).collect();
         assert_eq!(ts, vec![0.0, 1.0, 3.0, 3.5, 5.5]);
@@ -620,5 +670,31 @@ mod tests {
     fn zstd_magic_const() {
         // 与 asciinema ZSTD_MAGIC 一致
         assert_eq!(ZSTD_MAGIC, [0x28, 0xb5, 0x2f, 0xfd]);
+    }
+
+    #[test]
+    fn home_rooted_resolution_and_discovery_are_generic() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        std::fs::create_dir_all(home.join("blog/hello")).unwrap();
+        std::fs::create_dir_all(home.join(".hidden")).unwrap();
+        std::fs::write(home.join("notes/demo.cast"), "cast").unwrap();
+        std::fs::write(home.join("blog/hello/demo.cast"), "cast").unwrap();
+        std::fs::write(home.join(".hidden/secret.cast"), "cast").unwrap();
+
+        assert_eq!(
+            resolve_in_home("notes/demo", home),
+            Some(home.join("notes/demo.cast"))
+        );
+        assert_eq!(
+            resolve_in_home("blog/hello/demo", home),
+            Some(home.join("blog/hello/demo.cast"))
+        );
+
+        let mut found = Vec::new();
+        walk_casts(home, home, &mut found);
+        found.sort();
+        assert_eq!(found, ["blog/hello/demo", "notes/demo"]);
     }
 }

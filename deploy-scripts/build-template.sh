@@ -89,28 +89,32 @@ export LANG=C.UTF-8
 umask 022
 PS1='%F{green}blog@jail%f %~ %# '
 setopt INTERACTIVE_COMMENTS
-echo '帮助: blog ~/help.md    博客: blog 看列表, blog hello 读文章'
-echo '录像: 敲 play 列出终端录像(.cast), 播一个: play hello/demo (空格暂停, q 退出)'
+echo '帮助: blog ~/help.md    博客: blog 看列表, blog <article-key> 读文章'
+echo '录像: play 看列表, play <cast-key> 播放 (空格暂停, q 退出)'
 EOF
 
-# 8. 博客内容: 文章进 ~/blog(与 URL /blog/ 一一对应), 预渲染产物进 ~/.rendered
-#    (hidden 工具目录, 不混进文章); 处理后图片进 ~/.rendered-assets(图片二期:
-#    TUI 阅读器读的像素图源, 与 dist/blog 同字节同路径); README 是仓库侧
-#    写作规范, 不进 jail
-if [ -d "$REPO/jailtpl/content" ]; then
-    mkdir -p "$BUILD_MOUNT/home/$GUEST/blog" "$BUILD_MOUNT/home/$GUEST/.rendered" "$BUILD_MOUNT/home/$GUEST/.rendered-assets"
-    cp -R "$REPO/jailtpl/content/blog/." "$BUILD_MOUNT/home/$GUEST/blog/"
-    install -m 444 "$REPO/jailtpl/content/help.md" "$BUILD_MOUNT/home/$GUEST/help.md"
-    if [ -d "$REPO/jailtpl/content/.rendered" ]; then
-        cp -R "$REPO/jailtpl/content/.rendered/." "$BUILD_MOUNT/home/$GUEST/.rendered/"
-    fi
-    if [ -d "$REPO/jailtpl/content/.rendered-assets" ]; then
-        cp -R "$REPO/jailtpl/content/.rendered-assets/." "$BUILD_MOUNT/home/$GUEST/.rendered-assets/"
-    fi
+# 8. content 是 guest HOME 的唯一蓝图。复制全部非隐藏路径，系统生成的
+#    .rendered 与 .rendered-assets 再按白名单单独安装。
+CONTENT="$REPO/jailtpl/content"
+HOME_DIR="$BUILD_MOUNT/home/$GUEST"
+[ -d "$CONTENT" ] && [ ! -L "$CONTENT" ] || { echo "content 根必须是真实目录: $CONTENT"; exit 1; }
+bad_link=$(find "$CONTENT" -type l -print -quit)
+[ -z "$bad_link" ] || { echo "content 不支持符号链接: $bad_link"; exit 1; }
+mkdir -p "$HOME_DIR/.rendered" "$HOME_DIR/.rendered-assets"
+(
+    cd "$CONTENT"
+    # 从 content 根开始，并在任意点前缀组件处剪枝；空内容树也能正常完成。
+    find . -mindepth 1 -name '.*' -prune -o -print | pax -rw -pe -d "$HOME_DIR"
+)
+if [ -d "$CONTENT/.rendered" ]; then
+    cp -R "$CONTENT/.rendered/." "$HOME_DIR/.rendered/"
+fi
+if [ -d "$CONTENT/.rendered-assets" ]; then
+    cp -R "$CONTENT/.rendered-assets/." "$HOME_DIR/.rendered-assets/"
 fi
 chown -R 1001:1001 "$BUILD_MOUNT/home/$GUEST"
 
-# 评论设备：只按 content-build 从含直属文章的目录生成的可信清单创建。
+# 评论设备：只按 content-build 从 .termblog.toml 生成的可信清单创建。
 TARGETS="$REPO/jailtpl/content/.comment-targets.tsv"
 [ -f "$TARGETS" ] || { echo "缺少评论 target 清单: $TARGETS"; exit 1; }
 install -d -m 755 "$BUILD_MOUNT/usr/local/share/termblog"
@@ -122,11 +126,10 @@ while IFS="$(printf '\t')" read -r rel target; do
     esac
     case "$rel" in
         comment) expected="/" ;;
-        blog/comment) expected="/blog/" ;;
-        blog/*/comment)
-            dir=${rel#blog/}; dir=${dir%/comment}
-            case "$dir" in ""|/*|*/|*//*|*[!a-z0-9/-]*) echo "非法文章目录: $dir"; exit 1 ;; esac
-            expected="/blog/$dir/"
+        */comment)
+            dir=${rel%/comment}
+            case "$dir" in ""|/*|*/|*//*|*[!a-z0-9/-]*) echo "非法评论目录: $dir"; exit 1 ;; esac
+            expected="/$dir/"
             ;;
         *) echo "非法评论设备路径: $rel"; exit 1 ;;
     esac

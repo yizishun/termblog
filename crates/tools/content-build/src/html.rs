@@ -27,7 +27,8 @@ pub fn attr_escape(s: &str) -> String {
 ///    Image 事件(Start..End)消费掉, 换成手写的 <img> InlineHtml(可信生成物,
 ///    不再过转义, 否则会被转义成文本)。
 /// 2. 若第一个块级元素是 H1(即元数据标题的来源)则整块剥掉, 其余喂 push_html。
-/// image_meta: 本地图 dest_url 原文 → (宽, 高, /blog/ 路径); 查不到 = 外链(原样, 无宽高)。
+///
+/// image_meta: 本地图 dest_url 原文 → (宽, 高, 站点绝对路径); 查不到 = 外链(原样, 无宽高)。
 pub fn body_html(
     events: &[Event<'static>],
     image_meta: &HashMap<String, (u32, u32, String)>,
@@ -107,7 +108,7 @@ fn preprocess_events(
     out
 }
 
-/// 手写 <img>: src 用重写后的 /blog/ 路径(外链原样); 本地图带真实宽高;
+/// 手写 <img>: src 用重写后的 content-relative 站点路径(外链原样); 本地图带真实宽高;
 /// 所有属性值过 attr_escape。
 fn build_img_tag(
     dest_url: &str,
@@ -150,8 +151,7 @@ fn fill(tpl: &str, conds: &[(&str, bool)], vars: &[(&str, String)]) -> String {
     let mut s = tpl.to_string();
     for (name, on) in conds {
         let open = format!("{{{{#if {name}}}}}");
-        loop {
-            let Some(start) = s.find(&open) else { break };
+        while let Some(start) = s.find(&open) {
             let Some(rel_end) = s[start..].find("{{/if}}") else {
                 break;
             };
@@ -192,11 +192,12 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
   <link rel="stylesheet" href="{{BLOG_CSS}}" />
   <!-- 无 JS: 不显示等待层, 静态正文即全部视图 -->
   <noscript><style>#mirror-cover{display:none}</style></noscript>
-  {{#if site_url}}<link rel="canonical" href="{{SITE_URL}}/blog/{{SLUG}}/" />{{/if}}
+  {{#if site_url}}<link rel="canonical" href="{{SITE_URL}}{{ROUTE}}" />{{/if}}
   <meta name="description" content="{{EXCERPT}}" />
-  <meta name="termblog-slug" content="{{SLUG}}" />
+  <meta name="termblog-source" content="{{SOURCE}}" />
+  <meta name="termblog-route" content="{{ROUTE}}" />
   <meta property="og:title" content="{{TITLE}}" />
-  {{#if site_url}}<meta property="og:url" content="{{SITE_URL}}/blog/{{SLUG}}/" />{{/if}}
+  {{#if site_url}}<meta property="og:url" content="{{SITE_URL}}{{ROUTE}}" />{{/if}}
   <meta property="og:type" content="article" />
   <meta property="og:description" content="{{EXCERPT}}" />
   <meta property="og:site_name" content="{{SITE_TITLE}}" />
@@ -226,13 +227,13 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
         <h1>{{TITLE}}</h1>
         {{BODY_HTML}}
         <footer class="post-meta">
-          {{DATE}}{{#if ssh_hint}} · 终端里也可以读: ssh -p 2222 blog@{{HOST}} 然后敲 blog {{SLUG}}{{/if}}
+          {{DATE}}{{#if ssh_hint}} · 终端里也可以读: ssh -p 2222 blog@{{HOST}} 然后敲 blog {{KEY}}{{/if}}
         </footer>
-        <section class="comments" data-comments-target="{{COMMENT_TARGET}}">
+        {{#if comments}}<section class="comments" data-comments-target="{{COMMENT_TARGET}}" data-comments-fifo="~/{{COMMENT_FIFO}}">
           <h2>评论</h2>
           <p class="comments-status">正在加载…</p>
           <ol class="comment-list"></ol>
-        </section>
+        </section>{{/if}}
       </article>
     </div>
     <!-- 等待层: JS 用户首屏只看到它(不透明盖住静态正文, 正文不闪现);
@@ -248,7 +249,7 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
   </div>
   <button id="enter-terminal" type="button" hidden>进入终端 ↵</button>
   <script type="module" src="/assets/{{ENTRY_JS}}"></script>
-  <script type="module" src="/assets/{{COMMENTS_JS}}"></script>
+  {{#if comments}}<script type="module" src="/assets/{{COMMENTS_JS}}"></script>{{/if}}
 </body>
 
 </html>
@@ -264,7 +265,7 @@ fn blog_css_href(entry_js: &str) -> String {
     }
 }
 
-/// 渲染单篇镜像页。first_image: 文章第一张本地图的 /blog/ 路径(og:image 用,
+/// 渲染单篇镜像页。first_image: 文章第一张本地图的站点绝对路径(og:image 用,
 /// 需同时有 site_url 才输出)。
 pub fn render_mirror_page(
     a: &Article,
@@ -285,15 +286,22 @@ pub fn render_mirror_page(
             ("site_url", site_url.is_some()),
             ("ssh_hint", ssh_hint),
             ("og_image", og_image),
+            ("comments", a.comments.is_some()),
         ],
         &[
             ("TITLE", attr_escape(&a.title)),
             ("SITE_TITLE", attr_escape(site_title)),
             ("SITE_URL", attr_escape(site_url.unwrap_or(""))),
-            ("SLUG", attr_escape(&a.slug)),
+            ("SOURCE", attr_escape(&a.path.source_rel.to_string_lossy())),
+            ("ROUTE", attr_escape(&a.path.route)),
+            ("KEY", attr_escape(&a.path.key)),
             (
                 "COMMENT_TARGET",
-                attr_escape(&crate::comment_location_for_slug(&a.slug).1),
+                attr_escape(a.comments.as_ref().map_or("", |c| c.target.as_str())),
+            ),
+            (
+                "COMMENT_FIFO",
+                attr_escape(a.comments.as_ref().map_or("", |c| c.fifo_rel.as_str())),
             ),
             ("EXCERPT", attr_escape(&a.excerpt)),
             ("DATE", a.date10.clone()),
@@ -345,8 +353,8 @@ pub fn render_list_page(
     let mut items = String::new();
     for a in arts {
         items.push_str(&format!(
-            "      <li><a href=\"/blog/{}/\">{}</a> <span class=\"date\">{}</span></li>\n",
-            a.slug,
+            "      <li><a href=\"{}\">{}</a> <span class=\"date\">{}</span></li>\n",
+            a.path.route,
             attr_escape(&a.title),
             a.date10
         ));
@@ -373,9 +381,12 @@ mod tests {
             .collect()
     }
 
-    fn article(slug: &str, title: &str, md: &str) -> Article {
+    fn article(key: &str, title: &str, md: &str) -> Article {
+        let path = termblog_content_model::ArticlePath::parse(&format!("{key}.md")).unwrap();
+        let comments =
+            termblog_content_model::CommentAttachment::from_directory_rel(&path.directory_rel).ok();
         Article {
-            slug: slug.into(),
+            path,
             title: title.into(),
             excerpt: "摘要".into(),
             date10: "2026-08-29".into(),
@@ -385,6 +396,7 @@ mod tests {
             image_meta: HashMap::new(),
             dest_paths: Default::default(),
             first_image: None,
+            comments,
         }
     }
 
@@ -416,7 +428,7 @@ mod tests {
 
     #[test]
     fn body_image_rewritten_with_dims() {
-        // 本地图: src 重写为 /blog/ 路径, 带宽高/lazy/decoding
+        // 本地图: src 重写为 content-relative 站点绝对路径, 带宽高/lazy/decoding
         let mut meta = HashMap::new();
         meta.insert(
             "hello/arch.png".to_string(),
@@ -528,9 +540,11 @@ mod tests {
         );
         assert!(!page.contains("{{"), "模板残留占位符: {page}");
         assert!(page.contains("<h1>你好, 世界</h1>"));
-        assert!(page.contains("name=\"termblog-slug\" content=\"hello\""));
-        assert!(page.contains("href=\"https://blog.example.com/blog/hello/\""));
-        assert!(page.contains("data-comments-target=\"/blog/\""));
+        assert!(page.contains("name=\"termblog-source\" content=\"hello.md\""));
+        assert!(page.contains("name=\"termblog-route\" content=\"/hello/\""));
+        assert!(page.contains("href=\"https://blog.example.com/hello/\""));
+        assert!(page.contains("data-comments-target=\"/\""));
+        assert!(page.contains("data-comments-fifo=\"~/comment\""));
         assert!(page.contains("src=\"/assets/index-abc123.js\""));
         assert!(
             page.contains("href=\"/assets/index-abc123.css\""),
@@ -586,7 +600,7 @@ mod tests {
             "index-abc123.js",
         );
         assert!(page.contains("<title>文章 — ~yzs</title>"));
-        assert!(page.contains("<a href=\"/blog/hello/\">你好, 世界</a>"));
+        assert!(page.contains("<a href=\"/hello/\">你好, 世界</a>"));
         assert!(page.contains("atom.xml"));
         assert!(
             !page.contains("src=\"/assets/index-abc123.js\""),
@@ -594,12 +608,7 @@ mod tests {
         );
         assert!(!page.contains("comments-abc123.js"));
         assert!(!page.contains("data-comments-target"));
-        let page = render_list_page(
-            std::slice::from_ref(&a),
-            None,
-            "~yzs",
-            "index-abc123.js",
-        );
+        let page = render_list_page(std::slice::from_ref(&a), None, "~yzs", "index-abc123.js");
         assert!(!page.contains("atom.xml"));
     }
 

@@ -5,9 +5,9 @@
 ## 阅读文章
 
 - `blog`：列出所有文章
-- `blog hello`：阅读一篇文章，并在文末显示评论
+- `blog path/to/article`：按列表给出的 HOME 相对 article key 阅读文章
 - `blog ~/help.md`：再次打开这份首页说明和首页留言
-- `less ~/blog/hello.md`：查看未经排版的 Markdown 原文
+- `less ~/path/to/article.md`：查看未经排版的 Markdown 原文
 
 ## 留言
 
@@ -19,19 +19,13 @@ echo 'alice: 你好' > ~/comment
 
 提交后会进入审核队列；当前会话的评论快照不会变化，审核通过后重新连接终端即可看到。
 
-文章评论绑定到文章所在的直属目录；同目录的多篇文章共享评论。例如 `~/blog/hello.md` 位于 `~/blog/`：
+评论目录由站点配置显式启用，不从目录名猜测。文章绑定了评论时，阅读器会在文末显示对应的投稿路径；同一 attachment 下的多篇文章共享评论。例如提示路径为 `~/path/to/comment` 时：
 
 ```sh
-echo 'alice: 好文' > ~/blog/comment
-```
-
-如果文章是 `~/blog/topic/one.md`，则向它所在的目录投稿：
-
-```sh
-echo 'alice: 好文' > ~/blog/topic/comment
+echo 'alice: 好文' > ~/path/to/comment
 ```
 
 ## 终端录像
 
 - `play`：列出录像
-- `play hello/demo`：播放录像（空格暂停，`q` 退出）
+- `play path/to/demo`：按列表给出的 HOME 相对 key 播放录像（空格暂停，`q` 退出）

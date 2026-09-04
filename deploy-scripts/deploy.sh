@@ -24,6 +24,28 @@ BUILD_USER=yzs
 
 [ "$(id -u)" -eq 0 ] || { echo "需要 root (service/zfs/install)"; exit 1; }
 
+publish_static() {
+    static_parent=$(dirname "$STATIC_DIR")
+    static_stage="$static_parent/.frontend.new.$$"
+    static_old="$static_parent/.frontend.old.$$"
+    [ ! -L "$STATIC_DIR" ] || { echo "静态目录不能是符号链接: $STATIC_DIR"; exit 1; }
+    [ ! -e "$static_stage" ] && [ ! -e "$static_old" ] || {
+        echo "静态发布临时路径已存在"; exit 1;
+    }
+    install -d "$static_parent" "$static_stage"
+    cp -R "$REPO/frontend/dist/." "$static_stage/"
+    chmod -R a+rX "$static_stage"
+    if [ -e "$STATIC_DIR" ]; then
+        mv "$STATIC_DIR" "$static_old"
+    fi
+    if mv "$static_stage" "$STATIC_DIR"; then
+        [ ! -e "$static_old" ] || rm -rf "$static_old"
+    else
+        [ ! -e "$static_old" ] || mv "$static_old" "$STATIC_DIR"
+        exit 1
+    fi
+}
+
 # ── --static-only: 内容小改, 零停机(不碰进程/模板/会话) ──
 if [ "${1:-}" = "--static-only" ]; then
     echo ">> 1/2 编译内容(以 $BUILD_USER, 产物进 frontend/dist 与 jailtpl/content/.rendered)"
@@ -32,10 +54,7 @@ if [ "${1:-}" = "--static-only" ]; then
     echo ">> 2/2 发布静态镜像(纯文件替换, 无感, 不重启)"
     install -d /usr/local/share/termblog
     install -m 444 "$REPO/jailtpl/content/.comment-targets.tsv" /usr/local/share/termblog/comment-targets.tsv
-    rm -rf "$STATIC_DIR/blog"
-    cp -R "$REPO/frontend/dist/." "$STATIC_DIR/"
-    # 保证 www 可读(曾出过 600 权限导致 /blog.css 404 的事故)
-    chmod -R a+rX "$STATIC_DIR"
+    publish_static
     echo ">> 完成(仅镜像)。jail 侧将在下次模板重建时跟进。"
     exit 0
 fi
@@ -78,13 +97,12 @@ su -l "$BUILD_USER" -c "set -e; cd $REPO; cargo build --release; \
 
 # ── 4. 安装 ──
 echo ">> 安装二进制 / 前端 / rc 脚本"
-install -d /usr/local/sbin /usr/local/share/termblog/frontend /usr/local/etc/rc.d
+install -d /usr/local/sbin /usr/local/share/termblog /usr/local/etc/rc.d
 install -m 555 "$REPO/target/release/termblog-web" /usr/local/sbin/termblog-web
 install -m 555 "$REPO/target/release/termblog-ssh" /usr/local/sbin/termblog-ssh
 install -m 555 "$REPO/target/release/termblog-jaild" /usr/local/sbin/jaild
 install -m 555 "$REPO/target/release/commentd" /usr/local/sbin/commentd
 ln -sf commentd /usr/local/sbin/commentctl
-cp -R "$REPO/frontend/dist/." /usr/local/share/termblog/frontend/
 install -m 444 "$REPO/jailtpl/content/.comment-targets.tsv" /usr/local/share/termblog/comment-targets.tsv
 install -m 644 "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml.sample
 if [ -f /usr/local/etc/termblog.toml ] && ! cmp -s "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml; then
@@ -100,10 +118,8 @@ install -m 644 "$REPO/etc/newsyslog.conf.d/termblog.conf" /usr/local/etc/newsysl
 sysrc commentd_enable=YES jaild_enable=YES termblog_enable=YES >/dev/null
 echo ">> 已启用开机自启: commentd_enable=YES jaild_enable=YES termblog_enable=YES"
 
-# ── 5. 发布静态镜像(纯文件替换; blog 目录先清掉防删文留僵尸) ──
-rm -rf "$STATIC_DIR/blog"
-cp -R "$REPO/frontend/dist/." "$STATIC_DIR/"
-chmod -R a+rX "$STATIC_DIR"
+# ── 5. 发布完整静态树（同父目录 staging 后整体换名，可回滚） ──
+publish_static
 
 
 # ── 6. commentd 独立 root-only 数据目录；只初始化本次新建的空目录 ──

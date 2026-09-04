@@ -12,11 +12,9 @@ type CommentsResponse = {
   comments: CommentItem[];
 };
 
-function emptyHint(target: string): string {
-  if (target === "/") return "暂无留言 —— echo 'alice: 你好' > ~/comment 写第一条";
-  if (target === "/blog/") return "暂无评论 —— echo 'alice: 好文' > ~/blog/comment 写第一条";
-  const slug = target.slice("/blog/".length, -1);
-  return `暂无评论 —— echo 'alice: 好文' > ~/blog/${slug}/comment 写第一条`;
+function emptyHint(target: string, fifo: string): string {
+  const noun = target === "/" ? "留言" : "评论";
+  return `暂无${noun} —— echo 'alice: 好文' > ${fifo} 写第一条`;
 }
 
 function renderComment(item: CommentItem, ordinal: number): HTMLLIElement {
@@ -52,9 +50,10 @@ function renderComment(item: CommentItem, ordinal: number): HTMLLIElement {
 
 async function loadSection(section: HTMLElement): Promise<void> {
   const target = section.dataset.commentsTarget;
+  const fifo = section.dataset.commentsFifo;
   const status = section.querySelector<HTMLElement>(".comments-status");
   const list = section.querySelector<HTMLOListElement>(".comment-list");
-  if (!target || !status || !list) return;
+  if (!target || !fifo || !status || !list) return;
   status.textContent = "正在加载…";
   list.replaceChildren();
   try {
@@ -68,7 +67,7 @@ async function loadSection(section: HTMLElement): Promise<void> {
       throw new Error("bad response");
     }
     if (data.comments.length === 0) {
-      status.textContent = emptyHint(target);
+      status.textContent = emptyHint(target, fifo);
       return;
     }
     status.textContent = data.omitted_earlier > 0 ? `还有 ${data.omitted_earlier} 条更早评论` : "";

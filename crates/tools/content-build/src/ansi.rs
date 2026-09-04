@@ -58,15 +58,26 @@ enum Block {
     Rule,
     Code(Vec<String>),
     Quote(Vec<Block>),
-    List { ordered: bool, start: u64, items: Vec<Vec<Block>> },
-    Table { head: Vec<String>, rows: Vec<Vec<String>> },
+    List {
+        ordered: bool,
+        start: u64,
+        items: Vec<Vec<Block>>,
+    },
+    Table {
+        head: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
     /// 独占段落的图片 → 占位框。url 已按 link_base 拼好(终端可点可复制的完整形态);
     /// dest 是 md 里的原始引用(manifest 锚点查表键)。
-    Image { alt: String, url: String, dest: String },
+    Image {
+        alt: String,
+        url: String,
+        dest: String,
+    },
 }
 
 /// main.rs 提供的处理后图片信息: dest 原文 → 锚点数据。
-/// (图片二期 manifest: path 是 v1 规范化后的 ~/blog/ 相对路径, asset 是
+/// (图片二期 manifest: path 是规范化后的 content/HOME 相对路径, asset 是
 /// 处理后文件相对 .rendered-assets/ 的路径 —— webp 转 png 后两者扩展名不同。)
 pub struct ImgMeta {
     pub path: String,
@@ -82,7 +93,7 @@ pub struct ImageAnchor {
     pub block_start: usize,
     /// 占位框末行之后一行, 不含(区间精确覆盖整个占位框, 含 alt/URL 折行续行)
     pub block_end: usize,
-    /// 相对 ~/blog/ 的资源路径(v1 规范化结果, 占位框降级与链接的 URL 语义)
+    /// 相对 content/HOME 的资源路径(占位框降级与链接的 URL 语义)
     pub path: String,
     /// 相对 .rendered-assets/ 的处理后文件路径 —— TUI reader 的实际读取源
     pub asset: String,
@@ -97,7 +108,7 @@ pub struct ImageAnchor {
     pub alt: String,
 }
 
-/// manifest 顶层结构(sidecar 文件 <slug>.images.json)
+/// manifest 顶层结构(sidecar 文件 <article-key>.images.json)
 #[derive(Serialize, Debug)]
 pub struct Manifest {
     pub version: u32,
@@ -110,17 +121,17 @@ impl Manifest {
     }
 }
 
-/// 渲染上下文: 图片 URL 重写需要 slug(相对基准)与 link_base(站点根)。
+/// 渲染上下文: 图片 URL 重写需要源路径(相对基准)与 link_base(站点根)。
 struct Ctx<'a> {
-    slug: &'a str,
+    source_rel: &'a str,
     link_base: &'a str,
 }
 
 /// md 里的 dest_url 原文 → 终端里用的 URL:
-/// 本地图 = link_base + /blog/...(有 site_url 时拼成完整 URL, 无则站点路径);
+/// 本地图 = link_base + content-relative URL(有 site_url 时拼成完整 URL, 无则站点路径);
 /// 外链原样。resolve 失败主流程已 fail-fast, 这里兜底用原文。
 fn image_url(ctx: &Ctx, dest: &str) -> String {
-    match resolve_image_url(ctx.slug, dest) {
+    match resolve_image_url(ctx.source_rel, dest) {
         Ok(ResolvedImage::Local(p)) => format!("{}{}", ctx.link_base, p),
         Ok(ResolvedImage::External(u)) => u,
         Err(_) => dest.to_string(),
@@ -137,19 +148,26 @@ fn url_basename(url: &str) -> &str {
 }
 
 /// 渲染入口: 事件流 → (完整 ANSI 文本(行尾 \n, 文件尾保证一个 \n), 图片锚点)。
-/// slug: 文章 slug(图片相对路径的解析基准); link_base: site_url 或空串。
+/// source_rel: Markdown 源路径(图片相对路径的解析基准); link_base: site_url 或空串。
 /// img: dest 原文 → 处理后图片信息; 查不到(外链等)则不产锚点(占位框仍渲染)。
 pub fn render_ansi(
     events: &[Event<'static>],
-    slug: &str,
+    source_rel: &str,
     link_base: &str,
     img: &dyn Fn(&str) -> Option<ImgMeta>,
 ) -> (String, Vec<ImageAnchor>) {
-    let ctx = Ctx { slug, link_base };
+    let ctx = Ctx {
+        source_rel,
+        link_base,
+    };
     let (blocks, _) = parse_blocks(events, &ctx);
     let mut lines: Vec<String> = vec![];
     let mut anchors: Vec<ImageAnchor> = vec![];
-    let ind = Indent { first: String::new(), cont: String::new(), width: WIDTH };
+    let ind = Indent {
+        first: String::new(),
+        cont: String::new(),
+        width: WIDTH,
+    };
     render_blocks(&blocks, &mut lines, 0, 0, &ind, img, &mut anchors);
     // 去掉块间渲染出的多余尾部空行, 文件尾保证一个 \n
     while lines.last().is_some_and(|l| l.is_empty()) {
@@ -199,7 +217,11 @@ fn take_image_block(events: &[Event<'static>], i: &mut usize, ctx: &Ctx) -> Bloc
     *i += 1; // End(Image)
     let alt: String = alt_segs.iter().map(|s| s.t.as_str()).collect();
     let alt = alt.trim().to_string();
-    let alt = if alt.is_empty() { url_basename(&url).to_string() } else { alt };
+    let alt = if alt.is_empty() {
+        url_basename(&url).to_string()
+    } else {
+        alt
+    };
     Block::Image { alt, url, dest }
 }
 
@@ -280,7 +302,11 @@ fn parse_blocks(events: &[Event<'static>], ctx: &Ctx) -> (Vec<Block>, usize) {
                         _ => i += 1,
                     }
                 }
-                blocks.push(Block::List { ordered, start: start_num, items });
+                blocks.push(Block::List {
+                    ordered,
+                    start: start_num,
+                    items,
+                });
             }
             Event::Start(Tag::Table(_)) => {
                 i += 1;
@@ -356,7 +382,13 @@ fn parse_blocks(events: &[Event<'static>], ctx: &Ctx) -> (Vec<Block>, usize) {
 
 /// inline 解析: 消费 events[*i] 起的内容, 遇到任意 End 事件即返回(不消费)。
 /// 由调用方(段落/标题/单元格)消费该 End。
-fn parse_inline(events: &[Event<'static>], i: &mut usize, style: u8, segs: &mut Vec<Seg>, ctx: &Ctx) {
+fn parse_inline(
+    events: &[Event<'static>],
+    i: &mut usize,
+    style: u8,
+    segs: &mut Vec<Seg>,
+    ctx: &Ctx,
+) {
     loop {
         match &events[*i] {
             Event::End(_) => return,
@@ -400,7 +432,11 @@ fn parse_inline(events: &[Event<'static>], i: &mut usize, style: u8, segs: &mut 
                 *i += 1; // 消费 End(Image)
                 let alt: String = alt_segs.iter().map(|s| s.t.as_str()).collect();
                 let alt = alt.trim();
-                let alt = if alt.is_empty() { url_basename(&url) } else { alt };
+                let alt = if alt.is_empty() {
+                    url_basename(&url)
+                } else {
+                    alt
+                };
                 push_seg_link(segs, style | DIM, format!("[图: {alt}]"), Some(url));
             }
             Event::Text(t) => {
@@ -497,7 +533,11 @@ fn render_block(
             };
             render_blocks(inner, lines, q + 1, level, &child, img, anchors);
         }
-        Block::List { ordered, start, items } => {
+        Block::List {
+            ordered,
+            start,
+            items,
+        } => {
             let lead = "  ".repeat(level);
             let qp = qprefix(q);
             for (idx, item) in items.iter().enumerate() {
@@ -546,11 +586,19 @@ fn render_block(
             let top = format!("{}{}", head, "─".repeat(w.saturating_sub(8)));
             lines.push(format!("{}\x1b[2m{}\x1b[22m", ind.first, top));
             let content_w = w.saturating_sub(3); // "│ " 前缀 2 列 + 1 列余量
-            let alt_segs = [Seg { s: 0, t: alt.clone(), link: None }];
+            let alt_segs = [Seg {
+                s: 0,
+                t: alt.clone(),
+                link: None,
+            }];
             for l in wrap_segments(&alt_segs, content_w) {
                 lines.push(format!("{}\x1b[2m│\x1b[22m {}", ind.cont, render_line(&l)));
             }
-            let url_segs = [Seg { s: CYAN, t: url.clone(), link: Some(url.clone()) }];
+            let url_segs = [Seg {
+                s: CYAN,
+                t: url.clone(),
+                link: Some(url.clone()),
+            }];
             for l in wrap_segments(&url_segs, content_w) {
                 lines.push(format!("{}\x1b[2m│\x1b[22m {}", ind.cont, render_line(&l)));
             }
@@ -601,7 +649,11 @@ fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
                     cur.last(),
                     Some(&(_, _, prev)) if prev.width().unwrap_or(0) == 2 || w == 2
                 );
-                let bp = if at_boundary { Some(cur.len() - 1) } else { break_at };
+                let bp = if at_boundary {
+                    Some(cur.len() - 1)
+                } else {
+                    break_at
+                };
                 match bp {
                     Some(bp) => {
                         let rest = cur.split_off(bp + 1);
@@ -769,7 +821,7 @@ mod tests {
     fn render_with(md: &str, link_base: &str) -> String {
         let parser = Parser::new_ext(md, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH);
         let events: Vec<Event<'static>> = parser.map(|e| e.into_static()).collect();
-        render_ansi(&events, "post", link_base, &|_| None).0
+        render_ansi(&events, "post.md", link_base, &|_| None).0
     }
 
     /// 去掉 SGR/OSC8 序列后的可见文本(按 \n 分行)。
@@ -842,8 +894,16 @@ mod tests {
         // 100 个加粗字符: 断行处行尾 \x1b[0m, 新行行首重发 \x1b[1m
         let out = render(&format!("**{}**\n", "b".repeat(100)));
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].ends_with("\x1b[0m"), "行尾应复位样式: {:?}", lines[0]);
-        assert!(lines[1].starts_with("\x1b[1m"), "新行行首应重发粗体: {:?}", lines[1]);
+        assert!(
+            lines[0].ends_with("\x1b[0m"),
+            "行尾应复位样式: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("\x1b[1m"),
+            "新行行首应重发粗体: {:?}",
+            lines[1]
+        );
         assert_eq!(strip_sgr(lines[0]).len(), 76);
         assert_eq!(strip_sgr(lines[1]).len(), 24);
     }
@@ -852,7 +912,10 @@ mod tests {
     fn code_block_not_wrapped() {
         let long = "c".repeat(100);
         let out = render(&format!("```\n{long}\n```\n"));
-        assert!(out.contains(&format!("    {long}")), "代码块应 4 空格缩进且不折行: {out:?}");
+        assert!(
+            out.contains(&format!("    {long}")),
+            "代码块应 4 空格缩进且不折行: {out:?}"
+        );
     }
 
     #[test]
@@ -871,7 +934,10 @@ mod tests {
     #[test]
     fn heading_bold_and_rule_dim() {
         let out = render("# 标题\n\n---\n");
-        assert!(out.contains("\x1b[1m标题\x1b[0m"), "标题应加粗(行尾整体复位): {out:?}");
+        assert!(
+            out.contains("\x1b[1m标题\x1b[0m"),
+            "标题应加粗(行尾整体复位): {out:?}"
+        );
         assert!(out.contains("\x1b[2m----"), "分隔线应 dim: {out:?}");
     }
 
@@ -907,15 +973,24 @@ mod tests {
 
     #[test]
     fn block_image_box() {
-        // 独占段落图片 → 占位框(无 site_url: URL 为 /blog/... 站点路径)
+        // 独占段落图片 → 占位框(无 site_url: URL 为 content-relative 站点绝对路径)
         let out = render("正文\n\n![架构图](post/arch.png)\n");
         let lines = plain(&out);
-        assert!(lines.iter().any(|l| l.starts_with("┌─ 图片 ─")), "应有顶边: {lines:?}");
-        assert!(lines.iter().any(|l| l.starts_with("└")), "应有底边: {lines:?}");
-        assert!(lines.iter().any(|l| l == "│ 架构图"), "alt 行带 │ 前缀: {lines:?}");
         assert!(
-            lines.iter().any(|l| l == "│ /blog/post/arch.png"),
-            "无 site_url 时 URL 为 /blog/... 形态: {lines:?}"
+            lines.iter().any(|l| l.starts_with("┌─ 图片 ─")),
+            "应有顶边: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("└")),
+            "应有底边: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "│ 架构图"),
+            "alt 行带 │ 前缀: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "│ /post/arch.png"),
+            "无 site_url 时 URL 应为站点绝对路径形态: {lines:?}"
         );
         // 顶边底边补齐到 76 显示列
         let top = lines.iter().find(|l| l.starts_with("┌")).unwrap();
@@ -925,7 +1000,7 @@ mod tests {
         assert_eq!(w(bottom), 76, "底边应 76 列: {bottom:?}");
         // URL 行带 OSC8 开闭(ST 终止)
         assert!(
-            out.contains("\x1b]8;;/blog/post/arch.png\x1b\\"),
+            out.contains("\x1b]8;;/post/arch.png\x1b\\"),
             "应有 OSC8 开: {out:?}"
         );
         assert!(out.contains("\x1b]8;;\x1b\\"), "应有 OSC8 闭: {out:?}");
@@ -937,14 +1012,20 @@ mod tests {
     fn block_image_full_url_with_site() {
         // 有 site_url: 拼完整 URL(SSH 用户可直接复制进浏览器)
         let out = render_with("![a](post/x.png)\n", "https://blog.example.com");
-        assert!(out.contains("\x1b]8;;https://blog.example.com/blog/post/x.png\x1b\\"));
-        assert!(plain(&out).iter().any(|l| l == "│ https://blog.example.com/blog/post/x.png"));
+        assert!(out.contains("\x1b]8;;https://blog.example.com/post/x.png\x1b\\"));
+        assert!(plain(&out)
+            .iter()
+            .any(|l| l == "│ https://blog.example.com/post/x.png"));
     }
 
     #[test]
     fn block_image_empty_alt_uses_filename() {
         let out = render("![](post/x.png)\n");
-        assert!(plain(&out).iter().any(|l| l == "│ x.png"), "空 alt 应用文件名: {}", plain(&out)[1]);
+        assert!(
+            plain(&out).iter().any(|l| l == "│ x.png"),
+            "空 alt 应用文件名: {}",
+            plain(&out)[1]
+        );
     }
 
     #[test]
@@ -955,16 +1036,19 @@ mod tests {
         let out = render(&format!("![{alt}]({url_path})\n"));
         let lines: Vec<&str> = out.lines().collect();
         let plain_lines = plain(&out);
-        let alt_lines: Vec<&String> = plain_lines[1..].iter().take_while(|l| l.starts_with("│ ")).collect();
-        assert!(alt_lines.len() >= 4, "alt 折行续行都应带 │ 前缀: {plain_lines:?}");
-        // URL 折行: 每条 │ 行里若含 URL 片段, 对应原始行必须有 OSC8 开+闭
-        let url_lines: Vec<&&str> = lines
+        let alt_lines: Vec<&String> = plain_lines[1..]
             .iter()
-            .filter(|l| l.contains("]8;;"))
+            .take_while(|l| l.starts_with("│ "))
             .collect();
+        assert!(
+            alt_lines.len() >= 4,
+            "alt 折行续行都应带 │ 前缀: {plain_lines:?}"
+        );
+        // URL 折行: 每条 │ 行里若含 URL 片段, 对应原始行必须有 OSC8 开+闭
+        let url_lines: Vec<&&str> = lines.iter().filter(|l| l.contains("]8;;")).collect();
         assert!(url_lines.len() >= 2, "长 URL 应折成多行链接: {lines:?}");
         for l in url_lines {
-            assert!(l.contains("\x1b]8;;/blog/"), "每行应有 OSC8 开: {l:?}");
+            assert!(l.contains("\x1b]8;;/post/"), "每行应有 OSC8 开: {l:?}");
             assert!(l.contains("\x1b]8;;\x1b\\"), "每行应有 OSC8 闭: {l:?}");
         }
     }
@@ -973,17 +1057,26 @@ mod tests {
     fn inline_image_marker_with_link() {
         // 行内图(段落中夹图) → [图: alt] + OSC8 link
         let out = render("前文 ![截图](post/s.png) 后文\n");
-        assert!(out.contains("[图: 截图]"), "行内图应为 [图: alt] 标记: {out:?}");
         assert!(
-            out.contains("\x1b]8;;/blog/post/s.png\x1b\\"),
+            out.contains("[图: 截图]"),
+            "行内图应为 [图: alt] 标记: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b]8;;/post/s.png\x1b\\"),
             "行内图应带 OSC8: {out:?}"
         );
         // 空 alt 行内图 → 文件名
         let out = render("前文 ![](post/s.png) 后文\n");
-        assert!(out.contains("[图: s.png]"), "空 alt 行内图应用文件名: {out:?}");
+        assert!(
+            out.contains("[图: s.png]"),
+            "空 alt 行内图应用文件名: {out:?}"
+        );
         // 外链行内图: URL 原样
         let out = render("看 ![外](https://cdn.example.com/a.png) 图\n");
-        assert!(out.contains("\x1b]8;;https://cdn.example.com/a.png\x1b\\"), "外链原样: {out:?}");
+        assert!(
+            out.contains("\x1b]8;;https://cdn.example.com/a.png\x1b\\"),
+            "外链原样: {out:?}"
+        );
     }
 
     #[test]
@@ -991,11 +1084,17 @@ mod tests {
         // 引用块内的独占图也给占位框(沿用引用前缀)
         let out = render("> ![q](post/q.png)\n");
         let lines = plain(&out);
-        assert!(lines.iter().any(|l| l.starts_with("> ┌─ 图片")), "引用内占位框带 > 前缀: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("> ┌─ 图片")),
+            "引用内占位框带 > 前缀: {lines:?}"
+        );
         // 紧凑列表项内的独占图
         let out = render("- ![l](post/l.png)\n");
         let lines = plain(&out);
-        assert!(lines.iter().any(|l| l.contains("┌─ 图片")), "列表内占位框: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("┌─ 图片")),
+            "列表内占位框: {lines:?}"
+        );
     }
 
     #[test]
@@ -1025,7 +1124,7 @@ mod tests {
             }),
             _ => None,
         };
-        let (out, anchors) = render_ansi(&events, "post", "", &img);
+        let (out, anchors) = render_ansi(&events, "post.md", "", &img);
         (out.lines().map(str::to_string).collect(), anchors)
     }
 
@@ -1037,8 +1136,14 @@ mod tests {
         // 区间用最终渲染行号锚定: block_start 行以 ┌ 开头, block_end-1 行以 └ 开头
         let top = strip_sgr(&lines[a.block_start]);
         let bottom = strip_sgr(&lines[a.block_end - 1]);
-        assert!(top.starts_with("┌─ 图片"), "block_start 应为占位框首行: {top:?}");
-        assert!(bottom.starts_with("└"), "block_end-1 应为占位框末行: {bottom:?}");
+        assert!(
+            top.starts_with("┌─ 图片"),
+            "block_start 应为占位框首行: {top:?}"
+        );
+        assert!(
+            bottom.starts_with("└"),
+            "block_end-1 应为占位框末行: {bottom:?}"
+        );
         assert!(a.block_start < a.block_end);
         assert_eq!((a.w, a.h), (1080, 607));
         assert_eq!((a.indent_cols, a.display_cols), (0, 76), "顶层无缩进、整宽");
@@ -1052,24 +1157,39 @@ mod tests {
         let (_, anchors) = render_anchors("> ![q](post/a.png)\n\n- ![l](post/b.png)\n");
         assert_eq!(anchors.len(), 2);
         let q = &anchors[0];
-        assert_eq!((q.indent_cols, q.display_cols), (2, 74), "引用前缀 > ␣ = 2 列: {q:?}");
+        assert_eq!(
+            (q.indent_cols, q.display_cols),
+            (2, 74),
+            "引用前缀 > ␣ = 2 列: {q:?}"
+        );
         let l = &anchors[1];
-        assert_eq!((l.indent_cols, l.display_cols), (4, 72), "列表前缀 ␣␣•␣ = 4 列: {l:?}");
+        assert_eq!(
+            (l.indent_cols, l.display_cols),
+            (4, 72),
+            "列表前缀 ␣␣•␣ = 4 列: {l:?}"
+        );
         // 多图区间递增且不重叠
-        assert!(q.block_end <= l.block_start, "区间应递增不重叠: {q:?} {l:?}");
+        assert!(
+            q.block_end <= l.block_start,
+            "区间应递增不重叠: {q:?} {l:?}"
+        );
     }
 
     #[test]
     fn manifest_skips_external_and_inline() {
         // 外链占位框不进 manifest; 行内图不进 manifest
-        let (_, anchors) = render_anchors("![外](https://cdn.example.com/x.png)\n\n夹 ![行](post/a.png) 图\n");
+        let (_, anchors) =
+            render_anchors("![外](https://cdn.example.com/x.png)\n\n夹 ![行](post/a.png) 图\n");
         assert!(anchors.is_empty(), "外链与行内图都不应产锚点: {anchors:?}");
     }
 
     #[test]
     fn manifest_json_shape() {
         let (_, anchors) = render_anchors("![a](post/a.png)\n");
-        let m = Manifest { version: 1, images: anchors };
+        let m = Manifest {
+            version: 1,
+            images: anchors,
+        };
         let json = m.to_json();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["version"], 1);

@@ -447,22 +447,18 @@ fn parse_targets(text: &str) -> Result<Vec<(String, String)>> {
         }
         out.push((rel.to_string(), target.to_string()));
     }
-    if out.is_empty() {
-        bail!("评论 target 清单为空");
-    }
     Ok(out)
 }
 
 fn target_for_fifo(rel: &str) -> Option<String> {
-    match rel {
-        "comment" => Some("/".into()),
-        "blog/comment" => Some("/blog/".into()),
-        _ => {
-            let slug = rel.strip_prefix("blog/")?.strip_suffix("/comment")?;
-            let target = format!("/blog/{slug}/");
-            termblog_commentd::valid_target(&target).then_some(target)
-        }
-    }
+    let directory = if rel == "comment" {
+        ""
+    } else {
+        rel.strip_suffix("/comment")?
+    };
+    let attachment =
+        termblog_content_model::CommentAttachment::from_directory_rel(directory).ok()?;
+    (attachment.fifo_rel == rel).then_some(attachment.target)
 }
 
 /// 以 guest home fd 为锚逐级 openat；每层都 O_NOFOLLOW，最终再次 fstat FIFO。
@@ -719,16 +715,20 @@ mod tests {
 
     #[test]
     fn target_manifest_is_strict_and_derives_targets() {
-        let rows =
-            parse_targets("comment\t/\nblog/comment\t/blog/\nblog/a/b/comment\t/blog/a/b/\n")
-                .unwrap();
+        let rows = parse_targets(
+            "comment\t/\nnotes/comment\t/notes/\nprojects/demo/comment\t/projects/demo/\n",
+        )
+        .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2], ("blog/a/b/comment".into(), "/blog/a/b/".into()));
+        assert_eq!(
+            rows[2],
+            ("projects/demo/comment".into(), "/projects/demo/".into())
+        );
 
         for bad in [
             "/comment\t/\n",
-            "blog/../comment\t/blog/../\n",
-            "blog/a/comment\t/blog/wrong/\n",
+            "notes/../comment\t/notes/../\n",
+            "notes/comment\t/wrong/\n",
             "comment\t/\ncomment\t/\n",
             "missing-tab\n",
         ] {

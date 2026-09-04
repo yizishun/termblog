@@ -19,5 +19,6 @@ tracing-subscriber = "0.3"
 libc = "0.2"
 termblog-core = { path = "../core" }
 termblog-config = { path = "../../config" }
+termblog-content-model = { path = "../../content-model" }
 termblog-proto = { path = "../proto" }
 termblog-commentd = { path = "../commentd" }

@@ -25,15 +25,22 @@ function frame(kind: number, payload: Uint8Array): ArrayBuffer {
 }
 const jsonFrame = (kind: number, v: unknown) => frame(kind, textEnc.encode(JSON.stringify(v)));
 
-// ── 落地页接管状态机(M5): 镜像页带 <meta name="termblog-slug">, 普通页面无 ──
+// ── 落地页接管状态机(M5): 镜像页带 source + route meta, 普通页面无 ──
 // 时序常量: 接管兜底 5000ms; 自动命令延迟 200ms; 淡出 450ms(400ms 过渡 + 余量)。
 // 镜像页 Open 带 fresh=1: 每次访问都是全新会话(网关回收闲置旧会话), 落地永远
 // 是干净 shell → 自动敲 blog; 没有 attach 回镜像页的状态判断。attach 只发生在
 // 首页刷新(终端浏览保留历史)。
-const LANDING =
-  document.querySelector<HTMLMetaElement>('meta[name="termblog-slug"]')?.content?.trim() ?? "";
-const onMirror = LANDING !== "";
-const WANT = onMirror ? `/blog/${LANDING}/` : ""; // 本页文章的 canonical OSC 路径
+const ARTICLE_SOURCE =
+  document.querySelector<HTMLMetaElement>('meta[name="termblog-source"]')?.content?.trim() ?? "";
+const ARTICLE_ROUTE =
+  document.querySelector<HTMLMetaElement>('meta[name="termblog-route"]')?.content?.trim() ?? "";
+const validSource = /^[a-z0-9-]+(?:\/[a-z0-9-]+)*\.md$/.test(ARTICLE_SOURCE);
+const validRoute = /^\/[a-z0-9-]+(?:\/[a-z0-9-]+)*\/$/.test(ARTICLE_ROUTE);
+const onMirror = validSource && validRoute;
+if ((ARTICLE_SOURCE || ARTICLE_ROUTE) && !onMirror) {
+  console.error("termblog article meta is incomplete or invalid");
+}
+const WANT = onMirror ? ARTICLE_ROUTE : "";
 let takeoverDone = false; // 终端是否已完成首次接管
 let articleVisible = true; // 双向“阅读文章 / 进入终端”切换
 let autoArmed = false; // 新会话落地页: 等首帧数据后补敲 blog 命令
@@ -206,7 +213,7 @@ function connect() {
           // 造成第一行孤儿回显 + 与提示符绘制交错的乱象。
           autoSent = true;
           setTimeout(() => {
-            send(frame(T_DATA, textEnc.encode(`blog ~/blog/${LANDING}.md\r`)));
+            send(frame(T_DATA, textEnc.encode(`blog -- "$HOME/${ARTICLE_SOURCE}"\r`)));
           }, 200);
         }
         break;

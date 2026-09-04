@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/content-model",
     "crates/config",
     "crates/servers/proto",
     "crates/servers/core",

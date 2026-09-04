@@ -1,19 +1,19 @@
 # 你好, 世界
 
 这是 termblog 的第一篇文章。你现在读到的, 是同一份 markdown 的两种投影之一:
-搜索引擎看到的是这个静态镜像, 终端用户看到的是 `blog hello` 的排版输出。
+搜索引擎看到的是静态镜像，终端用户看到的是 `blog <article-key>` 的排版输出。
 
 ## 两种入口, 一个源头
 
-- 网页:打开 `/blog/hello/`,几秒后由真实终端接管
-- SSH:`ssh -p 2222 blog@<host>`,然后敲 `blog hello`
+- 网页：从全站文章列表打开本文，几秒后由真实终端接管
+- SSH：`ssh -p 2222 blog@<host>`，然后使用列表显示的 article key 阅读
 
-> 文章本体只有一个:`jailtpl/content/blog/hello.md`,其余全是编译产物。
+> 文章本体只存在于 `jailtpl/content/` 内容树中，其余都是编译产物。
 
 ## 排版自检
 
 ```sh
-$ blog hello
+$ blog path/to/article
 ```
 
 行内代码 `less -R`、**粗体**、*斜体* 与 [链接](https://example.com) 会被两种

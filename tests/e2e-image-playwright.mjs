@@ -5,7 +5,7 @@
 // 门控: env TERMBLOG_PW=1 才真跑(需要 playwright + chromium headless,
 // 人工/CI 按需); 未设 TERMBLOG_PW 或依赖缺失 → 跳过(退出 0 并说明)。
 //
-// 流程: 开 /blog/image-test/ → 等镜像页接管(cover 消失)→ 采样
+// 流程: 从图片 manifest 发现任意带图文章 → 等镜像页接管(cover 消失)→ 采样
 // #term-screen canvas 像素 → 断言存在非背景/非前景的彩色像素
 // (图像像素), 可选断言图片区域尺寸。
 //
@@ -15,7 +15,31 @@
 // 前置: 生产实例在跑(web + jaild + 已重建的模板, 见 plan_image_v2 §6);
 //   npm i playwright(仓库外, 本脚本不引入仓库依赖)。
 
+import { readdirSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BASE = process.env.BASE ?? "http://127.0.0.1:8080";
+const CONTENT = process.env.CONTENT ?? join(REPO, "jailtpl/content");
+
+function walkFiles(dir) {
+  const files = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...walkFiles(path));
+    else if (entry.isFile()) files.push(path);
+  }
+  return files;
+}
+
+function discoverImageKey() {
+  if (process.env.IMAGE_ARTICLE_KEY) return process.env.IMAGE_ARTICLE_KEY;
+  const root = join(CONTENT, ".rendered");
+  const manifest = walkFiles(root).sort().find((path) => path.endsWith(".images.json"));
+  if (!manifest) throw new Error(`找不到图片 manifest: ${root}`);
+  return relative(root, manifest).split("\\").join("/").slice(0, -".images.json".length);
+}
 
 async function main() {
   if (process.env.TERMBLOG_PW !== "1") {
@@ -32,6 +56,10 @@ async function main() {
     return;
   }
 
+  const imageKey = discoverImageKey();
+  const imageRoute = `/${imageKey}/`;
+  console.log(`图片文章: ${imageKey} → ${imageRoute}`);
+
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   let fail = 0;
@@ -44,7 +72,7 @@ async function main() {
   };
 
   try {
-    await page.goto(`${BASE}/blog/image-test/`, { waitUntil: "domcontentloaded" });
+    await page.goto(`${BASE}${imageRoute}`, { waitUntil: "domcontentloaded" });
     // 镜像页接管 = 等待层移除(blog 先发 OSC 7777, 200ms 后淡出移除 cover)
     await page.waitForSelector("#mirror-cover", { state: "detached", timeout: 20000 });
     check(true, "镜像页接管完成(#mirror-cover 已移除)");

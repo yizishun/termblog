@@ -23,6 +23,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3"
 termblog-config = { path = "../../config" }
+termblog-content-model = { path = "../../content-model" }
 termblog-core = { path = "../core" }
 termblog-proto = { path = "../proto" }
 

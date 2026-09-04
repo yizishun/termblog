@@ -32,7 +32,7 @@ URL_WEB := http://$(HOSTNAME):8080
 URL_SSH := ssh://0.0.0.0:2222
 
 .PHONY: all build build-frontend build-content \
-        tpl deploy content verify-comments \
+        tpl deploy content verify-comments verify-content-paths \
         run run-ssh \
         start start-ssh stop stop-ssh restart restart-ssh \
         status status-ssh logs logs-ssh clean
@@ -46,7 +46,7 @@ frontend/node_modules: frontend/package.json
 build-frontend: frontend/node_modules
 	cd frontend && npm run build
 
-# ── 内容编译器: md → HTML 镜像(进 dist) + ANSI 预渲染(进 jailtpl/content/.rendered) ──
+# ── 内容编译器: content 内可见 md → route 对应 HTML + ANSI 预渲染 ──
 # 注意顺序: 必须在 vite build 之后跑(产物写入 dist 且需读 assets/index-*.js)
 build-content:
 	cargo build --release -p content-build
@@ -146,7 +146,12 @@ clean:
 	cargo clean
 	rm -f $(PID_WEB) $(PID_SSH) $(LOG_WEB) $(LOG_SSH)
 	rm -rf frontend/dist
-	rm -rf jailtpl/content/.rendered
+	rm -rf jailtpl/content/.rendered jailtpl/content/.rendered-assets
+	rm -f jailtpl/content/.comment-targets.tsv jailtpl/content/.web-outputs.tsv
 
 verify-comments:
 	sudo sh tests/verify-comments.sh
+
+verify-content-paths:
+	cargo build -p content-build
+	node tests/e2e-content-paths.mjs

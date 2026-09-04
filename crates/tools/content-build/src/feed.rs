@@ -29,13 +29,19 @@ pub fn sitemap(site_url: &str, arts: &[Article]) -> String {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
     );
-    out.push_str(&format!("  <url><loc>{}/</loc></url>\n", xml_escape(site_url)));
-    out.push_str(&format!("  <url><loc>{}/blog/</loc></url>\n", xml_escape(site_url)));
+    out.push_str(&format!(
+        "  <url><loc>{}/</loc></url>\n",
+        xml_escape(site_url)
+    ));
+    out.push_str(&format!(
+        "  <url><loc>{}/blog/</loc></url>\n",
+        xml_escape(site_url)
+    ));
     for a in arts {
         out.push_str(&format!(
-            "  <url><loc>{}/blog/{}/</loc><lastmod>{}</lastmod></url>\n",
+            "  <url><loc>{}{}</loc><lastmod>{}</lastmod></url>\n",
             xml_escape(site_url),
-            xml_escape(&a.slug),
+            xml_escape(&a.path.route),
             a.date10
         ));
     }
@@ -50,28 +56,37 @@ pub fn atom(site_url: &str, site_title: &str, arts: &[Article], feed_updated: &s
     );
     out.push_str(&format!("  <title>{}</title>\n", xml_escape(site_title)));
     out.push_str(&format!("  <id>{}/</id>\n", xml_escape(site_url)));
-    out.push_str(&format!("  <updated>{}</updated>\n", xml_escape(feed_updated)));
+    out.push_str(&format!(
+        "  <updated>{}</updated>\n",
+        xml_escape(feed_updated)
+    ));
     out.push_str(&format!("  <link href=\"{}/\" />\n", xml_escape(site_url)));
     out.push_str(&format!(
         "  <link href=\"{}/atom.xml\" rel=\"self\" />\n",
         xml_escape(site_url)
     ));
-    out.push_str(&format!("  <author><name>{}</name></author>\n", xml_escape(site_title)));
+    out.push_str(&format!(
+        "  <author><name>{}</name></author>\n",
+        xml_escape(site_title)
+    ));
     for a in arts {
         let body = crate::html::body_html(&a.events, &a.image_meta);
         out.push_str("  <entry>\n");
         out.push_str(&format!("    <title>{}</title>\n", xml_escape(&a.title)));
         out.push_str(&format!(
-            "    <id>{}/blog/{}/</id>\n",
+            "    <id>{}{}</id>\n",
             xml_escape(site_url),
-            xml_escape(&a.slug)
+            xml_escape(&a.path.route)
         ));
         out.push_str(&format!(
-            "    <link href=\"{}/blog/{}/\" />\n",
+            "    <link href=\"{}{}\" />\n",
             xml_escape(site_url),
-            xml_escape(&a.slug)
+            xml_escape(&a.path.route)
         ));
-        out.push_str(&format!("    <updated>{}</updated>\n", xml_escape(&a.date_rfc3339)));
+        out.push_str(&format!(
+            "    <updated>{}</updated>\n",
+            xml_escape(&a.date_rfc3339)
+        ));
         out.push_str(&format!(
             "    <summary>{}</summary>\n",
             xml_escape(&strip_control(&a.excerpt))
@@ -100,12 +115,12 @@ mod tests {
     use super::*;
     use pulldown_cmark::{Options, Parser};
 
-    fn article(slug: &str, title: &str, excerpt: &str, md: &str) -> Article {
+    fn article(key: &str, title: &str, excerpt: &str, md: &str) -> Article {
         let events = Parser::new_ext(md, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH)
             .map(|e| e.into_static())
             .collect();
         crate::Article {
-            slug: slug.into(),
+            path: termblog_content_model::ArticlePath::parse(&format!("{key}.md")).unwrap(),
             title: title.into(),
             excerpt: excerpt.into(),
             date10: "2026-08-29".into(),
@@ -115,16 +130,17 @@ mod tests {
             image_meta: Default::default(),
             dest_paths: Default::default(),
             first_image: None,
+            comments: None,
         }
     }
 
     #[test]
     fn xml_escape_all() {
+        assert_eq!(xml_escape("&<>\"'"), "&amp;&lt;&gt;&quot;&apos;");
         assert_eq!(
-            xml_escape("&<>\"'"),
-            "&amp;&lt;&gt;&quot;&apos;"
+            xml_escape("<a href=\"x\">'y'</a>&"),
+            "&lt;a href=&quot;x&quot;&gt;&apos;y&apos;&lt;/a&gt;&amp;"
         );
-        assert_eq!(xml_escape("<a href=\"x\">'y'</a>&"), "&lt;a href=&quot;x&quot;&gt;&apos;y&apos;&lt;/a&gt;&amp;");
     }
 
     #[test]
@@ -134,7 +150,7 @@ mod tests {
         assert!(s.contains("<loc>https://blog.example.com/</loc>"));
         assert!(s.contains("<loc>https://blog.example.com/blog/</loc>"));
         assert!(
-            s.contains("<loc>https://blog.example.com/blog/hello/</loc><lastmod>2026-08-29</lastmod>"),
+            s.contains("<loc>https://blog.example.com/hello/</loc><lastmod>2026-08-29</lastmod>"),
             "文章 URL 应带尾斜杠: {s}"
         );
     }
@@ -142,9 +158,14 @@ mod tests {
     #[test]
     fn atom_content_escaped_html() {
         let a = article("hello", "你好", "摘", "# 你好\n\n正文 <b>加粗</b>\n");
-        let s = atom("https://blog.example.com", "~yzs", &[a], "2026-08-29T10:00:00+08:00");
+        let s = atom(
+            "https://blog.example.com",
+            "~yzs",
+            &[a],
+            "2026-08-29T10:00:00+08:00",
+        );
         assert!(s.contains("<entry>"));
-        assert!(s.contains("<id>https://blog.example.com/blog/hello/</id>"));
+        assert!(s.contains("<id>https://blog.example.com/hello/</id>"));
         assert!(s.contains(
             "<content type=\"html\">&lt;p&gt;正文 &amp;lt;b&amp;gt;加粗&amp;lt;/b&amp;gt;&lt;/p&gt;\n</content>"
         ));
@@ -154,7 +175,12 @@ mod tests {
     #[test]
     fn atom_strips_control_chars_in_summary() {
         let a = article("hello", "你好", "摘\u{07}要", "# 你好\n");
-        let s = atom("https://blog.example.com", "~yzs", &[a], "2026-08-29T10:00:00+08:00");
+        let s = atom(
+            "https://blog.example.com",
+            "~yzs",
+            &[a],
+            "2026-08-29T10:00:00+08:00",
+        );
         assert!(s.contains("<summary>摘要</summary>"));
     }
 

@@ -81,20 +81,7 @@ fn load(path: &Path, target: &str) -> Result<Vec<SnapshotComment>, String> {
 }
 
 fn valid_target(target: &str) -> bool {
-    if target == "/" || target == "/blog/" {
-        return true;
-    }
-    let Some(slug) = target
-        .strip_prefix("/blog/")
-        .and_then(|s| s.strip_suffix('/'))
-    else {
-        return false;
-    };
-    !slug.is_empty()
-        && !slug.contains("//")
-        && slug
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'/' || b == b'-')
+    termblog_content_model::validate_target(target).is_ok()
 }
 
 fn valid_date10(s: &str) -> bool {
@@ -112,6 +99,7 @@ fn strip_controls(s: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn display_ordinal(omitted_earlier: usize, offset: usize) -> usize {
     omitted_earlier + offset + 1
 }

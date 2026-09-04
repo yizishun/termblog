@@ -312,19 +312,19 @@
                 <mxCell id="m5_bc" value="构建期 —— gmake build: build-frontend(vite) → cargo build → content-build" style="rounded=1;dashed=1;whiteSpace=wrap;fillColor=none;strokeColor=#999999;fontSize=13;fontStyle=1;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;" parent="1" vertex="1">
                     <mxGeometry x="40" y="1650" width="1710" height="430" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_src" value="唯一内容源 jailtpl/content/blog/*.md&#xa;无 frontmatter, 目录树即结构&#xa;· slug = 相对路径去 .md (白名单 [a-z0-9/-], 违规构建失败)&#xa;· 标题 = 首个 H1 · 日期 = git 最后提交时间&#xa;· 摘要 = 首段 (~160 字)&#xa;· 顶层散文件只进 jail, 不进镜像与 feed" style="rounded=1;whiteSpace=wrap;fill=#fff2cc;strokeColor=#d6b656;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
+                <mxCell id="m5_src" value="唯一内容根 jailtpl/content/ = guest HOME 蓝图&#xa;任意可见 *.md 是文章, blog/ 只是普通目录&#xa;· source_rel → key / route (白名单 [a-z0-9/-])&#xa;· 标题 = 首个 H1 · 日期 = git 最后提交时间&#xa;· 摘要 = 首段 (~160 字)&#xa;· .cast/普通文件只进 jail, 不进镜像与 feed" style="rounded=1;whiteSpace=wrap;fill=#fff2cc;strokeColor=#d6b656;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
                     <mxGeometry x="50" y="1720" width="250" height="180" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_cb" value="content-build (Rust, crates/content-build)&#xa;pulldown-cmark 一次解析 → 事件流喂两个 renderer&#xa;(ENABLE_TABLES | ENABLE_STRIKETHROUGH)&#xa;slug 违规 → 构建失败 (逐文件列出)&#xa;日期: git commit date, 无历史 fallback mtime + 告警&#xa;清理旧产物 (删文不留僵尸, 幂等)" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
+                <mxCell id="m5_cb" value="content-build + shared content-model&#xa;pulldown-cmark 一次解析 → 事件流喂两个 renderer&#xa;(ENABLE_TABLES | ENABLE_STRIKETHROUGH)&#xa;路径/输出 claim 冲突 → 写入前汇总失败&#xa;日期: git commit date, 无历史 fallback mtime + 告警&#xa;staging + .web-outputs.tsv 清理旧产物" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
                     <mxGeometry x="370" y="1720" width="280" height="180" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_html" value="HTML 投影 → frontend/dist (ServeDir 直接服务)&#xa;· blog/&lt;slug&gt;/index.html 镜像页: 静态全文 +&#xa;  termblog-slug meta + canonical/OG + ssh 提示&#xa;· blog/index.html 列表页 (纯静态, 不引导终端)&#xa;· dist/index.html 首页 footer 注入 (幂等替换)&#xa;· sitemap.xml / atom.xml / robots.txt&#xa;· glob assets/index-*.js + index-*.css 注入镜像页&#xa;  (缺/多 → 构建失败; 缺 CSS 终端 DOM 会裸奔)" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
+                <mxCell id="m5_html" value="HTML 投影 → frontend/dist (ServeDir 直接服务)&#xa;· &lt;article-key&gt;/index.html 镜像页: 静态全文 +&#xa;  termblog-source/route meta + canonical/OG&#xa;· blog/index.html 固定为全站列表&#xa;· sitemap.xml / atom.xml / robots.txt&#xa;· 图片 URL 与 content-relative 路径同构&#xa;· glob assets/index-*.js + index-*.css 注入镜像页&#xa;  (缺/多 → 构建失败)" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
                     <mxGeometry x="890" y="1660" width="330" height="230" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_ansi" value="ANSI 投影 → jailtpl/content/.rendered/&#xa;· &lt;slug&gt;: 76 显示列折行 + SGR (less -R 可读, CJK=2)&#xa;· .index: TSV 一行一篇 (日期倒序) 列表数据" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
+                <mxCell id="m5_ansi" value="ANSI 投影 → jailtpl/content/.rendered/&#xa;· &lt;article-key&gt;: 76 列折行 + SGR (CJK=2)&#xa;· .index: 人类列表&#xa;· .index.json: source/key/route 机器事实源" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
                     <mxGeometry x="830" y="1910" width="330" height="130" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_tpl" value="jail 模板 (build-template.sh)&#xa;· content/blog/ → ~/blog/ (文章目录 = URL 前缀)&#xa;· content/.rendered/ → ~/.rendered/ (隐藏)&#xa;· bin/blog + bin/webctl → /usr/local/bin (0555)&#xa;· zshrc: LANG=C.UTF-8 + MOTD (blog 用法)&#xa;内容更新: scripts/update-content.sh&#xa;(镜像即时发布; 模板销毁重建, 杀会话)" style="rounded=1;whiteSpace=wrap;fill=#e1d5e7;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
+                <mxCell id="m5_tpl" value="jail 模板 (build-template.sh)&#xa;· content 完整非隐藏树 → ~/ 同构复制&#xa;· .rendered/ + assets 单独安装&#xa;· 配置目录注入 comment FIFO&#xa;· bin/blog/play/webctl → /usr/local/bin (0555)&#xa;· zshrc: LANG=C.UTF-8 + MOTD&#xa;内容更新: 完整静态树发布 + 模板旁路换名" style="rounded=1;whiteSpace=wrap;fill=#e1d5e7;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
                     <mxGeometry x="1380" y="1870" width="340" height="190" as="geometry"/>
                 </mxCell>
                 <mxCell id="m5_e1" value="*.md 递归收集" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d6b656;" parent="1" source="m5_src" target="m5_cb" edge="1">
@@ -362,7 +362,7 @@
                 <mxCell id="m5_osc" value="osc.ts: parser.registerOscHandler(7777)&#xa;只认 url= · 白名单 ^/[a-z0-9-]*(/[a-z0-9-]+)*/?$ 且 ≤512&#xa;只 history.replaceState —— 绝不跳转 / 不写 DOM&#xa;天花板 = 地址栏显示一个站内路径" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#b85450;fontSize=12;" parent="m5_browser" vertex="1">
                     <mxGeometry x="20" y="206" width="340" height="80" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_main" value="main.ts 落地状态机&#xa;· 镜像页: Open.fresh=1 → 每次全新会话&#xa;  (旧会话网关立即回收; 免状态判断/免恢复按键)&#xa;· 新会话: 等首帧数据(zsh 就绪)后 200ms&#xa;  自动敲 blog ~/blog/&lt;slug&gt;.md&#xa;· 首页: attach 回放保留终端历史&#xa;· 本页 OSC + 200ms → 等待层淡出, 终端接管&#xa;· 5s 兜底 / WS 断: 撤等待层露全文 + 手动入口" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="m5_browser" vertex="1">
+                <mxCell id="m5_main" value="main.ts 落地状态机&#xa;· 读取并校验 termblog-source + route&#xa;· 镜像页: Open.fresh=1 → 每次全新会话&#xa;· 新会话首帧后自动敲&#xa;  blog -- &amp;quot;$HOME/&lt;source-rel&gt;&amp;quot;&#xa;· 首页: attach 回放保留终端历史&#xa;· 本页 OSC + 200ms → 等待层淡出&#xa;· 5s 兜底 / WS 断: 露全文 + 手动入口" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="m5_browser" vertex="1">
                     <mxGeometry x="20" y="296" width="340" height="110" as="geometry"/>
                 </mxCell>
                 <mxCell id="m5_web" value="termblog-web (axum, www) —— M5 路由零新增" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
@@ -380,10 +380,10 @@
                 <mxCell id="m5_jail" value="jail 会话 (每访客一个真实 FreeBSD jail, guest)" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
                     <mxGeometry x="1100" y="2180" width="420" height="440" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_zsh" value="zsh (guest)&#xa;落地页自动敲入 blog ~/blog/&lt;slug&gt;.md&#xa;(正常键入通路, 进 zsh 历史)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="m5_jail" vertex="1">
+                <mxCell id="m5_zsh" value="zsh (guest)&#xa;落地页自动敲入 blog -- $HOME/&lt;source-rel&gt;&#xa;(正常键入通路, 进 zsh 历史)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="m5_jail" vertex="1">
                     <mxGeometry x="20" y="46" width="380" height="80" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_blog" value="blog —— cat 式接口的阅读器 (sh)&#xa;任意层级 md 路径 (相对 cwd / 相对 ~/blog / 绝对)&#xa;~/blog/ 下文章 → 读预渲染 ~/.rendered/&lt;slug&gt; + 算 slug&#xa;webctl url /blog/&lt;slug&gt;/ → less -RXc (清屏重画)&#xa;退出 → webctl url /" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="m5_jail" vertex="1">
+                <mxCell id="m5_blog" value="blog —— HOME-rooted 阅读器 (Rust)&#xa;查找: 原样 → $HOME/arg → $HOME/arg.md&#xa;.index.json 精确命中 → rendered + 明确 route&#xa;其他可读文件 → 原文, 不猜 route&#xa;配置 attachment 才展示目录评论&#xa;退出 → webctl url /" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="m5_jail" vertex="1">
                     <mxGeometry x="20" y="136" width="380" height="130" as="geometry"/>
                 </mxCell>
                 <mxCell id="m5_webctl" value="webctl (sh): printf &#39;\033]7777;url=%s\007&#39;&#xa;ssh 客户端不认识 → 按 VT 规范吞掉, 零副作用" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="m5_jail" vertex="1">
@@ -400,7 +400,7 @@
                         </Array>
                     </mxGeometry>
                 </mxCell>
-                <mxCell id="m5_r2" value="点开 /blog/&lt;slug&gt;/" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d79b00;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="m5_hum" target="m5_browser" edge="1">
+                <mxCell id="m5_r2" value="点开任意文章 route" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d79b00;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="m5_hum" target="m5_browser" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
                 </mxCell>
                 <mxCell id="m5_r3" value="WS /ws (proto 帧) + 静态资源 (入口 JS/CSS 带 hash)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#6c8ebf;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="m5_browser" target="m5_web" edge="1">

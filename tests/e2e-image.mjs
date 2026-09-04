@@ -23,18 +23,21 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CONTENT = process.argv[2] ?? join(REPO, "jailtpl/content");
 const DIST = process.argv[3] ?? join(REPO, "frontend/dist");
-const BIN_CONTENT = join(REPO, "target/release/content-build");
-const BIN_JAILBIN = join(REPO, "target/release/jailbin");
+const BIN_CONTENT = resolve(
+  process.env.CONTENT_BUILD_BIN ?? join(REPO, "target/release/content-build"),
+);
+const BIN_JAILBIN = resolve(process.env.JAILBIN_BIN ?? join(REPO, "target/release/jailbin"));
 
 // 与 jailbin reader.rs 的默认 cell 尺寸一致(§5.6.3)
 const CELL_W = 9;
@@ -55,14 +58,39 @@ function assertEq(got, want, name) {
   check(got === want, name, `got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
 }
 
+function walkFiles(dir) {
+  const files = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...walkFiles(path));
+    else if (entry.isFile()) files.push(path);
+  }
+  return files;
+}
+
 // ── 1. 跑 content-build(测试 fixture) ──
 console.log("== 1. content-build + manifest ==");
 execFileSync(BIN_CONTENT, ["--content", CONTENT, "--dist", DIST], { stdio: "inherit" });
 
-const slug = "image-test";
-const manifestPath = join(CONTENT, ".rendered", `${slug}.images.json`);
-check(existsSync(manifestPath), "有图文章产 manifest(image-test.images.json)");
-const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+const renderedRoot = join(CONTENT, ".rendered");
+const imageFixtures = walkFiles(renderedRoot)
+  .filter((path) => path.endsWith(".images.json"))
+  .map((path) => ({ path, manifest: JSON.parse(readFileSync(path, "utf8")) }));
+// 这个测试验证特定的 2×2 + 1080×607 几何 fixture，但不关心它位于哪个目录。
+const fixture = imageFixtures.find(({ manifest }) =>
+  manifest.images?.length === 2 &&
+  manifest.images[0].w === 2 && manifest.images[0].h === 2 &&
+  manifest.images[1].w === 1080 && manifest.images[1].h === 607
+);
+if (!fixture) {
+  throw new Error("找不到图片几何 fixture（2×2 + 1080×607）；fixture 可位于 content 任意目录");
+}
+const manifestPath = fixture.path;
+const articleKey = relative(renderedRoot, manifestPath)
+  .split("\\").join("/")
+  .slice(0, -".images.json".length);
+const manifest = fixture.manifest;
+check(true, `发现带图 fixture: ${articleKey}`);
 assertEq(manifest.version, 1, "manifest version == 1");
 check(Array.isArray(manifest.images) && manifest.images.length === 2, "image-test 有 2 个锚点(外链图不进 manifest)", JSON.stringify(manifest.images));
 
@@ -73,7 +101,7 @@ function stripAnsi(s) {
     .replace(/\u001b\[[0-9;?]*[a-zA-Z]/g, "")
     .replace(/\u001b\][^\u001b]*(\u001b\\|\u0007)/g, "");
 }
-const renderedLines = readFileSync(join(CONTENT, ".rendered", slug), "utf8").split("\n").map(stripAnsi);
+const renderedLines = readFileSync(join(CONTENT, ".rendered", articleKey), "utf8").split("\n").map(stripAnsi);
 let prevEnd = 0;
 for (const img of manifest.images) {
   const top = renderedLines[img.block_start] ?? "";
@@ -84,30 +112,39 @@ for (const img of manifest.images) {
   prevEnd = img.block_end;
   assertEq(img.indent_cols, 0, `顶层图 indent_cols=0(${img.asset})`);
   assertEq(img.display_cols, 76, `顶层图 display_cols=76(${img.asset})`);
-  // asset 与 dist/blog 同字节
+  // asset 与 content-relative Web 输出同字节
   const assetBytes = readFileSync(join(CONTENT, ".rendered-assets", img.asset));
-  const distBytes = readFileSync(join(DIST, "blog", img.asset));
+  const distBytes = readFileSync(join(DIST, img.asset));
   check(
     assetBytes.equals(distBytes),
-    `.rendered-assets/${img.asset} 与 dist/blog/${img.asset} 字节一致`,
+    `.rendered-assets/${img.asset} 与 dist/${img.asset} 字节一致`,
   );
   // w/h 与 asset 解码尺寸一致
   const dims = parseDims(assetBytes, extOf(img.asset));
   assertEq(`${img.w}x${img.h}`, dims, `manifest w/h 与 asset 解码尺寸一致(${img.asset})`);
 }
-// 无图文章不产 manifest
-check(!existsSync(join(CONTENT, ".rendered", "hello.images.json")), "无图文章(hello)不产 manifest");
+// 从机器索引任选一篇无图文章，验证“无图不产 manifest”，不绑定目录或文件名。
+const machineIndex = JSON.parse(readFileSync(join(renderedRoot, ".index.json"), "utf8"));
+const noImageArticle = machineIndex.articles.find(
+  ({ key }) => !existsSync(join(renderedRoot, `${key}.images.json`)),
+);
+check(Boolean(noImageArticle), "至少发现一篇无图文章");
+if (noImageArticle) {
+  check(
+    !existsSync(join(renderedRoot, `${noImageArticle.key}.images.json`)),
+    `无图文章(${noImageArticle.key})不产 manifest`,
+  );
+}
 
 // ── 2. dump-image-frame: IIP 字节格式 ──
 console.log("== 2. blog --dump-image-frame ==");
 const home = mkdtempSync(join(tmpdir(), "tb-e2e-"));
-mkdirSync(join(home, ".rendered"));
 cpSync(join(CONTENT, ".rendered"), join(home, ".rendered"), { recursive: true });
 cpSync(join(CONTENT, ".rendered-assets"), join(home, ".rendered-assets"), { recursive: true });
 symlinkSync(BIN_JAILBIN, join(home, "blog"));
 
 function dump(rows, cols, row) {
-  const r = spawnSync(join(home, "blog"), ["--dump-image-frame", slug, String(rows), String(cols), String(row)], {
+  const r = spawnSync(join(home, "blog"), ["--dump-image-frame", articleKey, String(rows), String(cols), String(row)], {
     env: { ...process.env, HOME: home },
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -172,7 +209,7 @@ check(blockRow(1) === 8 + 36 + 3, `photo 块模型行 47(实际 ${blockRow(1)})`
   check(seqs.length === 2, `F1 两条 IIP(实际 ${seqs.length})`, seqs.map((s) => s.name).join(","));
   if (seqs.length === 2) {
     const [pix, photo] = seqs;
-    assertEq(pix.name, "image-test/pixel.png", "F1: pixel 在 photo 前");
+    assertEq(pix.name, images[0].asset, "F1: 第一张图片 asset 与 manifest 一致");
     const wpx = geo(images[0]).wpx;
     assertEq(pix.wpx, wpx, `F1 pixel width=${wpx}px`);
     assertEq(pix.hpx, fullHpx(images[0], wpx), `F1 pixel height=${fullHpx(images[0], wpx)}px`);

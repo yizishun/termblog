@@ -16,8 +16,13 @@ done
 TERMBLOG_CONFIG="$CONFIG" "$COMMENTCTL" queue --limit 10 >/dev/null
 curl -fsS -G --data-urlencode 'target=/' --data-urlencode 'limit=100' \
     "$BASE_URL/api/comments" | grep -q '"comments"' || { echo "FAIL: public API"; exit 1; }
+curl -fsS -G --data-urlencode 'target=/notes/' --data-urlencode 'limit=100' \
+    "$BASE_URL/api/comments" | grep -q '"comments"' || { echo "FAIL: 通用 /notes/ target"; exit 1; }
+grep -Fxq 'notes/comment	/notes/' /usr/local/share/termblog/comment-targets.tsv || {
+    echo "FAIL: 显式空目录 attachment 未进入 target 清单"; exit 1;
+}
 
-echo "OK: 双 socket、commentctl、target 清单与 public API"
+echo "OK: 双 socket、commentctl、显式 attachment 清单与通用 target API"
 
 JAIL_ROOT=${TERMBLOG_VERIFY_JAIL_ROOT:-}
 if [ -z "$JAIL_ROOT" ]; then
@@ -25,6 +30,7 @@ if [ -z "$JAIL_ROOT" ]; then
     exit 0
 fi
 [ -p "$JAIL_ROOT/home/guest/comment" ] || { echo "FAIL: 全局 FIFO 不存在"; exit 1; }
+[ -p "$JAIL_ROOT/home/guest/notes/comment" ] || { echo "FAIL: notes attachment FIFO 不存在"; exit 1; }
 nonce="verify-comments-$(date +%s)-$$"
 printf 'verify: %s\n' "$nonce" > "$JAIL_ROOT/home/guest/comment"
 sleep 1

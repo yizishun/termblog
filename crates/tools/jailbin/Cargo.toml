@@ -21,6 +21,7 @@ nix = { workspace = true, features = ["poll"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+termblog-content-model = { path = "../../content-model" }
 # alt 行按显示列截断(CJK=2)
 unicode-width = "0.2"
 

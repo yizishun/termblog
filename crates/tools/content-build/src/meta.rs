@@ -1,4 +1,4 @@
-//! 元数据提取: slug 校验 / 标题 / 摘要 / 日期 / .index 生成。
+//! 元数据提取: 标题 / 摘要 / 日期 / 文章索引生成。
 
 use std::path::Path;
 use std::process::Command;
@@ -6,26 +6,6 @@ use std::process::Command;
 use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
 
 use crate::Article;
-
-/// slug 白名单校验: `^[a-z0-9/-]+$`(小写字母、数字、连字符、路径分隔),
-/// 另加防御性检查(空、`//`、以 `/` 结尾)。违规返回带原因的 Err。
-pub fn validate_slug(slug: &str) -> Result<(), String> {
-    if slug.is_empty() {
-        return Err("slug 为空".into());
-    }
-    if let Some(c) = slug.chars().find(|c| {
-        !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '/')
-    }) {
-        return Err(format!("含非法字符 '{c}' (仅允许 [a-z0-9/-])"));
-    }
-    if slug.contains("//") {
-        return Err("含连续分隔符 //".into());
-    }
-    if slug.ends_with('/') {
-        return Err("以 / 结尾".into());
-    }
-    Ok(())
-}
 
 /// 收集一段 inline 内容(从 events[*i] 起)的纯文本, 直到遇到 `stop` 结束事件。
 /// 嵌套 inline 容器(strong/em/link…)的结束事件跳过, 代码取字面、链接取文字、
@@ -73,11 +53,15 @@ fn collect_inline_text(events: &[Event<'static>], i: &mut usize, out: &mut Strin
 pub fn extract_title(events: &[Event<'static>], fallback: &str) -> String {
     let mut i = 0;
     while i < events.len() {
-        if let Event::Start(Tag::Heading { level: HeadingLevel::H1, .. }) = events[i] {
+        if let Event::Start(Tag::Heading {
+            level: HeadingLevel::H1,
+            ..
+        }) = events[i]
+        {
             i += 1;
             let mut text = String::new();
             collect_inline_text(events, &mut i, &mut text, TagEnd::Heading(HeadingLevel::H1));
-            let t = text.replace('\t', " ").trim().to_string();
+            let t = collapse_ws(&text);
             if !t.is_empty() {
                 return t;
             }
@@ -156,25 +140,41 @@ pub fn article_date(path: &Path) -> (String, String, bool) {
     (date10, rfc, true)
 }
 
-/// .rendered/.index: 一行一篇, TSV = 日期 \t slug \t 标题。
-/// 日期倒序, 同日 slug 字典序升序。
+/// .rendered/.index: 一行一篇, TSV = 日期 \t article key \t 标题。
+/// 日期倒序, 同日 key 字典序升序。
 pub fn build_index(arts: &[Article]) -> String {
     let mut sorted: Vec<&Article> = arts.iter().collect();
     sorted.sort_by(|a, b| {
         b.date_rfc3339
             .cmp(&a.date_rfc3339)
-            .then_with(|| a.slug.cmp(&b.slug))
+            .then_with(|| a.path.key.cmp(&b.path.key))
     });
     let mut out = String::new();
     for a in sorted {
         out.push_str(&a.date10);
         out.push('\t');
-        out.push_str(&a.slug);
+        out.push_str(&a.path.key);
         out.push('\t');
         out.push_str(&a.title);
         out.push('\n');
     }
     out
+}
+
+pub fn build_machine_index(arts: &[Article]) -> termblog_content_model::ArticleIndex {
+    termblog_content_model::ArticleIndex {
+        version: 1,
+        articles: arts
+            .iter()
+            .map(|article| termblog_content_model::ArticleIndexEntry {
+                date10: article.date10.clone(),
+                source_rel: article.path.source_rel.to_string_lossy().into_owned(),
+                key: article.path.key.clone(),
+                route: article.path.route.clone(),
+                title: article.title.clone(),
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -188,9 +188,9 @@ mod tests {
             .collect()
     }
 
-    fn article(slug: &str, date10: &str, date_rfc3339: &str, title: &str) -> Article {
+    fn article(key: &str, date10: &str, date_rfc3339: &str, title: &str) -> Article {
         Article {
-            slug: slug.into(),
+            path: termblog_content_model::ArticlePath::parse(&format!("{key}.md")).unwrap(),
             title: title.into(),
             excerpt: String::new(),
             date10: date10.into(),
@@ -200,33 +200,28 @@ mod tests {
             image_meta: Default::default(),
             dest_paths: Default::default(),
             first_image: None,
+            comments: None,
         }
-    }
-
-    #[test]
-    fn slug_validation() {
-        assert!(validate_slug("hello").is_ok());
-        assert!(validate_slug("2026/notes").is_ok());
-        assert!(validate_slug("why-a-terminal-blog").is_ok());
-        assert!(validate_slug("Hello").is_err()); // 大写
-        assert!(validate_slug("my_post").is_err()); // 下划线
-        assert!(validate_slug("你好").is_err()); // 中文
-        assert!(validate_slug("a..b").is_err()); // 点
-        assert!(validate_slug("a b").is_err()); // 空格
-        assert!(validate_slug("").is_err()); // 空
-        assert!(validate_slug("a//b").is_err()); // 连续分隔符
-        assert!(validate_slug("a/").is_err()); // 尾部斜杠
     }
 
     #[test]
     fn title_extraction() {
         // 有 H1
-        assert_eq!(extract_title(&parse("# 你好, 世界\n\n正文"), "fallback"), "你好, 世界");
+        assert_eq!(
+            extract_title(&parse("# 你好, 世界\n\n正文"), "fallback"),
+            "你好, 世界"
+        );
         // 无 H1 → 文件名 stem
-        assert_eq!(extract_title(&parse("只有正文, 没有标题\n"), "my-post"), "my-post");
+        assert_eq!(
+            extract_title(&parse("只有正文, 没有标题\n"), "my-post"),
+            "my-post"
+        );
         // H1 带行内代码与链接
         assert_eq!(
-            extract_title(&parse("# `less -R` 与 [链接](https://x.example) 标题"), "fb"),
+            extract_title(
+                &parse("# `less -R` 与 [链接](https://x.example) 标题"),
+                "fb"
+            ),
             "less -R 与 链接 标题"
         );
         // Tab 换空格
@@ -252,14 +247,24 @@ mod tests {
 
     #[test]
     fn index_build() {
-        let a = article("hello", "2026-08-29", "2026-08-29T10:00:00+08:00", "你好, 世界");
+        let a = article(
+            "hello",
+            "2026-08-29",
+            "2026-08-29T10:00:00+08:00",
+            "你好, 世界",
+        );
         let b = article(
             "why-a-terminal-blog",
             "2026-08-29",
             "2026-08-29T11:00:00+08:00",
             "为什么把博客做成一个终端",
         );
-        let c = article("2026/notes", "2026-08-28", "2026-08-28T09:00:00+08:00", "笔记");
+        let c = article(
+            "2026/notes",
+            "2026-08-28",
+            "2026-08-28T09:00:00+08:00",
+            "笔记",
+        );
         // 同日(08-29): 按完整时间倒序(b 11:00 在前), 跨日按日期倒序
         assert_eq!(
             build_index(&[c, a, b]),

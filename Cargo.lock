@@ -427,7 +427,10 @@ dependencies = [
  "pulldown-cmark",
  "serde",
  "serde_json",
+ "tempfile",
  "termblog-config",
+ "termblog-content-model",
+ "toml",
  "unicode-width",
 ]
 
@@ -2754,6 +2757,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "termblog-config",
+ "termblog-content-model",
  "termblog-core",
  "termblog-proto",
  "tokio",
@@ -2768,6 +2772,13 @@ dependencies = [
  "anyhow",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "termblog-content-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -2795,6 +2806,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "termblog-content-model",
  "unicode-width",
 ]
 
@@ -2810,6 +2822,7 @@ dependencies = [
  "serde_json",
  "termblog-commentd",
  "termblog-config",
+ "termblog-content-model",
  "termblog-core",
  "termblog-proto",
  "tokio",

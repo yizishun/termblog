@@ -3,12 +3,12 @@
 //! 满足**全部**进入条件时 blog 用它替换 less(见 `blog::run` 与 `try_run`):
 //!
 //! ```text
-//! slug 非空(文章在 ~/blog/ 下)
+//! rendered 是机器索引给出的 `~/.rendered/<article-key>`
 //! 且 stdin 与 stdout 都是终端
 //! 且 env TERMBLOG_IMG == "iterm2"   (严格相等; 未设置/空串/其他值一律走 less)
 //! 且 终端 cols ≥ 76                 (窄窗口语义见 §5.6.3)
-//! 且 ~/.rendered/<slug> 存在且非空
-//! 且 ~/.rendered/<slug>.images.json 存在、解析成功、version == 1、images 非空
+//! 且 rendered 文件存在且非空
+//! 且相邻的 `<basename>.images.json` 存在、解析成功、version == 1、images 非空
 //! 且 §5.6.1 全部预检通过
 //! ```
 //!
@@ -155,19 +155,7 @@ fn preflight(
 /// 字符集限 [a-z0-9/._-], 逐段拒绝空段与 `.`/`..`, 文件存在且非空。
 /// 拒绝 `..`/空段后规范化不可能逃逸 `.rendered-assets/` 根。
 fn validate_asset(asset: &str, root: &Path) -> Result<(), String> {
-    if asset.is_empty() {
-        return Err("asset 路径为空".into());
-    }
-    if let Some(c) = asset.chars().find(|c| {
-        !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '/' | '.' | '_' | '-'))
-    }) {
-        return Err(format!("asset 含非法字符 '{c}': {asset}"));
-    }
-    for seg in asset.split('/') {
-        if seg.is_empty() || seg == "." || seg == ".." {
-            return Err(format!("asset 含非法路径段 '{seg}': {asset}"));
-        }
-    }
+    termblog_content_model::validate_resource_rel(asset).map_err(|e| e.to_string())?;
     let p = root.join(asset);
     match std::fs::metadata(&p) {
         Ok(m) if m.is_file() && m.len() > 0 => Ok(()),
@@ -339,7 +327,7 @@ fn block_geometry(a: &ImgAnchor, cols: u16, cell_w: u32, cell_h: u32) -> (usize,
     // R 必须从实际写进 IIP height 的整数值推导, 不能分别对有理数取整,
     // 否则边界尺寸可能多/少预留一行。
     let hpx = display_height(a, wpx);
-    let r = (hpx as u64 + cell_h as u64 - 1) / cell_h as u64;
+    let r = (hpx as u64).div_ceil(cell_h as u64);
     (wcols, wpx, r.max(1) as usize)
 }
 
@@ -698,6 +686,7 @@ enum Placement {
 
 /// 计算放置并取(或构建)payload。top = 图像块首模型行 − scroll。
 /// 失败 → Degraded(该块退回 v1 占位框文本, 其余块不受影响)。
+#[allow(clippy::too_many_arguments)]
 fn place_image(
     prep: &Prepared,
     img: usize,
@@ -807,7 +796,13 @@ fn key_action(code: KeyCode, modifiers: KeyModifiers) -> Action {
 
 /// 满足全部进入条件且 §5.6.1 预检通过 → 进入 TUI 阅读器, 返回退出码。
 /// 任一条件不满足 → None(调用方走 less 现状路径, 一字不动)。
-pub fn try_run(slug: &str, home: &Path, rendered: &Path) -> Option<i32> {
+fn sidecar_path(rendered: &Path) -> Option<PathBuf> {
+    let mut name = rendered.file_name()?.to_os_string();
+    name.push(".images.json");
+    Some(rendered.with_file_name(name))
+}
+
+pub fn try_run(home: &Path, rendered: &Path) -> Option<i32> {
     // TERMBLOG_IMG 严格相等: 未设置/空串/其他值一律走 less
     if std::env::var("TERMBLOG_IMG").as_deref() != Ok("iterm2") {
         return None;
@@ -823,7 +818,7 @@ pub fn try_run(slug: &str, home: &Path, rendered: &Path) -> Option<i32> {
     if text.is_empty() {
         return None;
     }
-    let manifest_path = rendered.with_file_name(format!("{slug}.images.json"));
+    let manifest_path = sidecar_path(rendered)?;
     let manifest: ManifestFile =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).ok()?).ok()?;
     if manifest.version != 1 || manifest.images.is_empty() {
@@ -1131,6 +1126,7 @@ enum ExposedRow {
 /// 单行滚动快路径: 先准备新露出的一行, 然后在同步输出事务内用 CSI S/T
 /// 移动已有终端行(图片 cell 属性会随行移动), 最后只补这一行。相比整帧
 /// 清屏, 不再重发视口内整张图。
+#[allow(clippy::too_many_arguments)]
 fn draw_incremental_scroll(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     prep: &Prepared,
@@ -1210,6 +1206,7 @@ fn draw_incremental_scroll(
 
 /// 确定性整帧路径: 全清 → ratatui 重绘文本(图像行留空)→ 直接写 IIP。
 /// 初始帧、翻页/首尾跳转与 resize 使用它; 单行滚动走增量路径。
+#[allow(clippy::too_many_arguments)]
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     prep: &Prepared,
@@ -1334,23 +1331,23 @@ fn truncate_columns(s: &str, cols: usize) -> String {
     out
 }
 
-// ── 测试钩子: blog --dump-image-frame <slug> <rows> <cols> <row>(§5.6.6) ──
+// ── 测试钩子: blog --dump-image-frame <article-key> <rows> <cols> <row>(§5.6.6) ──
 
 /// 渲染单帧到 stdout 后退出(不进入交互, 不碰 raw mode/alternate screen),
 /// 供 Node e2e 断言 IIP 字节。cell 尺寸用默认值(20×9, 与常量一致)。
-pub fn dump_frame(home: &Path, slug: &str, rows: u16, cols: u16, row: usize) -> Result<(), String> {
-    let rendered = home.join(".rendered").join(slug);
-    let text = std::fs::read_to_string(&rendered).map_err(|e| format!("读 {slug}: {e}"))?;
+pub fn dump_frame(home: &Path, key: &str, rows: u16, cols: u16, row: usize) -> Result<(), String> {
+    let rendered = home.join(".rendered").join(key);
+    let text = std::fs::read_to_string(&rendered).map_err(|e| format!("读 {key}: {e}"))?;
     if text.is_empty() {
-        return Err(format!("{slug}: 预渲染文本为空"));
+        return Err(format!("{key}: 预渲染文本为空"));
     }
+    let manifest_path = sidecar_path(&rendered).ok_or("预渲染路径没有文件名")?;
     let manifest: ManifestFile = serde_json::from_str(
-        &std::fs::read_to_string(rendered.with_file_name(format!("{slug}.images.json")))
-            .map_err(|e| format!("读 manifest: {e}"))?,
+        &std::fs::read_to_string(manifest_path).map_err(|e| format!("读 manifest: {e}"))?,
     )
     .map_err(|e| format!("manifest JSON: {e}"))?;
     if manifest.version != 1 || manifest.images.is_empty() {
-        return Err(format!("{slug}: manifest 无图或版本不符"));
+        return Err(format!("{key}: manifest 无图或版本不符"));
     }
     let assets_dir = home.join(".rendered-assets");
     let prep = preflight(&text, manifest.images, &assets_dir, &rendered)?;
@@ -1389,7 +1386,7 @@ pub fn dump_frame(home: &Path, slug: &str, rows: u16, cols: u16, row: usize) -> 
         if top + block_h <= 0 || top >= rows as i64 {
             continue;
         }
-        match place_image(
+        if let Placement::Image { payload, x, top } = place_image(
             &prep,
             img,
             top,
@@ -1399,15 +1396,12 @@ pub fn dump_frame(home: &Path, slug: &str, rows: u16, cols: u16, row: usize) -> 
             DEFAULT_CELL_H,
             &mut caches,
         ) {
-            Placement::Image { payload, x, top } => {
-                let y = top.max(0);
-                if (y as u16) < rows {
-                    execute!(out, MoveTo(x, y as u16)).map_err(|e| e.to_string())?;
-                    out.write_all(payload.as_bytes())
-                        .map_err(|e| e.to_string())?;
-                }
+            let y = top.max(0);
+            if (y as u16) < rows {
+                execute!(out, MoveTo(x, y as u16)).map_err(|e| e.to_string())?;
+                out.write_all(payload.as_bytes())
+                    .map_err(|e| e.to_string())?;
             }
-            _ => {}
         }
     }
     out.write_all(SYNC_UPDATE_END).map_err(|e| e.to_string())?;
@@ -1415,10 +1409,10 @@ pub fn dump_frame(home: &Path, slug: &str, rows: u16, cols: u16, row: usize) -> 
     Ok(())
 }
 
-/// `blog --dump-image-frame <slug> <rows> <cols> <row>` 的 CLI 入口。
+/// `blog --dump-image-frame <article-key> <rows> <cols> <row>` 的 CLI 入口。
 pub fn dump_cli(args: &[String], home: &Path) -> i32 {
     if args.len() != 4 {
-        eprintln!("用法: blog --dump-image-frame <slug> <rows> <cols> <row>");
+        eprintln!("用法: blog --dump-image-frame <article-key> <rows> <cols> <row>");
         return 2;
     }
     let parse = |i: usize| -> Option<u32> { args[i].parse().ok() };
