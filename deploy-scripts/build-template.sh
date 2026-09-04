@@ -40,7 +40,7 @@ command -v zfs >/dev/null || { echo "需要 ZFS"; exit 1; }
 echo ">> 准备构建输入(以 $BUILD_USER: content-build + jailbin + 内容产物)"
 su -l "$BUILD_USER" -c "set -e; cd $REPO; \
     cargo build --release -p content-build -p termblog-jailbin; \
-    [ -d frontend/dist ] || ( cd frontend && npm install && npm run build ); \
+    ( cd frontend; [ -d node_modules ] || npm install; npm run build ); \
     ./target/release/content-build --content jailtpl/content --dist frontend/dist"
 
 # 1. 确定构建目标数据集: --replace 走旁路名(旧模板与在线会话全程不动)
@@ -89,7 +89,7 @@ export LANG=C.UTF-8
 umask 022
 PS1='%F{green}blog@jail%f %~ %# '
 setopt INTERACTIVE_COMMENTS
-echo '博客: 敲 blog 看文章列表, 读一篇: blog hello (或 blog ~/blog/hello.md)'
+echo '帮助: blog ~/help.md    博客: blog 看列表, blog hello 读文章'
 echo '录像: 敲 play 列出终端录像(.cast), 播一个: play hello/demo (空格暂停, q 退出)'
 EOF
 
@@ -100,6 +100,7 @@ EOF
 if [ -d "$REPO/jailtpl/content" ]; then
     mkdir -p "$BUILD_MOUNT/home/$GUEST/blog" "$BUILD_MOUNT/home/$GUEST/.rendered" "$BUILD_MOUNT/home/$GUEST/.rendered-assets"
     cp -R "$REPO/jailtpl/content/blog/." "$BUILD_MOUNT/home/$GUEST/blog/"
+    install -m 444 "$REPO/jailtpl/content/help.md" "$BUILD_MOUNT/home/$GUEST/help.md"
     if [ -d "$REPO/jailtpl/content/.rendered" ]; then
         cp -R "$REPO/jailtpl/content/.rendered/." "$BUILD_MOUNT/home/$GUEST/.rendered/"
     fi
@@ -108,6 +109,38 @@ if [ -d "$REPO/jailtpl/content" ]; then
     fi
 fi
 chown -R 1001:1001 "$BUILD_MOUNT/home/$GUEST"
+
+# 评论设备：只按 content-build 从含直属文章的目录生成的可信清单创建。
+TARGETS="$REPO/jailtpl/content/.comment-targets.tsv"
+[ -f "$TARGETS" ] || { echo "缺少评论 target 清单: $TARGETS"; exit 1; }
+install -d -m 755 "$BUILD_MOUNT/usr/local/share/termblog"
+install -m 444 "$TARGETS" "$BUILD_MOUNT/usr/local/share/termblog/comment-targets.tsv"
+while IFS="$(printf '\t')" read -r rel target; do
+    [ -n "$rel" ] && [ -n "$target" ] || { echo "非法空 target 行"; exit 1; }
+    case "$rel" in
+        /*|*//*|.|..|../*|*/../*|*/..) echo "非法评论设备路径: $rel"; exit 1 ;;
+    esac
+    case "$rel" in
+        comment) expected="/" ;;
+        blog/comment) expected="/blog/" ;;
+        blog/*/comment)
+            dir=${rel#blog/}; dir=${dir%/comment}
+            case "$dir" in ""|/*|*/|*//*|*[!a-z0-9/-]*) echo "非法文章目录: $dir"; exit 1 ;; esac
+            expected="/blog/$dir/"
+            ;;
+        *) echo "非法评论设备路径: $rel"; exit 1 ;;
+    esac
+    [ "$target" = "$expected" ] || { echo "评论 target 不匹配: $rel -> $target"; exit 1; }
+    fifo="$BUILD_MOUNT/home/$GUEST/$rel"
+    [ ! -e "$fifo" ] || { echo "评论设备路径已存在: $fifo"; exit 1; }
+    parent=$(dirname "$fifo")
+    install -d -m 755 -o 1001 -g 1001 "$parent"
+    mkfifo -m 600 "$fifo"
+    chown 1001:1001 "$fifo"
+done < "$TARGETS"
+
+# 会话快照目录由 root 管理；guest 只能读取 comments.jsonl。
+install -d -m 755 "$BUILD_MOUNT/var/run/termblog"
 
 # 9. jailbin 命令(0555, 只读): blog / play / webctl 是指向 jailbin 的符号链接(busybox 式)
 echo ">> 安装 jailbin 命令(blog / play / webctl → jailbin)"

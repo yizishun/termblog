@@ -6,8 +6,11 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
 
 ## 架构
 
-- **jaild**(root, 唯一特权进程): 每访客从只读模板 `zroot/jails/template@release`
+- **jaild**(root, 会话特权进程): 每访客从只读模板 `zroot/jails/template@release`
   ZFS clone 出一个会话 jail(rctl 限额 + 4M 磁盘配额), PTY 经 Unix socket 供接入层使用。
+- **commentd**(root, 评论单写者): 用独立 root-only JSONL 数据库存储待审/通过/删除状态，
+  通过 public/private 两个 Unix socket 分隔只读查询与投稿、审核；访客向 jail 内 FIFO
+  写一行即可投稿。文章评论绑定直属目录，同目录文章共享一个 FIFO；无直属文章的目录不创建。
 - **termblog-web / termblog-ssh**(降权 www): 浏览器(WS)/ SSH 两个接入网关,
   经 SEQPACKET Unix socket 连 jaild, 零协议转换。
 - **content-build**: 把唯一内容源 `jailtpl/content/blog/*.md` 一次解析成两个投影 ——
@@ -32,11 +35,11 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
 ```
 crates/
   config/        # termblog-config: TOML 配置(servers 与 content-build 共用)
-  servers/       # proto(线协议) core(会话运行时) web ssh jaild
+  servers/       # proto(线协议) core(会话运行时) web ssh jaild commentd
   tools/         # content-build(内容编译器) jailbin(jail 内命令)
 deploy-scripts/  # build-template.sh(模板构建/零停机换面) deploy.sh(全量部署)
 tests/           # verify-m3.sh verify-m5.sh e2e-reconnect.mjs(验收脚本)
-jailtpl/content/ # 唯一内容源: blog/*.md(每篇可带同名资源目录, 如录像 .cast)
+jailtpl/content/ # 唯一内容源: help.md + blog/*.md(每篇可带同名资源目录, 如录像 .cast)
                  # + .rendered 产物(README 写作规范只留仓库)
 etc/             # termblog.toml 样例 + rc.d + newsyslog
 frontend/        # xterm.js 前端(vite)
@@ -55,10 +58,10 @@ frontend/        # xterm.js 前端(vite)
 部署目标内嵌 sudo, 直接 `make tpl` / `make deploy` / `make content` 即可
 (会提示输入密码)。部署脚本不依赖 Makefile; Makefile 只是薄入口。
 
-> **图片二期升级注意**: 新 jailbin、`~/.rendered-assets/` 与图片 sidecar 只存在于
-> 重建后的模板数据集里, `make deploy` 不会替换已有 jail 模板。升级后必须带
-> `--replace` 重建模板(零停机换面, 旧会话继续用旧模板):
-> `make build && sudo sh deploy-scripts/deploy.sh && sudo sh deploy-scripts/build-template.sh --replace`。
+> **模板功能升级注意**: 新 jailbin、评论 FIFO/清单、`help.md` 和图片产物只存在于
+> 重建后的模板数据集里。升级已有安装时先零停机换模板，再部署守护进程：
+> `sudo sh deploy-scripts/build-template.sh --replace && sudo sh deploy-scripts/deploy.sh`。
+> `deploy.sh` 会拒绝启动缺少评论清单的旧模板，避免新 jaild 交付不了会话。
 > 后续只改文章仍走 `make content`(内部已含 `--replace`)。
 
 配置: `/usr/local/etc/termblog.toml`(仓库 `etc/termblog.toml` 为样例)。
@@ -69,6 +72,7 @@ frontend/        # xterm.js 前端(vite)
 
 - `sh tests/verify-m3.sh`(root): 进程形态 / 真实 jail / 隔离 / rctl / 配额 / zfs 无泄漏
 - `sh tests/verify-m5.sh`: 镜像页 / 发现链路 / feed / robots + ssh 侧 blog 行为
+- `sh tests/verify-comments.sh`(root): 双 socket / FIFO 投稿 / 审核 / API / 初始会话快照
 - `node tests/e2e-reconnect.mjs`: 断线重连协议
 
 ## 开发

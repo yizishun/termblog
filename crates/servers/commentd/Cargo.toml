@@ -1,23 +1,30 @@
 [package]
-name = "termblog-jaild"
+name = "termblog-commentd"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "termblog_commentd"
+path = "src/lib.rs"
+
 [[bin]]
-name = "termblog-jaild"
+name = "commentd"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-bytes.workspace = true
+chrono.workspace = true
+libc = "0.2"
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3"
-libc = "0.2"
-termblog-core = { path = "../core" }
 termblog-config = { path = "../../config" }
+termblog-core = { path = "../core" }
 termblog-proto = { path = "../proto" }
-termblog-commentd = { path = "../commentd" }
+
+[dev-dependencies]
+tempfile = "3"

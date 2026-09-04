@@ -16,17 +16,34 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
-use axum::response::Response;
+use axum::extract::{ConnectInfo, Query, State, WebSocketUpgrade};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::Json;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
+use termblog_commentd::{page_limit, valid_target, Client as CommentClient, PublicQuery};
 use termblog_config::Config;
 use termblog_core::{Control, SessionClient};
 use termblog_proto as proto;
 use tower_http::services::ServeDir;
 
 use sessions::{CloseReason, SessionStore};
+
+#[derive(Clone)]
+struct AppState {
+    sessions: SessionStore,
+    comments: CommentClient,
+}
+
+#[derive(serde::Deserialize)]
+struct CommentsParams {
+    target: Option<String>,
+    after_id: Option<u64>,
+    limit: Option<u16>,
+    revision: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,10 +61,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.jail.socket = v.into();
     }
 
-    let state = SessionStore::new(SessionClient::new(&cfg.jail.socket));
+    let state = AppState {
+        sessions: SessionStore::new(SessionClient::new(&cfg.jail.socket)),
+        comments: CommentClient::new(cfg.comments.public_socket.clone()),
+    };
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/api/comments", get(comments_handler))
         .fallback_service(ServeDir::new(&cfg.web.static_dir)) // 前端构建产物; 开发可用 vite dev 代理
         .with_state(state);
 
@@ -66,12 +87,67 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn comments_handler(
+    State(state): State<AppState>,
+    Query(params): Query<CommentsParams>,
+) -> impl IntoResponse {
+    let Some(target) = params.target else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "target 必填"})),
+        );
+    };
+    if !valid_target(&target)
+        || page_limit(params.limit).is_err()
+        || params.after_id.unwrap_or(0) > 0 && params.revision.is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "查询参数非法"})),
+        );
+    }
+    match state
+        .comments
+        .public_query(&PublicQuery {
+            target,
+            after_id: params.after_id,
+            limit: params.limit,
+            revision: params.revision,
+        })
+        .await
+    {
+        Ok(res) if res.ok => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "revision": res.revision,
+                "total": res.total,
+                "omitted_earlier": res.omitted_earlier,
+                "comments": res.comments,
+                "next_after_id": res.next_after_id,
+                "has_more": res.has_more,
+            })),
+        ),
+        Ok(res) if res.error.as_deref() == Some("stale_revision") => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale_revision"})),
+        ),
+        Ok(res) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": res.error.unwrap_or_else(|| "查询失败".into())})),
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "评论服务暂不可用"})),
+        ),
+    }
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(state): State<SessionStore>,
+    State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    ws.on_upgrade(move |sock| handle(sock, state, peer.ip()))
+    ws.on_upgrade(move |sock| handle(sock, state.sessions, peer.ip()))
 }
 
 async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {

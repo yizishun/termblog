@@ -34,7 +34,8 @@ const LANDING =
   document.querySelector<HTMLMetaElement>('meta[name="termblog-slug"]')?.content?.trim() ?? "";
 const onMirror = LANDING !== "";
 const WANT = onMirror ? `/blog/${LANDING}/` : ""; // 本页文章的 canonical OSC 路径
-let takeoverDone = false; // 静态层是否已交给终端(一次性)
+let takeoverDone = false; // 终端是否已完成首次接管
+let articleVisible = true; // 双向“阅读文章 / 进入终端”切换
 let autoArmed = false; // 新会话落地页: 等首帧数据后补敲 blog 命令
 let autoSent = false; // 自动命令已发出(一次性)
 
@@ -263,29 +264,47 @@ function handleOscUrl(path: string) {
 }
 
 function takeOver() {
-  if (takeoverDone) return;
-  takeoverDone = true;
-  // 先藏正文再淡等待层: 淡出过程透出的是终端, 不是静态正文
-  const sv = document.getElementById("static-view");
-  if (sv) sv.style.display = "none";
-  const cover = document.getElementById("mirror-cover");
-  cover?.classList.add("fade-out"); // 400ms 淡出(blog.css)
-  setTimeout(() => cover?.remove(), 450); // 之后彻底移出 DOM
-  document.getElementById("enter-terminal")?.setAttribute("hidden", "");
+  if (!takeoverDone) {
+    takeoverDone = true;
+    const cover = document.getElementById("mirror-cover");
+    cover?.classList.add("fade-out");
+    setTimeout(() => cover?.remove(), 450);
+  }
+  showTerminal();
+}
+
+function showTerminal() {
+  document.getElementById("static-view")?.style.setProperty("display", "none");
+  const toggle = document.getElementById("enter-terminal");
+  if (toggle) {
+    toggle.textContent = "阅读文章";
+    toggle.removeAttribute("hidden");
+  }
+  articleVisible = false;
+}
+
+function showArticle() {
+  document.getElementById("static-view")?.style.removeProperty("display");
+  const toggle = document.getElementById("enter-terminal");
+  if (toggle) {
+    toggle.textContent = "进入终端 ↵";
+    toggle.removeAttribute("hidden");
+  }
+  articleVisible = true;
 }
 
 function revealStaticFallback() {
   // 会话死了 / WS 断了 / 5s 无 OSC: 撤掉等待层, 静态正文保留可读 + 手动入口。
-  // 若 OSC 稍后才到, takeOver 会继续完成接管(正文再藏起), 此态不是终态。
   document.getElementById("static-view")?.style.removeProperty("display");
   const cover = document.getElementById("mirror-cover");
   cover?.classList.add("fade-out");
   setTimeout(() => cover?.remove(), 450);
-  revealEnterButton();
-}
-
-function revealEnterButton() {
-  document.getElementById("enter-terminal")?.removeAttribute("hidden");
+  articleVisible = true;
+  const toggle = document.getElementById("enter-terminal");
+  if (toggle) {
+    toggle.textContent = "进入终端 ↵";
+    toggle.removeAttribute("hidden");
+  }
 }
 
 function armFallback() {
@@ -294,4 +313,7 @@ function armFallback() {
   }, 5000);
 }
 
-document.getElementById("enter-terminal")?.addEventListener("click", takeOver);
+document.getElementById("enter-terminal")?.addEventListener("click", () => {
+  if (!takeoverDone || articleVisible) takeOver();
+  else showArticle();
+});

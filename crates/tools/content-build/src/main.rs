@@ -46,6 +46,19 @@ pub struct Article {
     pub first_image: Option<String>,
 }
 
+/// 评论绑定文章的直属目录，而不是文章文件本身。同目录文章共享一个 target/FIFO。
+pub(crate) fn comment_location_for_slug(slug: &str) -> (String, String) {
+    let directory = slug.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+    if directory.is_empty() {
+        ("blog/comment".into(), "/blog/".into())
+    } else {
+        (
+            format!("blog/{directory}/comment"),
+            format!("/blog/{directory}/"),
+        )
+    }
+}
+
 #[derive(Debug)]
 struct Cli {
     content: PathBuf,
@@ -56,7 +69,8 @@ struct Cli {
 }
 
 fn next_val(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
-    args.next().ok_or_else(|| anyhow::anyhow!("参数 {name} 需要一个值"))
+    args.next()
+        .ok_or_else(|| anyhow::anyhow!("参数 {name} 需要一个值"))
 }
 
 fn parse_cli() -> Result<Cli> {
@@ -92,7 +106,8 @@ fn scan_blog(
     slug_errors: &mut Vec<String>,
     warns: &mut Vec<String>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("扫描目录 {}", dir.display()))? {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("扫描目录 {}", dir.display()))?
+    {
         let entry = entry.with_context(|| format!("读目录项 {}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
@@ -165,7 +180,14 @@ fn main() -> Result<()> {
     let mut slug_errors: Vec<String> = vec![];
     let mut warns: Vec<String> = vec![];
     if blog_dir.is_dir() {
-        scan_blog(&blog_dir, &blog_dir, &mut rel_paths, &mut assets, &mut slug_errors, &mut warns)?;
+        scan_blog(
+            &blog_dir,
+            &blog_dir,
+            &mut rel_paths,
+            &mut assets,
+            &mut slug_errors,
+            &mut warns,
+        )?;
         if rel_paths.is_empty() {
             warns.push(format!("{} 下没有文章", blog_dir.display()));
         }
@@ -176,7 +198,10 @@ fn main() -> Result<()> {
         for e in &slug_errors {
             eprintln!("slug 违规: {e}");
         }
-        bail!("slug 校验失败: {} 个文件违规, 请改名后重跑", slug_errors.len());
+        bail!(
+            "slug 校验失败: {} 个文件违规, 请改名后重跑",
+            slug_errors.len()
+        );
     }
     rel_paths.sort();
 
@@ -200,7 +225,10 @@ fn main() -> Result<()> {
         if text.contains('\r') {
             text = text.replace("\r\n", "\n").replace('\r', "\n");
         }
-        let parser = Parser::new_ext(&text, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH);
+        let parser = Parser::new_ext(
+            &text,
+            Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
+        );
         let events: Vec<Event<'static>> = parser.map(|e| e.into_static()).collect();
         let slug = rel
             .to_string_lossy()
@@ -212,7 +240,10 @@ fn main() -> Result<()> {
         let excerpt = meta::extract_excerpt(&events, &title);
         let (date10, date_rfc3339, date_warned) = meta::article_date(&path);
         if date_warned {
-            warns.push(format!("「{}」无 git 历史, 日期回退到文件 mtime", rel.display()));
+            warns.push(format!(
+                "「{}」无 git 历史, 日期回退到文件 mtime",
+                rel.display()
+            ));
         }
 
         // 图片引用: 逐张 resolve + 处理, 单篇总量预算 1.5 MiB
@@ -260,7 +291,9 @@ fn main() -> Result<()> {
                     total_imgs += 1;
                     total_bytes += p.bytes.len();
                     referenced.insert(p.dist_rel.clone());
-                    asset_bytes.entry(p.dist_rel.clone()).or_insert_with(|| p.bytes.clone());
+                    asset_bytes
+                        .entry(p.dist_rel.clone())
+                        .or_insert_with(|| p.bytes.clone());
                     // 产物 URL: webp 已转 png, 路径用转换后的扩展名
                     let url = format!("/blog/{}{suffix}", p.dist_rel);
                     image_meta.insert(dest.clone(), (p.width, p.height, url.clone()));
@@ -313,8 +346,8 @@ fn main() -> Result<()> {
         let assets = cli.dist.join("assets");
         let mut found: Vec<String> = vec![];
         if assets.is_dir() {
-            for e in std::fs::read_dir(&assets)
-                .with_context(|| format!("扫描 {}", assets.display()))?
+            for e in
+                std::fs::read_dir(&assets).with_context(|| format!("扫描 {}", assets.display()))?
             {
                 let name = e?.file_name().to_string_lossy().to_string();
                 if name.starts_with("index-") && name.ends_with(".js") {
@@ -337,8 +370,8 @@ fn main() -> Result<()> {
         let assets = cli.dist.join("assets");
         let mut found: Vec<String> = vec![];
         if assets.is_dir() {
-            for e in std::fs::read_dir(&assets)
-                .with_context(|| format!("扫描 {}", assets.display()))?
+            for e in
+                std::fs::read_dir(&assets).with_context(|| format!("扫描 {}", assets.display()))?
             {
                 let name = e?.file_name().to_string_lossy().to_string();
                 if name.starts_with("index-") && name.ends_with(".css") {
@@ -356,6 +389,25 @@ fn main() -> Result<()> {
         }
     };
 
+    // 独立 comments 入口：文章镜像页不通过 main.ts 间接启动。
+    let comments_js = {
+        let assets = cli.dist.join("assets");
+        let mut found = Vec::new();
+        if assets.is_dir() {
+            for entry in std::fs::read_dir(&assets)? {
+                let name = entry?.file_name().to_string_lossy().to_string();
+                if name.starts_with("comments-") && name.ends_with(".js") {
+                    found.push(name);
+                }
+            }
+        }
+        match found.len() {
+            1 => found.pop().unwrap(),
+            0 => bail!("找不到独立 comments 前端入口，请先 make build-frontend"),
+            n => bail!("找到 {n} 个 comments 前端入口，无法确定: {found:?}"),
+        }
+    };
+
     // 清理旧产物(幂等: 删文后不留僵尸)
     let dist_blog = cli.dist.join("blog");
     if dist_blog.exists() {
@@ -370,10 +422,10 @@ fn main() -> Result<()> {
     }
     let rendered = cli.content.join(".rendered");
     if rendered.exists() {
-        std::fs::remove_dir_all(&rendered).with_context(|| format!("清理 {}", rendered.display()))?;
+        std::fs::remove_dir_all(&rendered)
+            .with_context(|| format!("清理 {}", rendered.display()))?;
     }
-    std::fs::create_dir_all(&rendered)
-        .with_context(|| format!("创建 {}", rendered.display()))?;
+    std::fs::create_dir_all(&rendered).with_context(|| format!("创建 {}", rendered.display()))?;
     // 处理后图片的第二投影(jail 内 TUI 阅读器的读取源): 与 dist/blog 同字节、
     // 同路径; 目录与 dist/blog 一样每轮先清后写, 僵尸资源天然清理。
     let rendered_assets = cli.content.join(".rendered-assets");
@@ -383,6 +435,21 @@ fn main() -> Result<()> {
     }
     std::fs::create_dir_all(&rendered_assets)
         .with_context(|| format!("创建 {}", rendered_assets.display()))?;
+
+    // 评论绑定文章直属目录；同目录多篇文章共享一行，纯资源目录不创建 FIFO。
+    let mut target_rows = vec![("comment".to_string(), "/".to_string())];
+    target_rows.extend(
+        arts.iter()
+            .map(|a| comment_location_for_slug(&a.slug)),
+    );
+    target_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    target_rows.dedup();
+    let target_manifest: String = target_rows
+        .iter()
+        .map(|(path, target)| format!("{path}\t{target}\n"))
+        .collect();
+    std::fs::write(cli.content.join(".comment-targets.tsv"), target_manifest)
+        .with_context(|| format!("写 {}", cli.content.join(".comment-targets.tsv").display()))?;
 
     // 复制被引用的图片资源进 dist/blog/(dist/blog 已整体先清, 僵尸资源天然清理)
     // 与 .rendered-assets/(与 dist/blog 同字节、同路径)
@@ -432,14 +499,22 @@ fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("创建 {}", parent.display()))?;
             }
-            std::fs::write(&mp, ansi::Manifest { version: 1, images: anchors }.to_json())
-                .with_context(|| format!("写 {}", mp.display()))?;
+            std::fs::write(
+                &mp,
+                ansi::Manifest {
+                    version: 1,
+                    images: anchors,
+                }
+                .to_json(),
+            )
+            .with_context(|| format!("写 {}", mp.display()))?;
         }
 
         let page = html::render_mirror_page(
             a,
             entry_js.as_deref().unwrap_or_default(),
             entry_css.as_deref().unwrap_or_default(),
+            &comments_js,
             site_url.as_deref(),
             &site_title,
             a.first_image.as_deref(),
@@ -457,7 +532,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("写 {}", rendered.join(".index").display()))?;
     std::fs::create_dir_all(&dist_blog).with_context(|| format!("创建 {}", dist_blog.display()))?;
     let entry_js_str = entry_js.as_deref().unwrap_or_default();
-    let list = html::render_list_page(&arts, site_url.as_deref(), &site_title, entry_js_str);
+    let list = html::render_list_page(
+        &arts,
+        site_url.as_deref(),
+        &site_title,
+        entry_js_str,
+    );
     std::fs::write(dist_blog.join("index.html"), list)
         .with_context(|| format!("写 {}", dist_blog.join("index.html").display()))?;
 
@@ -469,13 +549,20 @@ fn main() -> Result<()> {
             .first()
             .map(|a| a.date_rfc3339.clone())
             .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
-        std::fs::write(cli.dist.join("atom.xml"), feed::atom(u, &site_title, &arts, &feed_updated))
-            .with_context(|| format!("写 {}", cli.dist.join("atom.xml").display()))?;
+        std::fs::write(
+            cli.dist.join("atom.xml"),
+            feed::atom(u, &site_title, &arts, &feed_updated),
+        )
+        .with_context(|| format!("写 {}", cli.dist.join("atom.xml").display()))?;
     } else {
-        warns.push("未设置 site_url, 跳过 sitemap.xml / atom.xml(镜像页无 canonical/OG:url)".into());
+        warns
+            .push("未设置 site_url, 跳过 sitemap.xml / atom.xml(镜像页无 canonical/OG:url)".into());
     }
-    std::fs::write(cli.dist.join("robots.txt"), feed::robots(site_url.as_deref()))
-        .with_context(|| format!("写 {}", cli.dist.join("robots.txt").display()))?;
+    std::fs::write(
+        cli.dist.join("robots.txt"),
+        feed::robots(site_url.as_deref()),
+    )
+    .with_context(|| format!("写 {}", cli.dist.join("robots.txt").display()))?;
 
     // 摘要
     println!("content-build: {} 篇文章", arts.len());
@@ -493,4 +580,28 @@ fn main() -> Result<()> {
         println!("警告: {w}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod comment_location_tests {
+    use super::*;
+
+    #[test]
+    fn comments_attach_to_immediate_article_directory() {
+        assert_eq!(
+            comment_location_for_slug("hello"),
+            ("blog/comment".into(), "/blog/".into())
+        );
+        assert_eq!(
+            comment_location_for_slug("topic/one"),
+            ("blog/topic/comment".into(), "/blog/topic/".into())
+        );
+        assert_eq!(
+            comment_location_for_slug("topic/deep/two"),
+            (
+                "blog/topic/deep/comment".into(),
+                "/blog/topic/deep/".into(),
+            )
+        );
+    }
 }

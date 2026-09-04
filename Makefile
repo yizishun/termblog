@@ -32,7 +32,7 @@ URL_WEB := http://$(HOSTNAME):8080
 URL_SSH := ssh://0.0.0.0:2222
 
 .PHONY: all build build-frontend build-content \
-        tpl deploy content \
+        tpl deploy content verify-comments \
         run run-ssh \
         start start-ssh stop stop-ssh restart restart-ssh \
         status status-ssh logs logs-ssh clean
@@ -147,3 +147,6 @@ clean:
 	rm -f $(PID_WEB) $(PID_SSH) $(LOG_WEB) $(LOG_SSH)
 	rm -rf frontend/dist
 	rm -rf jailtpl/content/.rendered
+
+verify-comments:
+	sudo sh tests/verify-comments.sh

@@ -18,10 +18,17 @@
 //! 后续想换 libjail-rs / rctl crate 对外界无感。`jail_attach(2)` 在 fork 后的
 //! 子进程里直接 syscall, PTY 从端、uid 切换、attach 的顺序完全可控。
 
+use std::collections::HashSet;
 use std::ffi::CString;
-use std::os::fd::AsRawFd;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -29,33 +36,46 @@ use nix::pty::{openpty, Winsize};
 use nix::unistd::{fork, ForkResult};
 use tracing::{error, info, warn};
 
-use termblog_config::JailConfig;
+use termblog_commentd::{protocol::PRIVATE_SYNC, Client as CommentClient, Comment};
+use termblog_config::{CommentsConfig, JailConfig};
 
-use crate::pty::ShellChild;
+use crate::pty::{CommentFifo, ShellChild};
 
 #[derive(Clone)]
 pub struct JailBackend {
     cfg: JailConfig,
+    comments_cfg: CommentsConfig,
+    comments: CommentClient,
     /// kern.osreldate(如 1500000 = 15.0): 处理跨版本参数差异
     osreldate: u32,
 }
 
 impl JailBackend {
-    pub fn new(cfg: JailConfig) -> Self {
-        Self { cfg, osreldate: sysctl_osreldate().unwrap_or(0) }
+    pub fn new(cfg: JailConfig, comments_cfg: CommentsConfig) -> Self {
+        let comments = CommentClient::new(comments_cfg.private_socket.clone());
+        Self {
+            cfg,
+            comments_cfg,
+            comments,
+            osreldate: sysctl_osreldate().unwrap_or(0),
+        }
     }
 
     /// 启动残留回收: 上次崩溃遗留的 s-* 数据集(jail + devfs + zfs 一并清掉)。
     /// 幂等; zfs 不可用(非 ZFS 机器)时静默跳过, 方便开发环境直接拉起 jaild 调试。
     pub fn sweep(cfg: &JailConfig) -> Result<()> {
         let parent = parent_dataset(&cfg.dataset_prefix);
-        let out = Command::new("zfs").args(["list", "-H", "-o", "name", "-r", parent]).output();
+        let out = Command::new("zfs")
+            .args(["list", "-H", "-o", "name", "-r", parent])
+            .output();
         let Ok(out) = out else { return Ok(()) };
         if !out.status.success() {
             return Ok(());
         }
         for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let Some(sid) = line.strip_prefix(cfg.dataset_prefix.as_str()) else { continue };
+            let Some(sid) = line.strip_prefix(cfg.dataset_prefix.as_str()) else {
+                continue;
+            };
             if sid.is_empty() || sid.contains('/') || sid.contains('@') {
                 continue;
             }
@@ -90,13 +110,40 @@ impl JailBackend {
         rows: u16,
         caps: &[String],
     ) -> Result<ShellChild> {
+        // 首次 approved 同步是会话交付 barrier；失败时不 fork shell。
+        let approved = self
+            .comments
+            .all(PRIVATE_SYNC)
+            .await
+            .context("首次同步评论")?;
+        let snapshot = snapshot_bytes(&approved)?;
         let cfg = self.cfg.clone();
+        let comments_cfg = self.comments_cfg.clone();
         let sid = sid.to_string();
         let caps = caps.to_vec();
         let osreldate = self.osreldate;
-        tokio::task::spawn_blocking(move || spawn_sync(&cfg, &sid, cols, rows, &caps, osreldate))
-            .await
-            .context("jail spawn task panicked")?
+        tokio::task::spawn_blocking(move || {
+            spawn_sync(
+                &cfg,
+                &comments_cfg,
+                &snapshot,
+                &sid,
+                cols,
+                rows,
+                &caps,
+                osreldate,
+            )
+        })
+        .await
+        .context("jail spawn task panicked")?
+    }
+
+    pub fn comment_client(&self) -> CommentClient {
+        self.comments.clone()
+    }
+
+    pub fn comment_drain_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.comments_cfg.session_drain_ms)
     }
 
     /// 会话结束后的资源销毁(jail -r + zfs destroy)。幂等;
@@ -109,8 +156,11 @@ impl JailBackend {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // 生命周期参数在此边界显式传递，避免 fork 前隐藏状态。
 fn spawn_sync(
     cfg: &JailConfig,
+    comments_cfg: &CommentsConfig,
+    snapshot: &[u8],
     sid: &str,
     cols: u16,
     rows: u16,
@@ -122,7 +172,19 @@ fn spawn_sync(
     let name = format!("s-{sid}");
 
     // 失败兜底: 任何一步失败都把已建资源全部销毁(幂等), 不留半成品
-    let res = spawn_inner(cfg, sid, cols, rows, caps, osreldate, &ds, &path, &name);
+    let res = spawn_inner(
+        cfg,
+        comments_cfg,
+        snapshot,
+        sid,
+        cols,
+        rows,
+        caps,
+        osreldate,
+        &ds,
+        &path,
+        &name,
+    );
     if let Err(e) = &res {
         // 失败原因必须落日志: 否则只剩 socket 上的 Closed 帧, 排障无门
         error!(sid, error = %e, "jail spawn 失败");
@@ -132,8 +194,11 @@ fn spawn_sync(
     res
 }
 
+#[allow(clippy::too_many_arguments)] // spawn_sync 展开后的同步实现，共用同一失败清理边界。
 fn spawn_inner(
     cfg: &JailConfig,
+    comments_cfg: &CommentsConfig,
+    snapshot: &[u8],
     sid: &str,
     cols: u16,
     rows: u16,
@@ -174,7 +239,11 @@ fn spawn_inner(
     // 跨版本: FreeBSD 15.0 起 UFS quota 移除, 参数 allow.quotactl 改名 allow.quotas。
     // 一个二进制要同时跑 15.x/16 与老版本, 用运行时 kern.osreldate 选参数,
     // 而不是编译期宏(编译目标只有一个 freebsd, 宏区分不了 15 和 16)。
-    let quota_param = if osreldate >= 1500000 { "allow.quotas=0" } else { "allow.quotactl=0" };
+    let quota_param = if osreldate >= 1500000 {
+        "allow.quotas=0"
+    } else {
+        "allow.quotactl=0"
+    };
     let out = Command::new("jail")
         .args([
             "-c",
@@ -215,8 +284,31 @@ fn spawn_inner(
     // 5. guest 账号(从 jail 内的 passwd 解析 uid/gid/home)
     let (uid, gid, home) = guest_ids(path, &cfg.guest_user)?;
 
-    // 6. openpty + fork; 子进程只做异步信号安全的 syscall
-    let ws = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    // 6. shell 启动前固定打开全部 FIFO；随后写完 root-owned 初始快照。
+    let targets_rel = comments_cfg
+        .targets_file
+        .strip_prefix("/")
+        .context("comments.targets_file 必须是绝对路径")?;
+    let targets = read_targets(&Path::new(path).join(targets_rel))?;
+    let home_root = format!("{path}{home}");
+    let comment_fifos = targets
+        .iter()
+        .map(|(rel, target)| {
+            Ok(CommentFifo {
+                fd: open_fifo_at(Path::new(&home_root), rel)?,
+                target: target.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    write_snapshot(path, snapshot)?;
+
+    // 7. openpty + fork; 子进程只做异步信号安全的 syscall
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     let pty = openpty(Some(&ws), None).context("openpty")?;
     let (master, slave) = (pty.master, pty.slave);
 
@@ -242,9 +334,16 @@ fn spawn_inner(
             drop(slave);
             // 主端设为非阻塞, 交给 core 的读写泵(AsyncFd)驱动
             let flags = OFlag::from_bits_truncate(fcntl(master.as_raw_fd(), FcntlArg::F_GETFL)?);
-            fcntl(master.as_raw_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+            fcntl(
+                master.as_raw_fd(),
+                FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
+            )?;
             info!(sid, jid, pid = child.as_raw(), "jail 会话已创建");
-            Ok(ShellChild { master, pid: child })
+            Ok(ShellChild {
+                master,
+                pid: child,
+                comment_fifos,
+            })
         }
         ForkResult::Child => unsafe {
             libc::setsid();
@@ -277,6 +376,196 @@ fn spawn_inner(
     }
 }
 
+#[derive(serde::Serialize)]
+struct SnapshotLine<'a> {
+    id: u64,
+    target: &'a str,
+    author: &'a str,
+    date10: &'a str,
+    text: &'a str,
+}
+
+fn snapshot_bytes(comments: &[Comment]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for c in comments {
+        let date10 = c
+            .created_at
+            .get(..10)
+            .ok_or_else(|| anyhow::anyhow!("commentd created_at 太短"))?;
+        serde_json::to_writer(
+            &mut out,
+            &SnapshotLine {
+                id: c.id,
+                target: &c.target,
+                author: &c.author,
+                date10,
+                text: &c.text,
+            },
+        )?;
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+fn read_targets(path: &Path) -> Result<Vec<(String, String)>> {
+    let md = std::fs::symlink_metadata(path)
+        .with_context(|| format!("读取评论 target 清单 {}", path.display()))?;
+    if !md.file_type().is_file()
+        || md.file_type().is_symlink()
+        || md.uid() != 0
+        || md.mode() & 0o022 != 0
+    {
+        bail!("评论 target 清单必须是 root-owned、group/other 不可写的普通文件");
+    }
+    parse_targets(&std::fs::read_to_string(path)?)
+}
+
+fn parse_targets(text: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut paths = HashSet::new();
+    let mut targets = HashSet::new();
+    for (idx, line) in text.lines().enumerate() {
+        let (rel, target) = line
+            .split_once('\t')
+            .ok_or_else(|| anyhow::anyhow!("target 清单第 {} 行缺 Tab", idx + 1))?;
+        if target.contains('\t')
+            || rel.is_empty()
+            || rel.starts_with('/')
+            || rel
+                .split('/')
+                .any(|p| p.is_empty() || p == "." || p == "..")
+        {
+            bail!("target 清单第 {} 行相对路径非法", idx + 1);
+        }
+        let derived = target_for_fifo(rel)
+            .ok_or_else(|| anyhow::anyhow!("target 清单第 {} 行路径不是评论设备", idx + 1))?;
+        if derived != target || !termblog_commentd::valid_target(target) {
+            bail!("target 清单第 {} 行映射不一致", idx + 1);
+        }
+        if !paths.insert(rel.to_string()) || !targets.insert(target.to_string()) {
+            bail!("target 清单第 {} 行重复", idx + 1);
+        }
+        out.push((rel.to_string(), target.to_string()));
+    }
+    if out.is_empty() {
+        bail!("评论 target 清单为空");
+    }
+    Ok(out)
+}
+
+fn target_for_fifo(rel: &str) -> Option<String> {
+    match rel {
+        "comment" => Some("/".into()),
+        "blog/comment" => Some("/blog/".into()),
+        _ => {
+            let slug = rel.strip_prefix("blog/")?.strip_suffix("/comment")?;
+            let target = format!("/blog/{slug}/");
+            termblog_commentd::valid_target(&target).then_some(target)
+        }
+    }
+}
+
+/// 以 guest home fd 为锚逐级 openat；每层都 O_NOFOLLOW，最终再次 fstat FIFO。
+fn open_fifo_at(home: &Path, rel: &str) -> Result<OwnedFd> {
+    let home_c = CString::new(home.as_os_str().as_bytes())?;
+    let raw = unsafe {
+        libc::open(
+            home_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error()).context("打开 guest home");
+    }
+    let mut dir = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let name = CString::new(part)?;
+        let last = parts.peek().is_none();
+        let flags = if last {
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("openat 评论设备 {rel}"));
+        }
+        let opened = unsafe { OwnedFd::from_raw_fd(fd) };
+        if last {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            if unsafe { libc::fstat(opened.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("fstat 评论设备");
+            }
+            let st = unsafe { st.assume_init() };
+            if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+                bail!("评论设备 {rel} 不是 FIFO");
+            }
+            return Ok(opened);
+        }
+        dir = opened;
+    }
+    bail!("空评论设备路径")
+}
+
+static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn write_snapshot(jail_root: &str, bytes: &[u8]) -> Result<()> {
+    let root = Path::new(jail_root);
+    for rel in ["var", "var/run"] {
+        validate_root_dir(&root.join(rel))?;
+    }
+    let dir = root.join("var/run/termblog");
+    if !dir.exists() {
+        std::fs::create_dir(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    }
+    validate_root_dir(&dir)?;
+    let final_path = dir.join("comments.jsonl");
+    if final_path.exists() {
+        let md = std::fs::symlink_metadata(&final_path)?;
+        if !md.file_type().is_file() || md.file_type().is_symlink() || md.uid() != 0 {
+            bail!("评论快照不是 root-owned 普通文件");
+        }
+    }
+    let seq = SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(".comments.tmp.{}.{}", std::process::id(), seq));
+    let result = (|| -> Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&temp, &final_path)?;
+        File::open(&dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn validate_root_dir(path: &Path) -> Result<()> {
+    let md = std::fs::symlink_metadata(path)
+        .with_context(|| format!("校验 root-owned 目录 {}", path.display()))?;
+    if !md.file_type().is_dir()
+        || md.file_type().is_symlink()
+        || md.uid() != 0
+        || md.mode() & 0o022 != 0
+    {
+        bail!(
+            "{} 必须是 root-owned 且 group/other 不可写的真实目录",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// 会话 shell 的环境变量内容(独立成纯函数便于单测):
 /// caps 含 img-iterm2 时含 TERMBLOG_IMG=iterm2(图片二期: 告知 jailbin 的
 /// blog 可以走 TUI 阅读器); **否则完全不设置该变量** —— 绝不设空值,
@@ -295,7 +584,10 @@ fn env_strings(home: &str, caps: &[String]) -> Vec<String> {
 
 /// 用 `jls -j <name> jid` 查 jail 的 jid(创建后立刻可用)。
 fn jail_jid(name: &str) -> Result<c_int> {
-    let out = Command::new("jls").args(["-j", name, "jid"]).output().context("执行 jls")?;
+    let out = Command::new("jls")
+        .args(["-j", name, "jid"])
+        .output()
+        .context("执行 jls")?;
     if !out.status.success() {
         bail!("jls -j {name} 失败: {}", stderr_of(&out));
     }
@@ -368,7 +660,10 @@ fn guest_ids(jail_root: &str, user: &str) -> Result<(u32, u32, String)> {
 
 /// kern.osreldate(如 1500000 = 15.0-RELEASE)。读不到时返回 None(调用方兜底)。
 fn sysctl_osreldate() -> Option<u32> {
-    let out = Command::new("sysctl").args(["-n", "kern.osreldate"]).output().ok()?;
+    let out = Command::new("sysctl")
+        .args(["-n", "kern.osreldate"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -385,7 +680,10 @@ fn parent_dataset(prefix: &str) -> &str {
 }
 
 fn run(prog: &str, args: &[&str]) -> Result<()> {
-    let out = Command::new(prog).args(args).output().with_context(|| format!("执行 {prog}"))?;
+    let out = Command::new(prog)
+        .args(args)
+        .output()
+        .with_context(|| format!("执行 {prog}"))?;
     if !out.status.success() {
         bail!("{prog} {} 失败: {}", args.join(" "), stderr_of(&out));
     }
@@ -408,8 +706,33 @@ mod tests {
         assert!(envs.iter().any(|e| e == "HOME=/home/guest"));
         // 无 caps / 未知 caps → 完全不设置该变量(不是设空值)
         let envs = env_strings("/home/guest", &[]);
-        assert!(!envs.iter().any(|e| e.starts_with("TERMBLOG_IMG")), "{envs:?}");
+        assert!(
+            !envs.iter().any(|e| e.starts_with("TERMBLOG_IMG")),
+            "{envs:?}"
+        );
         let envs = env_strings("/home/guest", &["img-sixel".to_string()]);
-        assert!(!envs.iter().any(|e| e.starts_with("TERMBLOG_IMG")), "{envs:?}");
+        assert!(
+            !envs.iter().any(|e| e.starts_with("TERMBLOG_IMG")),
+            "{envs:?}"
+        );
+    }
+
+    #[test]
+    fn target_manifest_is_strict_and_derives_targets() {
+        let rows =
+            parse_targets("comment\t/\nblog/comment\t/blog/\nblog/a/b/comment\t/blog/a/b/\n")
+                .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2], ("blog/a/b/comment".into(), "/blog/a/b/".into()));
+
+        for bad in [
+            "/comment\t/\n",
+            "blog/../comment\t/blog/../\n",
+            "blog/a/comment\t/blog/wrong/\n",
+            "comment\t/\ncomment\t/\n",
+            "missing-tab\n",
+        ] {
+            assert!(parse_targets(bad).is_err(), "应拒绝: {bad:?}");
+        }
     }
 }

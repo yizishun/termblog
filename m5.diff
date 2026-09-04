@@ -1,0 +1,4135 @@
+commit 60fb68917dfe945abcf4f61cd802d86c689fbdbc
+Author: Zishun Yi <zis@FreeBSD.org>
+Date:   Sun Aug 30 09:03:07 2026 +0000
+
+    M5: SEO 静态镜像 + URL⇄终端双向同步
+    
+    每篇文章有稳定 URL: content-build(Rust)把唯一内容源
+    jailtpl/content/blog/*.md 一次解析成两个投影 —— HTML 静态镜像页
+    (frontend/dist/blog/<slug>/, 爬虫读全文, 不开 jail)与 ANSI 预渲染
+    (76 列, less -R 可读), 并产出列表页/首页注入/sitemap/atom/robots。
+    
+    真人打开文章 URL: 等待层首屏(正文不闪现)→ 终端后台就绪 → 自动敲
+    blog ~/blog/blog/<slug>.md(首帧数据后发送, 避免 tty 回显抢跑)→
+    首条 OSC 7777 后等待层淡出、终端接管; attach 时 Ctrl-C + 在同一终端
+    敲 blog(less -c 清屏重画); 失败 5s 兜底露全文。OSC 双向同步:
+    jail 内 webctl 打 ESC]7777;url=/blog/<slug>/BEL, 纯字节穿透
+    PTY/jaild/web, 前端 osc.ts 白名单校验后只 replaceState;
+    ssh 客户端自动吞掉未知 OSC。
+    
+    blog 命令为 cat 式文件阅读器(任意层级 md 路径, 文章树内自动同步
+    地址栏); 镜像页注入带 hash 的入口 JS 与打包 CSS(xterm.css 缺失会
+    导致终端 DOM 裸奔); blog.css 带版本参数防旧缓存; 部署链
+    update-content.sh 区分静态发布与模板重建。
+    
+    文档: docs/architecture.drawio 新增 M5 设计图(编译投影 + 运行期
+    OSC 闭环)。验收: content-build 29 个单元测试, verify-m5.sh 全绿。
+
+diff --git a/.gitignore b/.gitignore
+index 722ddcb..74bc115 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,3 +10,5 @@ dist
+ ssh_host_ed25519*
+ # 本地说明文档, 不入库
+ m3.md
++# 内容编译产物(由 content-build 生成, 勿手改、勿提交)
++jailtpl/content/.rendered/
+diff --git a/Cargo.lock b/Cargo.lock
+index 3fb5a3b..ce2c051 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -355,6 +355,17 @@ version = "0.10.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+ 
++[[package]]
++name = "content-build"
++version = "0.1.0"
++dependencies = [
++ "anyhow",
++ "chrono",
++ "pulldown-cmark",
++ "termblog-core",
++ "unicode-width",
++]
++
+ [[package]]
+ name = "core-foundation-sys"
+ version = "0.8.7"
+@@ -810,6 +821,15 @@ dependencies = [
+  "typenum",
+ ]
+ 
++[[package]]
++name = "getopts"
++version = "0.2.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cfe4fbac503b8d1f88e6676011885f34b7174f46e59956bba534ba83abded4df"
++dependencies = [
++ "unicode-width",
++]
++
+ [[package]]
+ name = "getrandom"
+ version = "0.3.4"
+@@ -1525,6 +1545,25 @@ dependencies = [
+  "unicode-ident",
+ ]
+ 
++[[package]]
++name = "pulldown-cmark"
++version = "0.13.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
++dependencies = [
++ "bitflags",
++ "getopts",
++ "memchr",
++ "pulldown-cmark-escape",
++ "unicase",
++]
++
++[[package]]
++name = "pulldown-cmark-escape"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
++
+ [[package]]
+ name = "quote"
+ version = "1.0.47"
+@@ -2453,6 +2492,12 @@ version = "1.0.24"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+ 
++[[package]]
++name = "unicode-width"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
++
+ [[package]]
+ name = "universal-hash"
+ version = "0.6.1"
+diff --git a/Cargo.toml b/Cargo.toml
+index 3651a25..ee52317 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [workspace]
+ resolver = "2"
+-members = ["crates/proto", "crates/core", "crates/web", "crates/ssh", "crates/jaild"]
++members = ["crates/proto", "crates/core", "crates/web", "crates/ssh", "crates/jaild", "crates/content-build"]
+ 
+ [workspace.dependencies]
+ anyhow = "1"
+diff --git a/Makefile b/Makefile
+index c93a957..0304f36 100644
+--- a/Makefile
++++ b/Makefile
+@@ -18,6 +18,7 @@
+ BIN_WEB := target/release/termblog-web
+ BIN_SSH := target/release/termblog-ssh
+ BIN_JAILD := target/release/termblog-jaild
++BIN_CONTENT := target/release/content-build
+ PID_WEB := .termblog-web.pid
+ PID_SSH := .termblog-ssh.pid
+ LOG_WEB := termblog-web.log
+@@ -28,7 +29,7 @@ URL_SSH := ssh://0.0.0.0:2222
+ PREFIX ?= /usr/local
+ ETCDIR ?= $(PREFIX)/etc
+ 
+-.PHONY: all build build-frontend install \
++.PHONY: all build build-frontend build-content install \
+         run run-ssh \
+         start start-ssh stop stop-ssh restart restart-ssh \
+         status status-ssh logs logs-ssh clean
+@@ -42,9 +43,16 @@ frontend/node_modules: frontend/package.json
+ build-frontend: frontend/node_modules
+ 	cd frontend && npm run build
+ 
+-# ── 构建: 一次产出 web + ssh + jaild 三个二进制 ──
++# ── 内容编译器: md → HTML 镜像(进 dist) + ANSI 预渲染(进 jailtpl/content/.rendered) ──
++# 注意顺序: 必须在 vite build 之后跑(产物写入 dist 且需读 assets/index-*.js)
++build-content:
++	cargo build --release -p content-build
++	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
++
++# ── 构建: 一次产出 web + ssh + jaild 三个二进制 + 前端 + 内容镜像 ──
+ build: build-frontend
+ 	cargo build --release
++	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
+ 
+ # ── 部署(需要 root): 二进制 -> sbin, 前端 -> share, rc 脚本 -> etc/rc.d ──
+ install: build
+@@ -133,3 +141,4 @@ clean:
+ 	cargo clean
+ 	rm -f $(PID_WEB) $(PID_SSH) $(LOG_WEB) $(LOG_SSH)
+ 	rm -rf frontend/dist
++	rm -rf jailtpl/content/.rendered
+diff --git a/crates/content-build/Cargo.toml b/crates/content-build/Cargo.toml
+new file mode 100644
+index 0000000..153ee25
+--- /dev/null
++++ b/crates/content-build/Cargo.toml
+@@ -0,0 +1,11 @@
++[package]
++name = "content-build"
++version = "0.1.0"
++edition = "2021"
++
++[dependencies]
++anyhow.workspace = true
++chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
++pulldown-cmark = "0.13"
++termblog-core = { path = "../core" }
++unicode-width = "0.2"
+diff --git a/crates/content-build/src/ansi.rs b/crates/content-build/src/ansi.rs
+new file mode 100644
+index 0000000..062d87e
+--- /dev/null
++++ b/crates/content-build/src/ansi.rs
+@@ -0,0 +1,617 @@
++//! ANSI 预渲染: 同一事件流的终端投影。目标宽度 76 显示列(unicode-width
++//! 计宽, CJK=2), 输出 UTF-8 文本 + SGR 颜色序列, `less -R` 直接读。
++//!
++//! 折行: 贪心填充, 断行机会 = 空格之后, 或相邻两字符中任一是宽字符
++//! (width==2) 之间; 单个不可断原子超宽时硬切。样式跨行: 断行处行尾发
++//! `\x1b[0m`, 新行行首重发活动样式, 保证 less 分屏重绘不串色。
++
++use pulldown_cmark::{Event, Tag, TagEnd};
++use unicode_width::UnicodeWidthChar;
++
++/// 目标显示列宽。
++const WIDTH: usize = 76;
++
++// SGR 样式位(开启 1/3/2/36, 关闭 22/23/22/39)
++const BOLD: u8 = 1;
++const ITALIC: u8 = 2;
++const DIM: u8 = 4;
++const CYAN: u8 = 8;
++
++#[derive(Clone)]
++struct Seg {
++    s: u8,
++    t: String,
++}
++
++fn push_seg(segs: &mut Vec<Seg>, s: u8, t: impl Into<String>) {
++    let t = t.into();
++    if t.is_empty() {
++        return;
++    }
++    if let Some(last) = segs.last_mut() {
++        if last.s == s {
++            last.t.push_str(&t);
++            return;
++        }
++    }
++    segs.push(Seg { s, t });
++}
++
++enum Block {
++    Paragraph(Vec<Seg>),
++    Heading(Vec<Seg>),
++    Rule,
++    Code(Vec<String>),
++    Quote(Vec<Block>),
++    List { ordered: bool, start: u64, items: Vec<Vec<Block>> },
++    Table { head: Vec<String>, rows: Vec<Vec<String>> },
++}
++
++/// 渲染入口: 事件流 → 完整 ANSI 文本(行尾 \n, 文件尾保证一个 \n)。
++pub fn render_ansi(events: &[Event<'static>]) -> String {
++    let (blocks, _) = parse_blocks(events);
++    let mut lines: Vec<String> = vec![];
++    let ind = Indent { first: String::new(), cont: String::new(), width: WIDTH };
++    render_blocks(&blocks, &mut lines, 0, 0, &ind);
++    // 去掉块间渲染出的多余尾部空行, 文件尾保证一个 \n
++    while lines.last().is_some_and(|l| l.is_empty()) {
++        lines.pop();
++    }
++    let mut out = lines.join("\n");
++    out.push('\n');
++    out
++}
++
++// ── 解析: 事件流 → 块树 ──
++
++fn parse_blocks(events: &[Event<'static>]) -> (Vec<Block>, usize) {
++    let mut blocks = vec![];
++    let mut i = 0;
++    while i < events.len() {
++        match &events[i] {
++            Event::Start(Tag::Paragraph) => {
++                let mut segs = vec![];
++                i += 1;
++                parse_inline(events, &mut i, 0, &mut segs);
++                i += 1; // End(Paragraph)
++                blocks.push(Block::Paragraph(segs));
++            }
++            Event::Start(Tag::Heading { .. }) => {
++                let mut segs = vec![];
++                i += 1;
++                parse_inline(events, &mut i, BOLD, &mut segs);
++                i += 1; // End(Heading)
++                blocks.push(Block::Heading(segs));
++            }
++            Event::Start(Tag::CodeBlock(_)) => {
++                i += 1;
++                let mut text = String::new();
++                while i < events.len() {
++                    match &events[i] {
++                        Event::Text(t) => {
++                            text.push_str(t);
++                            i += 1;
++                        }
++                        Event::End(TagEnd::CodeBlock) => {
++                            i += 1;
++                            break;
++                        }
++                        _ => i += 1,
++                    }
++                }
++                let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
++                while lines.last().is_some_and(|l| l.is_empty()) {
++                    lines.pop();
++                }
++                blocks.push(Block::Code(lines));
++            }
++            Event::Start(Tag::BlockQuote(_)) => {
++                let (inner, consumed) = parse_blocks(&events[i + 1..]);
++                i += consumed + 2; // +1 切片偏移, +1 消费 End(BlockQuote)
++                blocks.push(Block::Quote(inner));
++            }
++            Event::Start(Tag::List(start)) => {
++                let ordered = start.is_some();
++                let start_num = start.unwrap_or(1);
++                i += 1;
++                let mut items = vec![];
++                while i < events.len() {
++                    match &events[i] {
++                        Event::Start(Tag::Item) => {
++                            let (inner, consumed) = parse_blocks(&events[i + 1..]);
++                            i += consumed + 2; // +1 切片偏移, +1 消费 End(Item)
++                            items.push(inner);
++                        }
++                        Event::End(TagEnd::List(_)) => {
++                            i += 1;
++                            break;
++                        }
++                        _ => i += 1,
++                    }
++                }
++                blocks.push(Block::List { ordered, start: start_num, items });
++            }
++            Event::Start(Tag::Table(_)) => {
++                i += 1;
++                // 事件结构: Table > TableHead > TableCell*(无 TableRow 包裹) >
++                // TableRow > TableCell* > …; 表头行在 TableHead 内
++                let mut head: Vec<String> = vec![];
++                let mut rows: Vec<Vec<String>> = vec![];
++                let mut current: Vec<String> = vec![];
++                while i < events.len() {
++                    match &events[i] {
++                        Event::Start(Tag::TableCell) => {
++                            i += 1;
++                            let mut segs = vec![];
++                            parse_inline(events, &mut i, 0, &mut segs);
++                            i += 1; // End(TableCell)
++                            current.push(segs.iter().map(|s| s.t.as_str()).collect());
++                        }
++                        Event::End(TagEnd::TableHead) => {
++                            head = std::mem::take(&mut current);
++                            i += 1;
++                        }
++                        Event::End(TagEnd::TableRow) => {
++                            rows.push(std::mem::take(&mut current));
++                            i += 1;
++                        }
++                        Event::End(TagEnd::Table) => {
++                            i += 1;
++                            break;
++                        }
++                        _ => i += 1,
++                    }
++                }
++                blocks.push(Block::Table { head, rows });
++            }
++            Event::End(_) => break,
++            Event::Rule => {
++                blocks.push(Block::Rule);
++                i += 1;
++            }
++            // 块级 HTML: 站点约定纯 markdown, 跳过
++            Event::Html(_) => i += 1,
++            // 紧凑列表项没有 Paragraph 包装(裸 inline 事件): 按隐式段落处理
++            Event::Text(_)
++            | Event::Code(_)
++            | Event::SoftBreak
++            | Event::HardBreak
++            | Event::InlineHtml(_)
++            | Event::FootnoteReference(_)
++            | Event::TaskListMarker(_)
++            | Event::Start(
++                Tag::Emphasis
++                | Tag::Strong
++                | Tag::Strikethrough
++                | Tag::Link { .. }
++                | Tag::Image { .. },
++            ) => {
++                let mut segs = vec![];
++                parse_inline(events, &mut i, 0, &mut segs);
++                blocks.push(Block::Paragraph(segs));
++            }
++            _ => i += 1,
++        }
++    }
++    (blocks, i)
++}
++
++/// inline 解析: 消费 events[*i] 起的内容, 遇到任意 End 事件即返回(不消费)。
++/// 由调用方(段落/标题/单元格)消费该 End。
++fn parse_inline(events: &[Event<'static>], i: &mut usize, style: u8, segs: &mut Vec<Seg>) {
++    loop {
++        match &events[*i] {
++            Event::End(_) => return,
++            Event::Start(Tag::Strong) => {
++                *i += 1;
++                parse_inline(events, i, style | BOLD, segs);
++                *i += 1; // 消费 End(Strong), 继续外层 inline
++            }
++            Event::Start(Tag::Emphasis) => {
++                *i += 1;
++                parse_inline(events, i, style | ITALIC, segs);
++                *i += 1; // 消费 End(Emphasis)
++            }
++            Event::Start(Tag::Strikethrough) => {
++                *i += 1;
++                parse_inline(events, i, style | DIM, segs);
++                *i += 1; // 消费 End(Strikethrough)
++            }
++            Event::Start(Tag::Link { dest_url, .. }) => {
++                let url = dest_url.to_string();
++                *i += 1;
++                let mut inner: Vec<Seg> = vec![];
++                parse_inline(events, i, style, &mut inner);
++                *i += 1; // 消费 End(Link)
++                let text: String = inner.iter().map(|s| s.t.as_str()).collect();
++                if text.is_empty() || text == url {
++                    push_seg(segs, style | CYAN, url);
++                } else {
++                    for s in inner {
++                        push_seg(segs, s.s, s.t);
++                    }
++                    push_seg(segs, style | CYAN, format!("({url})"));
++                }
++            }
++            Event::Start(Tag::Image { dest_url, .. }) => {
++                let url = dest_url.to_string();
++                *i += 1;
++                let mut alt_segs: Vec<Seg> = vec![];
++                parse_inline(events, i, style, &mut alt_segs);
++                *i += 1; // 消费 End(Image)
++                let alt: String = alt_segs.iter().map(|s| s.t.as_str()).collect();
++                push_seg(segs, style | DIM, format!("image: {alt} {url}"));
++            }
++            Event::Text(t) => {
++                push_seg(segs, style, t.as_ref());
++                *i += 1;
++            }
++            Event::Code(c) => {
++                push_seg(segs, style | CYAN, c.as_ref());
++                *i += 1;
++            }
++            Event::SoftBreak => {
++                push_seg(segs, style, " ");
++                *i += 1;
++            }
++            Event::HardBreak => {
++                push_seg(segs, style, "\n");
++                *i += 1;
++            }
++            // 内联/块级 HTML 等: 站点约定纯 markdown, 跳过
++            Event::InlineHtml(_)
++            | Event::Html(_)
++            | Event::FootnoteReference(_)
++            | Event::TaskListMarker(_) => *i += 1,
++            _ => *i += 1,
++        }
++    }
++}
++
++// ── 渲染: 块树 → 输出行 ──
++
++struct Indent {
++    /// 首行前缀(已含样式)
++    first: String,
++    /// 续行前缀(已含样式)
++    cont: String,
++    /// 内容可用显示列宽
++    width: usize,
++}
++
++/// 引用前缀: 每级 `> `(dim)。
++fn qprefix(q: usize) -> String {
++    "\x1b[2m> \x1b[22m".repeat(q)
++}
++
++fn render_blocks(blocks: &[Block], lines: &mut Vec<String>, q: usize, level: usize, ind: &Indent) {
++    for b in blocks {
++        render_block(b, lines, q, level, ind);
++        // 块间空一行(Quote 由内部块自带空行, 不再加)
++        if !matches!(b, Block::Quote(_)) {
++            lines.push(String::new());
++        }
++    }
++}
++
++fn render_block(b: &Block, lines: &mut Vec<String>, q: usize, level: usize, ind: &Indent) {
++    match b {
++        Block::Paragraph(segs) | Block::Heading(segs) => {
++            let wrapped = wrap_segments(segs, ind.width);
++            for (i, l) in wrapped.iter().enumerate() {
++                let pre = if i == 0 { &ind.first } else { &ind.cont };
++                lines.push(format!("{pre}{}", render_line(l)));
++            }
++        }
++        Block::Rule => {
++            lines.push(format!("{}\x1b[2m{}\x1b[22m", ind.first, "-".repeat(WIDTH)));
++        }
++        Block::Code(code_lines) => {
++            for (i, l) in code_lines.iter().enumerate() {
++                let pre = if i == 0 { &ind.first } else { &ind.cont };
++                lines.push(format!("{pre}    {l}"));
++            }
++        }
++        Block::Quote(inner) => {
++            let child = Indent {
++                first: format!("{}{}", ind.first, qprefix(1)),
++                cont: format!("{}{}", ind.cont, qprefix(1)),
++                width: ind.width.saturating_sub(2),
++            };
++            render_blocks(inner, lines, q + 1, level, &child);
++        }
++        Block::List { ordered, start, items } => {
++            let lead = "  ".repeat(level);
++            let qp = qprefix(q);
++            for (idx, item) in items.iter().enumerate() {
++                let item_first = if *ordered {
++                    format!("{qp}{lead}{:>3}. ", start + idx as u64)
++                } else {
++                    format!("{qp}{lead}  • ")
++                };
++                let item_cont = format!("{qp}{lead}    ");
++                let item_width = WIDTH.saturating_sub(2 * q + 2 * level + 4);
++                for (bi, blk) in item.iter().enumerate() {
++                    let child = if bi == 0 {
++                        Indent {
++                            first: item_first.clone(),
++                            cont: item_cont.clone(),
++                            width: item_width,
++                        }
++                    } else {
++                        Indent {
++                            first: item_cont.clone(),
++                            cont: item_cont.clone(),
++                            width: item_width,
++                        }
++                    };
++                    render_block(blk, lines, q, level + 1, &child);
++                }
++            }
++        }
++        Block::Table { head, rows } => {
++            lines.push(format!("{}{}", ind.first, head.join(" | ")));
++            lines.push(format!("{}\x1b[2m{}\x1b[22m", ind.cont, "---- | ----"));
++            for r in rows {
++                lines.push(format!("{}{}", ind.cont, r.join(" | ")));
++            }
++        }
++    }
++}
++
++/// 折行: 贪心填充, 逐字符(原子)累加显示宽度, 超宽即断。
++/// 断行机会: 空格之后(空格留在行尾); 或相邻两字符任一是宽字符之间。
++fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
++    let mut raw_lines: Vec<Vec<(u8, char)>> = vec![];
++    let mut cur: Vec<(u8, char)> = vec![];
++    let mut curw = 0usize;
++    let mut break_at: Option<usize> = None;
++
++    for seg in segs {
++        for c in seg.t.chars() {
++            if c == '\n' {
++                // 硬换行: 当前行直接收尾
++                raw_lines.push(std::mem::take(&mut cur));
++                curw = 0;
++                break_at = None;
++                continue;
++            }
++            let w = c.width().unwrap_or(0);
++            if !cur.is_empty() && curw + w > width {
++                // 断行优先级: 紧邻边界可断(相邻两字符任一是宽字符)→ 断在当前原子前;
++                // 否则用之前记录的机会(空格之后等); 都没有 → 硬切。
++                let at_boundary = matches!(
++                    cur.last(),
++                    Some(&(_, prev)) if prev.width().unwrap_or(0) == 2 || w == 2
++                );
++                let bp = if at_boundary { Some(cur.len() - 1) } else { break_at };
++                match bp {
++                    Some(bp) => {
++                        let rest = cur.split_off(bp + 1);
++                        let keep = std::mem::replace(&mut cur, rest);
++                        raw_lines.push(keep);
++                        curw = cur.iter().map(|&(_, ch)| ch.width().unwrap_or(0)).sum();
++                        break_at = recompute_break(&cur);
++                    }
++                    None => {
++                        // 无断行机会: 硬切
++                        raw_lines.push(std::mem::take(&mut cur));
++                        curw = 0;
++                        break_at = None;
++                    }
++                }
++            }
++            if c == ' ' {
++                break_at = Some(cur.len());
++            } else if let Some(&(_, prev)) = cur.last() {
++                if prev.width().unwrap_or(0) == 2 || w == 2 {
++                    break_at = Some(cur.len() - 1);
++                }
++            }
++            cur.push((seg.s, c));
++            curw += w;
++        }
++    }
++    if !cur.is_empty() {
++        raw_lines.push(cur);
++    }
++
++    // 相邻同样式原子并回 Seg
++    let mut out = vec![];
++    for l in raw_lines {
++        let mut line = vec![];
++        for (s, c) in l {
++            push_seg(&mut line, s, c.to_string());
++        }
++        out.push(line);
++    }
++    out
++}
++
++/// 重算一行内最后一个断行机会(断行后余下的原子之间可能仍有空格/宽字符)。
++fn recompute_break(cur: &[(u8, char)]) -> Option<usize> {
++    let mut bp = None;
++    for (idx, &(_, c)) in cur.iter().enumerate() {
++        if c == ' ' {
++            bp = Some(idx);
++        } else if idx + 1 < cur.len() {
++            let next = cur[idx + 1].1;
++            if c.width().unwrap_or(0) == 2 || next.width().unwrap_or(0) == 2 {
++                bp = Some(idx);
++            }
++        }
++    }
++    bp
++}
++
++/// 一行内样式转换成 SGR: 开启/关闭一律成对(1/3/2/36 → 22/23/22/39)。
++/// 行尾若有活动样式发 \x1b[0m(断行后新行行首会按段重发)。
++fn render_line(segs: &[Seg]) -> String {
++    let mut out = String::new();
++    let mut active: u8 = 0;
++    for seg in segs {
++        let off = active & !seg.s;
++        let on = seg.s & !active;
++        if off & ITALIC != 0 {
++            out.push_str("\x1b[23m");
++        }
++        if off & CYAN != 0 {
++            out.push_str("\x1b[39m");
++        }
++        if off & (BOLD | DIM) != 0 {
++            // 22 同时关粗体与 dim: 关掉一个但另一个仍要时重发
++            out.push_str("\x1b[22m");
++            if seg.s & BOLD != 0 {
++                out.push_str("\x1b[1m");
++            }
++            if seg.s & DIM != 0 {
++                out.push_str("\x1b[2m");
++            }
++        } else {
++            if on & BOLD != 0 {
++                out.push_str("\x1b[1m");
++            }
++            if on & DIM != 0 {
++                out.push_str("\x1b[2m");
++            }
++        }
++        if on & ITALIC != 0 {
++            out.push_str("\x1b[3m");
++        }
++        if on & CYAN != 0 {
++            out.push_str("\x1b[36m");
++        }
++        out.push_str(&seg.t);
++        active = seg.s;
++    }
++    if active != 0 {
++        out.push_str("\x1b[0m");
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pulldown_cmark::{Options, Parser};
++
++    fn render(md: &str) -> String {
++        let parser = Parser::new_ext(md, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH);
++        let events: Vec<Event<'static>> = parser.map(|e| e.into_static()).collect();
++        render_ansi(&events)
++    }
++
++    /// 去掉 SGR 序列后的可见文本(按 \n 分行)。
++    fn plain(out: &str) -> Vec<String> {
++        out.lines().map(strip_sgr).collect()
++    }
++
++    fn strip_sgr(out: &str) -> String {
++        let mut s = out.to_string();
++        while let Some(i) = s.find('\x1b') {
++            let mut j = i + 1;
++            while j < s.len() && !s.as_bytes()[j].is_ascii_alphabetic() {
++                j += 1;
++            }
++            s.replace_range(i..=j, "");
++        }
++        s
++    }
++
++    #[test]
++    fn wrap_pure_ascii_hard_cut() {
++        // 100 个无空格 ASCII: 无断行机会 → 76 硬切 + 24
++        let out = render(&format!("{}\n", "a".repeat(100)));
++        let lines = plain(&out);
++        assert_eq!(lines[0].len(), 76);
++        assert_eq!(lines[1], "a".repeat(24));
++    }
++
++    #[test]
++    fn wrap_cjk_width_two() {
++        // CJK 按 2 列计宽: 50 个 → 38 + 12
++        let out = render(&format!("{}\n", "中".repeat(50)));
++        let lines = plain(&out);
++        assert_eq!(lines[0], "中".repeat(38));
++        assert_eq!(lines[1], "中".repeat(12));
++    }
++
++    #[test]
++    fn wrap_at_space() {
++        // 8 个 10 字符词: 空格后的断行机会让第 7 个词的第 6 字符超 76 时
++        // 断在最后一个空格之后(空格留在行尾): 行 1 = 前 6 词 + 行尾空格
++        let words: Vec<String> = (1..=8).map(|i| format!("w{i:09}")).collect();
++        let out = render(&format!("{}\n", words.join(" ")));
++        let lines = plain(&out);
++        assert_eq!(lines[0], format!("{} ", words[..6].join(" ")));
++        assert_eq!(lines[1], "w000000007 w000000008");
++    }
++
++    #[test]
++    fn style_reemission_across_break() {
++        // 100 个加粗字符: 断行处行尾 \x1b[0m, 新行行首重发 \x1b[1m
++        let out = render(&format!("**{}**\n", "b".repeat(100)));
++        let lines: Vec<&str> = out.lines().collect();
++        assert!(lines[0].ends_with("\x1b[0m"), "行尾应复位样式: {:?}", lines[0]);
++        assert!(lines[1].starts_with("\x1b[1m"), "新行行首应重发粗体: {:?}", lines[1]);
++        assert_eq!(strip_sgr(lines[0]).len(), 76);
++        assert_eq!(strip_sgr(lines[1]).len(), 24);
++    }
++
++    #[test]
++    fn code_block_not_wrapped() {
++        let long = "c".repeat(100);
++        let out = render(&format!("```\n{long}\n```\n"));
++        assert!(out.contains(&format!("    {long}")), "代码块应 4 空格缩进且不折行: {out:?}");
++    }
++
++    #[test]
++    fn list_indent() {
++        let out = render("- a\n- b\n");
++        let lines = plain(&out);
++        assert_eq!(lines[0], "  • a");
++        assert_eq!(lines[1], "  • b");
++        // 有序列表
++        let out = render("1. 一\n2. 二\n");
++        let lines = plain(&out);
++        assert_eq!(lines[0], "  1. 一");
++        assert_eq!(lines[1], "  2. 二");
++    }
++
++    #[test]
++    fn heading_bold_and_rule_dim() {
++        let out = render("# 标题\n\n---\n");
++        assert!(out.contains("\x1b[1m标题\x1b[0m"), "标题应加粗(行尾整体复位): {out:?}");
++        assert!(out.contains("\x1b[2m----"), "分隔线应 dim: {out:?}");
++    }
++
++    #[test]
++    fn inline_styles_and_link() {
++        let out = render("这是 `code` **粗** *斜* ~~删~~ [文字](https://x.example) 结束\n");
++        assert!(out.contains("\x1b[36mcode\x1b[39m"));
++        assert!(out.contains("\x1b[1m粗\x1b[22m"));
++        assert!(out.contains("\x1b[3m斜\x1b[23m"));
++        // 行内样式关闭成对: 链接后还有文本, cyan 以 \x1b[39m 收
++        assert!(out.contains("文字\x1b[36m(https://x.example)\x1b[39m"));
++        // 链接文字与 url 相同 → 只输出 url
++        let out = render("[https://x.example](https://x.example)\n");
++        assert!(!out.contains("(https://x.example)"));
++    }
++
++    #[test]
++    fn blockquote_prefix() {
++        let out = render("> 引用一行\n");
++        let lines = plain(&out);
++        assert_eq!(lines[0], "> 引用一行");
++        assert!(out.contains("\x1b[2m> \x1b[22m"));
++    }
++
++    #[test]
++    fn table_basic() {
++        let out = render("| a | b |\n|---|---|\n| 1 | 2 |\n");
++        let lines = plain(&out);
++        assert_eq!(lines[0], "a | b");
++        assert!(lines[1].starts_with("---- | ----"));
++        assert_eq!(lines[2], "1 | 2");
++    }
++}
+diff --git a/crates/content-build/src/feed.rs b/crates/content-build/src/feed.rs
+new file mode 100644
+index 0000000..d8c7b97
+--- /dev/null
++++ b/crates/content-build/src/feed.rs
+@@ -0,0 +1,166 @@
++//! sitemap.xml / atom.xml / robots.txt。URL 一律尾斜杠(canonical 形态)。
++
++use crate::Article;
++
++/// XML 转义: `& < > " '` → 实体。所有进 XML 文本/属性的值先过这里,
++/// 保证 `xmllint --noout` 通过。
++pub fn xml_escape(s: &str) -> String {
++    let mut out = String::with_capacity(s.len());
++    for c in s.chars() {
++        match c {
++            '&' => out.push_str("&amp;"),
++            '<' => out.push_str("&lt;"),
++            '>' => out.push_str("&gt;"),
++            '"' => out.push_str("&quot;"),
++            '\'' => out.push_str("&apos;"),
++            _ => out.push(c),
++        }
++    }
++    out
++}
++
++/// 剔除 XML 1.0 非法的控制字符(摘要等自由文本里可能出现)。
++fn strip_control(s: &str) -> String {
++    s.chars().filter(|c| !c.is_control()).collect()
++}
++
++/// sitemap.xml: 首页 + 列表页(无 lastmod)+ 每篇文章(带 lastmod)。
++pub fn sitemap(site_url: &str, arts: &[Article]) -> String {
++    let mut out = String::from(
++        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
++    );
++    out.push_str(&format!("  <url><loc>{}/</loc></url>\n", xml_escape(site_url)));
++    out.push_str(&format!("  <url><loc>{}/blog/</loc></url>\n", xml_escape(site_url)));
++    for a in arts {
++        out.push_str(&format!(
++            "  <url><loc>{}/blog/{}/</loc><lastmod>{}</lastmod></url>\n",
++            xml_escape(site_url),
++            xml_escape(&a.slug),
++            a.date10
++        ));
++    }
++    out.push_str("</urlset>\n");
++    out
++}
++
++/// atom.xml: feed 元数据 + 每篇一个 entry(content = 转义后的完整 HTML)。
++pub fn atom(site_url: &str, site_title: &str, arts: &[Article], feed_updated: &str) -> String {
++    let mut out = String::from(
++        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\">\n",
++    );
++    out.push_str(&format!("  <title>{}</title>\n", xml_escape(site_title)));
++    out.push_str(&format!("  <id>{}/</id>\n", xml_escape(site_url)));
++    out.push_str(&format!("  <updated>{}</updated>\n", xml_escape(feed_updated)));
++    out.push_str(&format!("  <link href=\"{}/\" />\n", xml_escape(site_url)));
++    out.push_str(&format!(
++        "  <link href=\"{}/atom.xml\" rel=\"self\" />\n",
++        xml_escape(site_url)
++    ));
++    out.push_str(&format!("  <author><name>{}</name></author>\n", xml_escape(site_title)));
++    for a in arts {
++        let body = crate::html::body_html(&a.events);
++        out.push_str("  <entry>\n");
++        out.push_str(&format!("    <title>{}</title>\n", xml_escape(&a.title)));
++        out.push_str(&format!(
++            "    <id>{}/blog/{}/</id>\n",
++            xml_escape(site_url),
++            xml_escape(&a.slug)
++        ));
++        out.push_str(&format!(
++            "    <link href=\"{}/blog/{}/\" />\n",
++            xml_escape(site_url),
++            xml_escape(&a.slug)
++        ));
++        out.push_str(&format!("    <updated>{}</updated>\n", xml_escape(&a.date_rfc3339)));
++        out.push_str(&format!(
++            "    <summary>{}</summary>\n",
++            xml_escape(&strip_control(&a.excerpt))
++        ));
++        out.push_str(&format!(
++            "    <content type=\"html\">{}</content>\n",
++            xml_escape(&body)
++        ));
++        out.push_str("  </entry>\n");
++    }
++    out.push_str("</feed>\n");
++    out
++}
++
++/// robots.txt: 总是产出; 有 site_url 时附 Sitemap 行。
++pub fn robots(site_url: Option<&str>) -> String {
++    let mut out = String::from("User-agent: *\nAllow: /\n");
++    if let Some(u) = site_url {
++        out.push_str(&format!("Sitemap: {u}/sitemap.xml\n"));
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pulldown_cmark::{Options, Parser};
++
++    fn article(slug: &str, title: &str, excerpt: &str, md: &str) -> Article {
++        let events = Parser::new_ext(md, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH)
++            .map(|e| e.into_static())
++            .collect();
++        crate::Article {
++            slug: slug.into(),
++            title: title.into(),
++            excerpt: excerpt.into(),
++            date10: "2026-08-29".into(),
++            date_rfc3339: "2026-08-29T10:00:00+08:00".into(),
++            date_warned: false,
++            events,
++        }
++    }
++
++    #[test]
++    fn xml_escape_all() {
++        assert_eq!(
++            xml_escape("&<>\"'"),
++            "&amp;&lt;&gt;&quot;&apos;"
++        );
++        assert_eq!(xml_escape("<a href=\"x\">'y'</a>&"), "&lt;a href=&quot;x&quot;&gt;&apos;y&apos;&lt;/a&gt;&amp;");
++    }
++
++    #[test]
++    fn sitemap_trailing_slash_urls() {
++        let a = article("hello", "你好", "摘", "# 你好\n");
++        let s = sitemap("https://blog.example.com", &[a]);
++        assert!(s.contains("<loc>https://blog.example.com/</loc>"));
++        assert!(s.contains("<loc>https://blog.example.com/blog/</loc>"));
++        assert!(
++            s.contains("<loc>https://blog.example.com/blog/hello/</loc><lastmod>2026-08-29</lastmod>"),
++            "文章 URL 应带尾斜杠: {s}"
++        );
++    }
++
++    #[test]
++    fn atom_content_escaped_html() {
++        let a = article("hello", "你好", "摘", "# 你好\n\n正文 <b>加粗</b>\n");
++        let s = atom("https://blog.example.com", "~yzs", &[a], "2026-08-29T10:00:00+08:00");
++        assert!(s.contains("<entry>"));
++        assert!(s.contains("<id>https://blog.example.com/blog/hello/</id>"));
++        assert!(s.contains(
++            "<content type=\"html\">&lt;p&gt;正文 &amp;lt;b&amp;gt;加粗&amp;lt;/b&amp;gt;&lt;/p&gt;\n</content>"
++        ));
++        assert!(s.contains("<updated>2026-08-29T10:00:00+08:00</updated>"));
++    }
++
++    #[test]
++    fn atom_strips_control_chars_in_summary() {
++        let a = article("hello", "你好", "摘\u{07}要", "# 你好\n");
++        let s = atom("https://blog.example.com", "~yzs", &[a], "2026-08-29T10:00:00+08:00");
++        assert!(s.contains("<summary>摘要</summary>"));
++    }
++
++    #[test]
++    fn robots_with_and_without_site_url() {
++        assert_eq!(
++            robots(Some("https://blog.example.com")),
++            "User-agent: *\nAllow: /\nSitemap: https://blog.example.com/sitemap.xml\n"
++        );
++        assert_eq!(robots(None), "User-agent: *\nAllow: /\n");
++    }
++}
+diff --git a/crates/content-build/src/html.rs b/crates/content-build/src/html.rs
+new file mode 100644
+index 0000000..1d8972b
+--- /dev/null
++++ b/crates/content-build/src/html.rs
+@@ -0,0 +1,420 @@
++//! HTML 投影: 镜像页 / 列表页 / 首页注入。
++
++use pulldown_cmark::{Event, HeadingLevel, Tag};
++
++use crate::Article;
++
++/// HTML 属性转义(& < > ")。所有进模板占位符的值先过这里,
++/// 正文 HTML 则由 pulldown-cmark 的 push_html 保证转义。
++pub fn attr_escape(s: &str) -> String {
++    let mut out = String::with_capacity(s.len());
++    for c in s.chars() {
++        match c {
++            '&' => out.push_str("&amp;"),
++            '<' => out.push_str("&lt;"),
++            '>' => out.push_str("&gt;"),
++            '"' => out.push_str("&quot;"),
++            _ => out.push(c),
++        }
++    }
++    out
++}
++
++/// 正文 HTML: 若事件流的第一个块级元素是 H1(即元数据标题的来源),
++/// 从投影中剥掉这个 H1 块(模板自己渲染 <h1>), 其余事件喂 push_html。
++/// push_html 对 Text 转义, 但对 InlineHtml/Html 事件是原样透传 ——
++/// 所以先自己转义一遍(安全红线: HTML 输出全转义)。
++pub fn body_html(events: &[Event<'static>]) -> String {
++    let mut out = String::new();
++    let mut iter = events.iter().cloned().map(escape_raw_html);
++    if matches!(
++        events.first(),
++        Some(Event::Start(Tag::Heading { level: HeadingLevel::H1, .. }))
++    ) {
++        // 剥掉首块 H1: 从 Start(H1) 到与之配对的 End(H1) 整块丢弃
++        let mut depth = 0usize;
++        for ev in iter.by_ref() {
++            match &ev {
++                Event::Start(_) => depth += 1,
++                Event::End(_) => {
++                    depth -= 1;
++                    if depth == 0 {
++                        break;
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++    pulldown_cmark::html::push_html(&mut out, iter);
++    out
++}
++
++/// 把内联/块级原始 HTML 事件内容预转义(push_html 对它们原样透传)。
++fn escape_raw_html(ev: Event<'static>) -> Event<'static> {
++    match ev {
++        Event::InlineHtml(s) => Event::InlineHtml(attr_escape(&s).into()),
++        Event::Html(s) => Event::Html(attr_escape(&s).into()),
++        other => other,
++    }
++}
++
++/// site_url(https://host[:port], 无尾斜杠)的 host 部分(去 scheme、路径与端口)。
++fn host_of(site_url: &str) -> &str {
++    let rest = site_url.split("://").nth(1).unwrap_or(site_url);
++    let rest = rest.split('/').next().unwrap_or(rest);
++    match rest.rfind(':') {
++        Some(idx) => &rest[..idx],
++        None => rest,
++    }
++}
++
++/// 模板填充: 先处理 `{{#if NAME}}…{{/if}}` 条件块(关闭时整块删除),
++/// 再替换 `{{KEY}}` 占位符。占位符值不再二次扫描(正文里的字面 `{{` 安全)。
++fn fill(tpl: &str, conds: &[(&str, bool)], vars: &[(&str, String)]) -> String {
++    let mut s = tpl.to_string();
++    for (name, on) in conds {
++        let open = format!("{{{{#if {name}}}}}");
++        loop {
++            let Some(start) = s.find(&open) else { break };
++            let Some(rel_end) = s[start..].find("{{/if}}") else { break };
++            let end = start + rel_end;
++            if *on {
++                let inner = s[start + open.len()..end].to_string();
++                s.replace_range(start..end + "{{/if}}".len(), &inner);
++            } else {
++                s.replace_range(start..end + "{{/if}}".len(), "");
++            }
++        }
++    }
++    for (k, v) in vars {
++        s = s.replace(&format!("{{{{{k}}}}}"), v);
++    }
++    s
++}
++
++/// 镜像页模板(§8.4 定案基础上按人类需求调整: JS 用户先看等待层而非静态正文)。
++/// 占位符 {{…}}, {{#if site_url}}/{{#if ssh_hint}} 条件块。
++///
++/// 布局: 静态全文(爬虫 / 无 JS 访客直接可读)→ `#mirror-cover` 不透明等待层
++/// 盖在正文之上(JS 用户首屏只看到"正在接入真实终端…", 正文不闪现)→ 终端就绪
++/// 后等待层淡出、正文层隐藏、终端接管; 终端失败时等待层撤掉露出正文(降级可读)。
++/// 所有 UA 拿到同一份 HTML(无 cloaking); 正文始终留在 DOM 里。
++const MIRROR_TEMPLATE: &str = r#"<!doctype html>
++<html lang="zh-CN">
++
++<head>
++  <meta charset="UTF-8" />
++  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++  <title>{{TITLE}} — {{SITE_TITLE}}</title>
++  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
++  <link rel="stylesheet" href="/style.css" />
++  <!-- 打包样式(xterm.css 等, vite 产物, 带 hash): 缺了它镜像页的终端 DOM 会
++       裸奔 —— 裸露可拉大的 textarea 与无样式文本层 -->
++  <link rel="stylesheet" href="/assets/{{ENTRY_CSS}}" />
++  <link rel="stylesheet" href="{{BLOG_CSS}}" />
++  <!-- 无 JS: 不显示等待层, 静态正文即全部视图 -->
++  <noscript><style>#mirror-cover{display:none}</style></noscript>
++  {{#if site_url}}<link rel="canonical" href="{{SITE_URL}}/blog/{{SLUG}}/" />{{/if}}
++  <meta name="description" content="{{EXCERPT}}" />
++  <meta name="termblog-slug" content="{{SLUG}}" />
++  <meta property="og:title" content="{{TITLE}}" />
++  {{#if site_url}}<meta property="og:url" content="{{SITE_URL}}/blog/{{SLUG}}/" />{{/if}}
++  <meta property="og:type" content="article" />
++  <meta property="og:description" content="{{EXCERPT}}" />
++  <meta property="og:site_name" content="{{SITE_TITLE}}" />
++  {{#if site_url}}<link rel="alternate" type="application/atom+xml" title="{{SITE_TITLE}}" href="/atom.xml" />{{/if}}
++</head>
++
++<body>
++  <!-- CRT 滤镜 defs: 与 frontend/index.html 中的完全一致(style.css 对
++       #term-screen 应用 url(#crt-smudge), 缺 defs 会导致滤镜引用失效) -->
++  <svg class="defs-only" aria-hidden="true" focusable="false">
++    <defs>
++      <filter id="crt-smudge" color-interpolation-filters="sRGB"
++              x="0" y="0" width="100%" height="100%">
++        <feTurbulence type="fractalNoise" baseFrequency="0.01" numOctaves="1" seed="5" result="noise"></feTurbulence>
++        <feDisplacementMap in="SourceGraphic" in2="noise" scale="4"
++                           xChannelSelector="R" yChannelSelector="G"></feDisplacementMap>
++      </filter>
++    </defs>
++  </svg>
++  <div id="app">
++    <!-- 静态正文层: 爬虫与无 JS 访客的完整视图; JS 用户由 #mirror-cover 盖住,
++         终端就绪后隐藏本层由终端接管(需保持正常布局, 不能 display:none 初始,
++         否则 FitAddon 量不到尺寸) -->
++    <div id="static-view">
++      <article>
++        <h1>{{TITLE}}</h1>
++        {{BODY_HTML}}
++        <footer class="post-meta">
++          {{DATE}}{{#if ssh_hint}} · 终端里也可以读: ssh -p 2222 blog@{{HOST}} 然后敲 blog ~/blog/blog/{{SLUG}}.md{{/if}}
++        </footer>
++      </article>
++    </div>
++    <!-- 等待层: JS 用户首屏只看到它(不透明盖住静态正文, 正文不闪现);
++         收到 blog 命令的 OSC(内容已在画)后淡出, 露出已就绪的终端 -->
++    <div id="mirror-cover">
++      <p class="mirror-status">正在接入真实终端…</p>
++    </div>
++    <!-- 终端层: 与首页同构, 等待层不透明地盖在上面; 需保持正常布局
++         (不能 display:none, 否则 FitAddon 量不到尺寸) -->
++    <div id="term-host">
++      <div id="term-screen"></div>
++    </div>
++  </div>
++  <button id="enter-terminal" type="button" hidden>进入终端 ↵</button>
++  <script type="module" src="/assets/{{ENTRY_JS}}"></script>
++</body>
++
++</html>
++"#;
++
++/// blog.css 引用: 带 entry JS 的 hash 做版本参数, 前端重新构建后
++/// 浏览器不会再用缓存的旧样式(等待层等新样式依赖它)。
++fn blog_css_href(entry_js: &str) -> String {
++    if entry_js.is_empty() {
++        "/blog.css".into()
++    } else {
++        format!("/blog.css?v={entry_js}")
++    }
++}
++
++/// 渲染单篇镜像页。
++pub fn render_mirror_page(
++    a: &Article,
++    entry_js: &str,
++    entry_css: &str,
++    site_url: Option<&str>,
++    site_title: &str,
++) -> String {
++    let body = body_html(&a.events);
++    let host = site_url.map(host_of).unwrap_or("");
++    let ssh_hint = site_url.is_some();
++    fill(
++        MIRROR_TEMPLATE,
++        &[("site_url", site_url.is_some()), ("ssh_hint", ssh_hint)],
++        &[
++            ("TITLE", attr_escape(&a.title)),
++            ("SITE_TITLE", attr_escape(site_title)),
++            ("SITE_URL", attr_escape(site_url.unwrap_or(""))),
++            ("SLUG", attr_escape(&a.slug)),
++            ("EXCERPT", attr_escape(&a.excerpt)),
++            ("DATE", a.date10.clone()),
++            ("HOST", attr_escape(host)),
++            ("ENTRY_JS", attr_escape(entry_js)),
++            ("ENTRY_CSS", attr_escape(entry_css)),
++            ("BLOG_CSS", blog_css_href(entry_js)),
++            ("BODY_HTML", body),
++        ],
++    )
++}
++
++/// 列表页模板(§8.7): 纯静态, 不引导终端(不引 entry JS)。
++const LIST_TEMPLATE: &str = r#"<!doctype html>
++<html lang="zh-CN">
++
++<head>
++  <meta charset="UTF-8" />
++  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++  <title>文章 — {{SITE_TITLE}}</title>
++  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
++  <link rel="stylesheet" href="/style.css" />
++  <link rel="stylesheet" href="{{BLOG_CSS}}" />
++  {{#if site_url}}<link rel="alternate" type="application/atom+xml" title="{{SITE_TITLE}}" href="/atom.xml" />{{/if}}
++</head>
++
++<body>
++  <main id="blog-list">
++    <h1>文章</h1>
++    <ul>
++{{ITEMS}}
++    </ul>
++    <p><a href="/">← 回到终端</a></p>
++  </main>
++</body>
++
++</html>
++"#;
++
++/// 渲染 /blog/ 列表页。
++pub fn render_list_page(
++    arts: &[Article],
++    site_url: Option<&str>,
++    site_title: &str,
++    entry_js: &str,
++) -> String {
++    let mut items = String::new();
++    for a in arts {
++        items.push_str(&format!(
++            "      <li><a href=\"/blog/{}/\">{}</a> <span class=\"date\">{}</span></li>\n",
++            a.slug,
++            attr_escape(&a.title),
++            a.date10
++        ));
++    }
++    fill(
++        LIST_TEMPLATE,
++        &[("site_url", site_url.is_some())],
++        &[
++            ("SITE_TITLE", attr_escape(site_title)),
++            ("ITEMS", items),
++            ("BLOG_CSS", blog_css_href(entry_js)),
++        ],
++    )
++}
++
++/// 首页注入(幂等): 无文章时返回 None(不注入);
++/// 否则给 dist/index.html 补 blog.css 引用(注入 1)与文章列表 footer 块(注入 2)。
++pub fn inject_homepage(index_html: &str, arts: &[Article], entry_js: &str) -> Option<String> {
++    if arts.is_empty() {
++        return None;
++    }
++    const BEGIN: &str = "<!--BEGIN termblog:blog-index-->";
++    const END: &str = "<!--END termblog:blog-index-->";
++
++    let mut items = String::new();
++    for a in arts {
++        items.push_str(&format!(
++            "    <li><span class=\"date\">{}</span><a href=\"/blog/{}/\">{}</a></li>\n",
++            a.date10,
++            a.slug,
++            attr_escape(&a.title)
++        ));
++    }
++    let block = format!(
++        "{BEGIN}\n<footer id=\"blog-index\">\n  <h2>文章</h2>\n  <ul>\n{items}  </ul>\n</footer>\n{END}"
++    );
++
++    let mut s = index_html.to_string();
++    // 幂等: 已存在的旧块整块删除后重插
++    if let (Some(b), Some(e)) = (s.find(BEGIN), s.find(END)) {
++        if e > b {
++            s.replace_range(b..e + END.len(), "");
++        }
++    }
++    // 注入 1: </head> 前补 blog.css(已含引用则跳过)
++    if !s.contains("blog.css") {
++        if let Some(h) = s.rfind("</head>") {
++            s.replace_range(h..h, &format!("<link rel=\"stylesheet\" href=\"{}\" />\n  ", blog_css_href(entry_js)));
++        }
++    }
++    // 注入 2: </body> 前插 footer 块
++    let b = s.rfind("</body>")?;
++    s.replace_range(b..b, &block);
++    Some(s)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pulldown_cmark::{Options, Parser};
++
++    fn parse(md: &str) -> Vec<Event<'static>> {
++        Parser::new_ext(md, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH)
++            .map(|e| e.into_static())
++            .collect()
++    }
++
++    fn article(slug: &str, title: &str, md: &str) -> Article {
++        Article {
++            slug: slug.into(),
++            title: title.into(),
++            excerpt: "摘要".into(),
++            date10: "2026-08-29".into(),
++            date_rfc3339: "2026-08-29T10:00:00+08:00".into(),
++            date_warned: false,
++            events: parse(md),
++        }
++    }
++
++    #[test]
++    fn body_strips_first_h1() {
++        let b = body_html(&parse("# 标题\n\n正文段落\n"));
++        assert!(!b.contains("<h1>"), "首个 H1 应被剥离, 实际: {b}");
++        assert!(b.contains("<p>正文段落</p>"));
++    }
++
++    #[test]
++    fn body_keeps_later_headings() {
++        let b = body_html(&parse("正文\n\n# 后出现的 H1\n\n尾段\n"));
++        assert!(b.contains("<h1>后出现的 H1</h1>"), "非首块的 H1 应保留: {b}");
++    }
++
++    #[test]
++    fn body_escapes_html() {
++        let b = body_html(&parse("小心 <script>alert(1)</script> 注入\n"));
++        assert!(b.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
++        assert!(!b.contains("<script>"));
++    }
++
++    #[test]
++    fn mirror_page_fills_all_placeholders() {
++        let a = article("hello", "你好, 世界", "# 你好, 世界\n\n正文\n");
++        let page = render_mirror_page(&a, "index-abc123.js", "index-abc123.css", Some("https://blog.example.com"), "~yzs");
++        assert!(!page.contains("{{"), "模板残留占位符: {page}");
++        assert!(page.contains("<h1>你好, 世界</h1>"));
++        assert!(page.contains("name=\"termblog-slug\" content=\"hello\""));
++        assert!(page.contains("href=\"https://blog.example.com/blog/hello/\""));
++        assert!(page.contains("src=\"/assets/index-abc123.js\""));
++        assert!(page.contains("href=\"/assets/index-abc123.css\""), "镜像页必须引打包样式(xterm.css): {page}");
++        assert!(page.contains("ssh -p 2222 blog@blog.example.com"));
++        // 等待层 + 无 JS 兜底: 正文留在 DOM, cover 由 noscript 对无 JS 隐藏
++        assert!(page.contains("id=\"mirror-cover\""));
++        assert!(page.contains("正在接入真实终端…"));
++        assert!(page.contains("noscript") && page.contains("#mirror-cover{display:none}"));
++        assert!(page.contains("id=\"static-view\"") && page.contains("<article>"));
++        // 无 site_url: 无 canonical / ssh_hint / og:url
++        let page = render_mirror_page(&a, "index-abc123.js", "index-abc123.css", None, "~yzs");
++        assert!(!page.contains("canonical"));
++        assert!(!page.contains("og:url"));
++        assert!(!page.contains("ssh -p 2222"));
++    }
++
++    #[test]
++    fn mirror_page_escapes_title_attr() {
++        let a = article("hello", "含 \"引号\" & <标签>", "# 含 \"引号\" & <标签>\n\n正文\n");
++        let page = render_mirror_page(&a, "index-abc123.js", "index-abc123.css", None, "~yzs");
++        assert!(page.contains("&quot;引号&quot; &amp; &lt;标签&gt;"));
++    }
++
++    #[test]
++    fn list_page_content() {
++        let a = article("hello", "你好, 世界", "# 你好, 世界\n\n正文\n");
++        let page = render_list_page(std::slice::from_ref(&a), Some("https://blog.example.com"), "~yzs", "index-abc123.js");
++        assert!(page.contains("<title>文章 — ~yzs</title>"));
++        assert!(page.contains("<a href=\"/blog/hello/\">你好, 世界</a>"));
++        assert!(page.contains("atom.xml"));
++        assert!(!page.contains("assets/"), "列表页不引 entry JS");
++        let page = render_list_page(std::slice::from_ref(&a), None, "~yzs", "index-abc123.js");
++        assert!(!page.contains("atom.xml"));
++    }
++
++    #[test]
++    fn homepage_injection_idempotent() {
++        let idx = "<!doctype html>\n<html>\n<head>\n  <title>x</title>\n</head>\n<body>\n  <p>hi</p>\n</body>\n</html>\n";
++        let a = article("hello", "你好, 世界", "# 你好, 世界\n\n正文\n");
++        let once = inject_homepage(idx, std::slice::from_ref(&a), "index-abc123.js").unwrap();
++        assert!(once.contains("<!--BEGIN termblog:blog-index-->"));
++        assert!(once.contains("<!--END termblog:blog-index-->"));
++        assert!(once.contains("href=\"/blog/hello/\""));
++        assert!(once.contains("blog.css"));
++        // 注入两遍结果等于一遍
++        let twice = inject_homepage(&once, std::slice::from_ref(&a), "index-abc123.js").unwrap();
++        assert_eq!(once, twice);
++        assert_eq!(twice.matches("termblog:blog-index").count(), 2, "BEGIN+END 各一次");
++    }
++
++    #[test]
++    fn homepage_injection_skipped_when_empty() {
++        let idx = "<!doctype html>\n<html><head></head><body></body></html>\n";
++        assert!(inject_homepage(idx, &[], "index-abc123.js").is_none());
++    }
++
++    #[test]
++    fn host_extraction() {
++        assert_eq!(host_of("https://blog.example.com"), "blog.example.com");
++        assert_eq!(host_of("https://example.com:8080"), "example.com");
++        assert_eq!(host_of("http://example.com"), "example.com");
++    }
++}
+diff --git a/crates/content-build/src/main.rs b/crates/content-build/src/main.rs
+new file mode 100644
+index 0000000..6c400b7
+--- /dev/null
++++ b/crates/content-build/src/main.rs
+@@ -0,0 +1,323 @@
++//! content-build —— 内容编译器(termblog M5)。
++//!
++//! 唯一内容源 `jailtpl/content/blog/*.md` 的两个投影:
++//!   HTML 镜像(爬虫读的静态全文页, 进 `frontend/dist/blog/`)与
++//!   ANSI 预渲染(终端里 `less -R` 读的排版文本, 进 `jailtpl/content/.rendered/`)。
++//! 同时产出文章列表页、sitemap.xml / atom.xml / robots.txt 与首页文章列表注入。
++//!
++//! 用法(从仓库根):
++//!   content-build [--content jailtpl/content] [--dist frontend/dist]
++//!                 [--config <file>] [--site-url <url>] [--site-title <title>]
++//!
++//! site_url 优先级: --site-url > 配置文件 web.site_url > 无(无则跳过 sitemap/atom)。
++
++mod ansi;
++mod feed;
++mod html;
++mod meta;
++
++use std::path::{Path, PathBuf};
++
++use anyhow::{bail, Context, Result};
++use pulldown_cmark::{Event, Options, Parser};
++
++/// 一篇文章的编译中间态: 元数据 + 解析后的事件流。
++pub struct Article {
++    pub slug: String,
++    pub title: String,
++    pub excerpt: String,
++    /// YYYY-MM-DD(sitemap lastmod / 镜像页 footer / .index)
++    pub date10: String,
++    /// 完整 RFC3339(atom updated / 排序键)
++    pub date_rfc3339: String,
++    /// 日期走了 mtime fallback(构建告警用)
++    pub date_warned: bool,
++    pub events: Vec<Event<'static>>,
++}
++
++#[derive(Debug)]
++struct Cli {
++    content: PathBuf,
++    dist: PathBuf,
++    config: Option<PathBuf>,
++    site_url_arg: Option<String>,
++    site_title: String,
++}
++
++fn next_val(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
++    args.next().ok_or_else(|| anyhow::anyhow!("参数 {name} 需要一个值"))
++}
++
++fn parse_cli() -> Result<Cli> {
++    let mut cli = Cli {
++        content: PathBuf::from("jailtpl/content"),
++        dist: PathBuf::from("frontend/dist"),
++        config: None,
++        site_url_arg: None,
++        site_title: "~yzs".into(),
++    };
++    let mut args = std::env::args().skip(1);
++    while let Some(a) = args.next() {
++        match a.as_str() {
++            "--content" => cli.content = PathBuf::from(next_val(&mut args, "--content")?),
++            "--dist" => cli.dist = PathBuf::from(next_val(&mut args, "--dist")?),
++            "--config" => cli.config = Some(PathBuf::from(next_val(&mut args, "--config")?)),
++            "--site-url" => cli.site_url_arg = Some(next_val(&mut args, "--site-url")?),
++            "--site-title" => cli.site_title = next_val(&mut args, "--site-title")?,
++            other => bail!("未知参数: {other}"),
++        }
++    }
++    Ok(cli)
++}
++
++/// 递归扫描 content/blog/, 收集 *.md 的相对路径(相对 blog 根),
++/// 同时收集 slug 违规与非 md 文件告警。
++fn scan_blog(
++    root: &Path,
++    dir: &Path,
++    out: &mut Vec<PathBuf>,
++    slug_errors: &mut Vec<String>,
++    warns: &mut Vec<String>,
++) -> Result<()> {
++    for entry in std::fs::read_dir(dir).with_context(|| format!("扫描目录 {}", dir.display()))? {
++        let entry = entry.with_context(|| format!("读目录项 {}", dir.display()))?;
++        let path = entry.path();
++        if path.is_dir() {
++            scan_blog(root, &path, out, slug_errors, warns)?;
++        } else {
++            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
++            if path.extension().and_then(|e| e.to_str()) == Some("md") {
++                let slug = rel
++                    .to_string_lossy()
++                    .strip_suffix(".md")
++                    .unwrap_or_default()
++                    .to_string();
++                if let Err(e) = meta::validate_slug(&slug) {
++                    slug_errors.push(format!("{}: {e}", rel.display()));
++                } else {
++                    out.push(rel);
++                }
++            } else {
++                warns.push(format!("忽略非 markdown 文件: {}", rel.display()));
++            }
++        }
++    }
++    Ok(())
++}
++
++fn main() -> Result<()> {
++    let cli = parse_cli()?;
++
++    // site_url: --site-url > 配置文件 web.site_url > 无
++    // 配置文件查找复用 termblog_core::Config::load 的机制:
++    // --config 指定文件 > $TERMBLOG_CONFIG > /usr/local/etc/termblog.toml(不存在则全默认)。
++    let cfg_path = match &cli.config {
++        Some(p) => Some(p.clone()),
++        None => std::env::var("TERMBLOG_CONFIG").ok().map(PathBuf::from),
++    };
++    let cfg = termblog_core::Config::load(cfg_path.as_deref())?;
++    let site_url = cli
++        .site_url_arg
++        .or(cfg.web.site_url)
++        .map(|u| u.trim_end_matches('/').to_string());
++
++    // 扫描 + slug 校验(违规全部列出后统一失败)
++    let blog_dir = cli.content.join("blog");
++    let mut rel_paths: Vec<PathBuf> = vec![];
++    let mut slug_errors: Vec<String> = vec![];
++    let mut warns: Vec<String> = vec![];
++    if blog_dir.is_dir() {
++        scan_blog(&blog_dir, &blog_dir, &mut rel_paths, &mut slug_errors, &mut warns)?;
++        if rel_paths.is_empty() {
++            warns.push(format!("{} 下没有文章", blog_dir.display()));
++        }
++    } else {
++        warns.push(format!("{} 不存在, 没有文章", blog_dir.display()));
++    }
++    if !slug_errors.is_empty() {
++        for e in &slug_errors {
++            eprintln!("slug 违规: {e}");
++        }
++        bail!("slug 校验失败: {} 个文件违规, 请改名后重跑", slug_errors.len());
++    }
++    rel_paths.sort();
++
++    // 逐篇: 读文件(BOM/CRLF 规范化)→ 解析(两投影共用同一套选项)→ 元数据 → 日期
++    let mut arts: Vec<Article> = vec![];
++    for rel in &rel_paths {
++        let path = blog_dir.join(rel);
++        let src = std::fs::read(&path).with_context(|| format!("读文章 {}", path.display()))?;
++        let mut text = String::from_utf8(src)
++            .with_context(|| format!("文章不是 UTF-8: {}", path.display()))?;
++        if let Some(stripped) = text.strip_prefix('\u{feff}') {
++            text = stripped.to_string();
++        }
++        if text.contains('\r') {
++            text = text.replace("\r\n", "\n").replace('\r', "\n");
++        }
++        let parser = Parser::new_ext(&text, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH);
++        let events: Vec<Event<'static>> = parser.map(|e| e.into_static()).collect();
++        let slug = rel
++            .to_string_lossy()
++            .strip_suffix(".md")
++            .unwrap_or_default()
++            .to_string();
++        let stem = slug.rsplit('/').next().unwrap_or(&slug).to_string();
++        let title = meta::extract_title(&events, &stem);
++        let excerpt = meta::extract_excerpt(&events, &title);
++        let (date10, date_rfc3339, date_warned) = meta::article_date(&path);
++        if date_warned {
++            warns.push(format!("「{}」无 git 历史, 日期回退到文件 mtime", rel.display()));
++        }
++        arts.push(Article { slug, title, excerpt, date10, date_rfc3339, date_warned, events });
++    }
++    // 排序: 日期倒序, 同日 slug 字典序升序
++    arts.sort_by(|a, b| {
++        b.date_rfc3339
++            .cmp(&a.date_rfc3339)
++            .then_with(|| a.slug.cmp(&b.slug))
++    });
++
++    // 前端入口产物: 镜像页需要引用带 hash 的文件名(dist/assets/index-*.js /
++    // index-*.css, 各恰 1 个)。CSS 含 xterm.css 等打包样式, 缺失会让镜像页的
++    // 终端 DOM 裸奔(裸 textarea「输入框」+ 无样式文本层「乱码」), 必须同 JS 一样强制。
++    let entry_js = if arts.is_empty() {
++        None
++    } else {
++        let assets = cli.dist.join("assets");
++        let mut found: Vec<String> = vec![];
++        if assets.is_dir() {
++            for e in std::fs::read_dir(&assets)
++                .with_context(|| format!("扫描 {}", assets.display()))?
++            {
++                let name = e?.file_name().to_string_lossy().to_string();
++                if name.starts_with("index-") && name.ends_with(".js") {
++                    found.push(name);
++                }
++            }
++        }
++        match found.len() {
++            1 => Some(found.pop().unwrap()),
++            0 => bail!(
++                "找不到前端入口 JS ({}), 请先 gmake build-frontend(vite build 先于 content-build)",
++                assets.display()
++            ),
++            n => bail!("找到 {n} 个前端入口 JS, 无法确定用哪个: {found:?}"),
++        }
++    };
++    let entry_css = if arts.is_empty() {
++        None
++    } else {
++        let assets = cli.dist.join("assets");
++        let mut found: Vec<String> = vec![];
++        if assets.is_dir() {
++            for e in std::fs::read_dir(&assets)
++                .with_context(|| format!("扫描 {}", assets.display()))?
++            {
++                let name = e?.file_name().to_string_lossy().to_string();
++                if name.starts_with("index-") && name.ends_with(".css") {
++                    found.push(name);
++                }
++            }
++        }
++        match found.len() {
++            1 => Some(found.pop().unwrap()),
++            0 => bail!(
++                "找不到前端入口 CSS ({}), 请先 gmake build-frontend(vite build 先于 content-build)",
++                assets.display()
++            ),
++            n => bail!("找到 {n} 个前端入口 CSS, 无法确定用哪个: {found:?}"),
++        }
++    };
++
++    // 清理旧产物(幂等: 删文后不留僵尸)
++    let dist_blog = cli.dist.join("blog");
++    if dist_blog.exists() {
++        std::fs::remove_dir_all(&dist_blog)
++            .with_context(|| format!("清理 {}", dist_blog.display()))?;
++    }
++    for f in ["sitemap.xml", "atom.xml", "robots.txt"] {
++        let p = cli.dist.join(f);
++        if p.exists() {
++            std::fs::remove_file(&p).with_context(|| format!("清理 {}", p.display()))?;
++        }
++    }
++    let rendered = cli.content.join(".rendered");
++    if rendered.exists() {
++        std::fs::remove_dir_all(&rendered).with_context(|| format!("清理 {}", rendered.display()))?;
++    }
++    std::fs::create_dir_all(&rendered)
++        .with_context(|| format!("创建 {}", rendered.display()))?;
++
++    // 逐篇产出: HTML 镜像页 + ANSI 预渲染
++    for a in &arts {
++        let ansi_out = ansi::render_ansi(&a.events);
++        let rp = rendered.join(&a.slug);
++        if let Some(parent) = rp.parent() {
++            std::fs::create_dir_all(parent)
++                .with_context(|| format!("创建 {}", parent.display()))?;
++        }
++        std::fs::write(&rp, ansi_out).with_context(|| format!("写 {}", rp.display()))?;
++
++        let page = html::render_mirror_page(
++            a,
++            entry_js.as_deref().unwrap_or_default(),
++            entry_css.as_deref().unwrap_or_default(),
++            site_url.as_deref(),
++            &cli.site_title,
++        );
++        let hp = dist_blog.join(&a.slug).join("index.html");
++        if let Some(parent) = hp.parent() {
++            std::fs::create_dir_all(parent)
++                .with_context(|| format!("创建 {}", parent.display()))?;
++        }
++        std::fs::write(&hp, page).with_context(|| format!("写 {}", hp.display()))?;
++    }
++
++    // 列表数据 + 列表页
++    std::fs::write(rendered.join(".index"), meta::build_index(&arts))
++        .with_context(|| format!("写 {}", rendered.join(".index").display()))?;
++    std::fs::create_dir_all(&dist_blog).with_context(|| format!("创建 {}", dist_blog.display()))?;
++    let entry_js_str = entry_js.as_deref().unwrap_or_default();
++    let list = html::render_list_page(&arts, site_url.as_deref(), &cli.site_title, entry_js_str);
++    std::fs::write(dist_blog.join("index.html"), list)
++        .with_context(|| format!("写 {}", dist_blog.join("index.html").display()))?;
++
++    // sitemap / atom(有 site_url 时)与 robots.txt(总是)
++    if let Some(u) = &site_url {
++        std::fs::write(cli.dist.join("sitemap.xml"), feed::sitemap(u, &arts))
++            .with_context(|| format!("写 {}", cli.dist.join("sitemap.xml").display()))?;
++        let feed_updated = arts
++            .first()
++            .map(|a| a.date_rfc3339.clone())
++            .unwrap_or_else(|| chrono::Local::now().to_rfc3339());
++        std::fs::write(cli.dist.join("atom.xml"), feed::atom(u, &cli.site_title, &arts, &feed_updated))
++            .with_context(|| format!("写 {}", cli.dist.join("atom.xml").display()))?;
++    } else {
++        warns.push("未设置 site_url, 跳过 sitemap.xml / atom.xml(镜像页无 canonical/OG:url)".into());
++    }
++    std::fs::write(cli.dist.join("robots.txt"), feed::robots(site_url.as_deref()))
++        .with_context(|| format!("写 {}", cli.dist.join("robots.txt").display()))?;
++
++    // 首页注入(幂等)
++    if arts.is_empty() {
++        warns.push("无文章, 跳过首页文章列表注入".into());
++    } else {
++        let idx_path = cli.dist.join("index.html");
++        let src = std::fs::read_to_string(&idx_path)
++            .with_context(|| format!("读首页 {}", idx_path.display()))?;
++        let new = html::inject_homepage(&src, &arts, entry_js.as_deref().unwrap_or_default())
++            .ok_or_else(|| anyhow::anyhow!("首页 {} 缺少 </body>, 无法注入", idx_path.display()))?;
++        std::fs::write(&idx_path, new).with_context(|| format!("写 {}", idx_path.display()))?;
++    }
++
++    // 摘要
++    println!("content-build: {} 篇文章", arts.len());
++    println!("  镜像页:   {}/blog/<slug>/index.html", cli.dist.display());
++    println!("  列表页:   {}/blog/index.html", cli.dist.display());
++    println!("  ANSI 预渲染: {}/.rendered/", cli.content.display());
++    for w in &warns {
++        println!("警告: {w}");
++    }
++    Ok(())
++}
+diff --git a/crates/content-build/src/meta.rs b/crates/content-build/src/meta.rs
+new file mode 100644
+index 0000000..47807ff
+--- /dev/null
++++ b/crates/content-build/src/meta.rs
+@@ -0,0 +1,278 @@
++//! 元数据提取: slug 校验 / 标题 / 摘要 / 日期 / .index 生成。
++
++use std::path::Path;
++use std::process::Command;
++
++use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
++
++use crate::Article;
++
++/// slug 白名单校验: `^[a-z0-9/-]+$`(小写字母、数字、连字符、路径分隔),
++/// 另加防御性检查(空、`//`、以 `/` 结尾)。违规返回带原因的 Err。
++pub fn validate_slug(slug: &str) -> Result<(), String> {
++    if slug.is_empty() {
++        return Err("slug 为空".into());
++    }
++    if let Some(c) = slug.chars().find(|c| {
++        !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '/')
++    }) {
++        return Err(format!("含非法字符 '{c}' (仅允许 [a-z0-9/-])"));
++    }
++    if slug.contains("//") {
++        return Err("含连续分隔符 //".into());
++    }
++    if slug.ends_with('/') {
++        return Err("以 / 结尾".into());
++    }
++    Ok(())
++}
++
++/// 收集一段 inline 内容(从 events[*i] 起)的纯文本, 直到遇到 `stop` 结束事件。
++/// 嵌套 inline 容器(strong/em/link…)的结束事件跳过, 代码取字面、链接取文字、
++/// 图片取 alt、换行按空格。停在 `stop` 处不消费它。
++fn collect_inline_text(events: &[Event<'static>], i: &mut usize, out: &mut String, stop: TagEnd) {
++    loop {
++        match &events[*i] {
++            Event::End(t) => {
++                if *t == stop {
++                    return;
++                }
++                *i += 1;
++            }
++            Event::Start(Tag::Image { .. }) => {
++                *i += 1;
++                let mut alt = String::new();
++                collect_inline_text(events, i, &mut alt, TagEnd::Image);
++                out.push_str(alt.trim());
++                *i += 1; // End(Image)
++            }
++            Event::Start(_) => *i += 1,
++            Event::Text(t) => {
++                out.push_str(t);
++                *i += 1;
++            }
++            Event::Code(c) => {
++                out.push_str(c);
++                *i += 1;
++            }
++            Event::SoftBreak | Event::HardBreak => {
++                out.push(' ');
++                *i += 1;
++            }
++            Event::Html(_)
++            | Event::InlineHtml(_)
++            | Event::FootnoteReference(_)
++            | Event::TaskListMarker(_) => *i += 1,
++            _ => *i += 1,
++        }
++    }
++}
++
++/// 标题: 文中第一个 H1 的全部 inline 文本(无 H1 用文件名 stem)。
++/// Tab 替换为空格。
++pub fn extract_title(events: &[Event<'static>], fallback: &str) -> String {
++    let mut i = 0;
++    while i < events.len() {
++        if let Event::Start(Tag::Heading { level: HeadingLevel::H1, .. }) = events[i] {
++            i += 1;
++            let mut text = String::new();
++            collect_inline_text(events, &mut i, &mut text, TagEnd::Heading(HeadingLevel::H1));
++            let t = text.replace('\t', " ").trim().to_string();
++            if !t.is_empty() {
++                return t;
++            }
++            break;
++        }
++        i += 1;
++    }
++    fallback.to_string()
++}
++
++/// 摘要: 第一个段落(Paragraph 块)的纯文本, 折叠空白, 超 160 字符截断加 …。
++/// 无(非空)段落时用标题。
++pub fn extract_excerpt(events: &[Event<'static>], fallback: &str) -> String {
++    let mut i = 0;
++    while i < events.len() {
++        if let Event::Start(Tag::Paragraph) = events[i] {
++            i += 1;
++            let mut text = String::new();
++            collect_inline_text(events, &mut i, &mut text, TagEnd::Paragraph);
++            i += 1; // End(Paragraph)
++            let t = collapse_ws(&text);
++            if !t.is_empty() {
++                return truncate_chars(&t, 160);
++            }
++            continue;
++        }
++        i += 1;
++    }
++    fallback.to_string()
++}
++
++/// 折叠空白: 连续空白(含 Tab/换行)压成单个空格, 首尾去空。
++pub fn collapse_ws(s: &str) -> String {
++    s.split_whitespace().collect::<Vec<_>>().join(" ")
++}
++
++/// 按字符数截断, 超长以 … 结尾。
++pub fn truncate_chars(s: &str, n: usize) -> String {
++    if s.chars().count() > n {
++        let mut t: String = s.chars().take(n).collect();
++        t.push('…');
++        t
++    } else {
++        s.to_string()
++    }
++}
++
++/// 文章日期: git 最后提交时间(commit date, ISO8601); 无历史时回退文件 mtime。
++/// 返回 (YYYY-MM-DD, 完整 RFC3339, 是否走了 fallback)。
++pub fn article_date(path: &Path) -> (String, String, bool) {
++    if let Ok(out) = Command::new("git")
++        .args(["log", "-1", "--format=%cI", "--"])
++        .arg(path)
++        .output()
++    {
++        if out.status.success() {
++            let s = String::from_utf8_lossy(&out.stdout);
++            let s = s.trim();
++            if !s.is_empty() {
++                let date10 = s.chars().take(10).collect::<String>();
++                return (date10, s.to_string(), false);
++            }
++        }
++    }
++    let secs = std::fs::metadata(path)
++        .and_then(|m| m.modified())
++        .ok()
++        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
++        .map(|d| d.as_secs())
++        .unwrap_or(0);
++    let dt = chrono::DateTime::from_timestamp(secs as i64, 0)
++        .unwrap_or_default()
++        .with_timezone(&chrono::Local);
++    let rfc = dt.to_rfc3339();
++    let date10 = rfc.chars().take(10).collect::<String>();
++    (date10, rfc, true)
++}
++
++/// .rendered/.index: 一行一篇, TSV = 日期 \t slug \t 标题。
++/// 日期倒序, 同日 slug 字典序升序。
++pub fn build_index(arts: &[Article]) -> String {
++    let mut sorted: Vec<&Article> = arts.iter().collect();
++    sorted.sort_by(|a, b| {
++        b.date_rfc3339
++            .cmp(&a.date_rfc3339)
++            .then_with(|| a.slug.cmp(&b.slug))
++    });
++    let mut out = String::new();
++    for a in sorted {
++        out.push_str(&a.date10);
++        out.push('\t');
++        out.push_str(&a.slug);
++        out.push('\t');
++        out.push_str(&a.title);
++        out.push('\n');
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pulldown_cmark::{Options, Parser};
++
++    fn parse(md: &str) -> Vec<Event<'static>> {
++        Parser::new_ext(md, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH)
++            .map(|e| e.into_static())
++            .collect()
++    }
++
++    fn article(slug: &str, date10: &str, date_rfc3339: &str, title: &str) -> Article {
++        Article {
++            slug: slug.into(),
++            title: title.into(),
++            excerpt: String::new(),
++            date10: date10.into(),
++            date_rfc3339: date_rfc3339.into(),
++            date_warned: false,
++            events: vec![],
++        }
++    }
++
++    #[test]
++    fn slug_validation() {
++        assert!(validate_slug("hello").is_ok());
++        assert!(validate_slug("2026/notes").is_ok());
++        assert!(validate_slug("why-a-terminal-blog").is_ok());
++        assert!(validate_slug("Hello").is_err()); // 大写
++        assert!(validate_slug("my_post").is_err()); // 下划线
++        assert!(validate_slug("你好").is_err()); // 中文
++        assert!(validate_slug("a..b").is_err()); // 点
++        assert!(validate_slug("a b").is_err()); // 空格
++        assert!(validate_slug("").is_err()); // 空
++        assert!(validate_slug("a//b").is_err()); // 连续分隔符
++        assert!(validate_slug("a/").is_err()); // 尾部斜杠
++    }
++
++    #[test]
++    fn title_extraction() {
++        // 有 H1
++        assert_eq!(extract_title(&parse("# 你好, 世界\n\n正文"), "fallback"), "你好, 世界");
++        // 无 H1 → 文件名 stem
++        assert_eq!(extract_title(&parse("只有正文, 没有标题\n"), "my-post"), "my-post");
++        // H1 带行内代码与链接
++        assert_eq!(
++            extract_title(&parse("# `less -R` 与 [链接](https://x.example) 标题"), "fb"),
++            "less -R 与 链接 标题"
++        );
++        // Tab 换空格
++        assert_eq!(extract_title(&parse("# 你好\t世界"), "fb"), "你好 世界");
++    }
++
++    #[test]
++    fn excerpt_extraction() {
++        // 首段纯文本 + 空白折叠
++        assert_eq!(
++            extract_excerpt(&parse("第一  段\n有多行\t与空白。\n\n第二段"), "fb"),
++            "第一 段 有多行 与空白。"
++        );
++        // 160 字符截断, 以 … 结尾
++        let long = "字".repeat(200);
++        let ex = extract_excerpt(&parse(&format!("{long}\n\n尾段")), "fb");
++        assert_eq!(ex.chars().count(), 161);
++        assert_eq!(ex.chars().take(160).collect::<String>(), "字".repeat(160));
++        assert!(ex.ends_with('…'));
++        // 无段落 → fallback 标题
++        assert_eq!(extract_excerpt(&parse("# 只有标题"), "标题"), "标题");
++    }
++
++    #[test]
++    fn index_build() {
++        let a = article("hello", "2026-08-29", "2026-08-29T10:00:00+08:00", "你好, 世界");
++        let b = article(
++            "why-a-terminal-blog",
++            "2026-08-29",
++            "2026-08-29T11:00:00+08:00",
++            "为什么把博客做成一个终端",
++        );
++        let c = article("2026/notes", "2026-08-28", "2026-08-28T09:00:00+08:00", "笔记");
++        // 同日(08-29): 按完整时间倒序(b 11:00 在前), 跨日按日期倒序
++        assert_eq!(
++            build_index(&[c, a, b]),
++            "2026-08-29\twhy-a-terminal-blog\t为什么把博客做成一个终端\n\
++             2026-08-29\thello\t你好, 世界\n\
++             2026-08-28\t2026/notes\t笔记\n"
++        );
++        // 标题里 Tab 已被替换(标题提取保证, 这里直接构造含 Tab 的标题验证 build_index 不额外处理)
++        let d = article("t", "2026-08-01", "2026-08-01T00:00:00+08:00", "含\tTab");
++        assert_eq!(build_index(&[d]), "2026-08-01\tt\t含\tTab\n");
++    }
++
++    #[test]
++    fn collapse_and_truncate() {
++        assert_eq!(collapse_ws("  a \n\t b  c "), "a b c");
++        assert_eq!(truncate_chars("abc", 5), "abc");
++        assert_eq!(truncate_chars("abcdef", 3), "abc…");
++    }
++}
+diff --git a/crates/core/src/config.rs b/crates/core/src/config.rs
+index fb25fef..6512c34 100644
+--- a/crates/core/src/config.rs
++++ b/crates/core/src/config.rs
+@@ -52,11 +52,18 @@ pub struct WebConfig {
+     pub listen: String,
+     /// 前端静态资源目录(安装布局下为绝对路径)
+     pub static_dir: String,
++    /// 站点对外绝对地址(https://host[:port], 尾部不带 /)。
++    /// canonical / sitemap / atom / OG 的前缀, 仅 content-build 消费。
++    pub site_url: Option<String>,
+ }
+ 
+ impl Default for WebConfig {
+     fn default() -> Self {
+-        Self { listen: "0.0.0.0:8080".into(), static_dir: "frontend/dist".into() }
++        Self {
++            listen: "0.0.0.0:8080".into(),
++            static_dir: "frontend/dist".into(),
++            site_url: None,
++        }
+     }
+ }
+ 
+diff --git a/docs/architecture.drawio b/docs/architecture.drawio
+index 34430b8..a40f167 100644
+--- a/docs/architecture.drawio
++++ b/docs/architecture.drawio
+@@ -1,6 +1,6 @@
+ <mxfile host="65bd71144e">
+     <diagram name="termblog-arch" id="termblog-arch">
+-        <mxGraphModel dx="2182" dy="1917" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1880" pageHeight="1460" math="0" shadow="0">
++        <mxGraphModel dx="2182" dy="1917" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1880" pageHeight="2760" math="0" shadow="0">
+             <root>
+                 <mxCell id="0"/>
+                 <mxCell id="1" parent="0"/>
+@@ -303,7 +303,124 @@
+                         </Array>
+                     </mxGeometry>
+                 </mxCell>
+-            </root>
++            <mxCell id="m5_divider" value="── M5: SEO 静态镜像 + URL⇄终端双向同步 ──&#xa;一个源头, 两个投影: 爬虫读静态全文 (不开 jail), 真人落进终端 (OSC 双向同步); 颜色: 黄=唯一内容源  青=编译产物  蓝=浏览器/前端  绿=termblog-web  紫=jail 内  橙=外部角色  红=安全边界" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=14;fontStyle=1;fontColor=#333333;" parent="1" vertex="1">
++                    <mxGeometry x="40" y="1520" width="1760" height="44" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_legend" value="颜色: 黄=唯一内容源(真身)  青=编译产物(两个投影)  蓝=浏览器/前端  绿=termblog-web(路由零新增)  紫=jail 内  橙=外部角色  红=安全边界与降级&#xa;构建顺序: vite build 先(清空 dist) → content-build 后(幂等清理, glob 入口 JS+CSS 注入镜像页)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=12;fontStyle=1;fontColor=#666666;" parent="1" vertex="1">
++                    <mxGeometry x="40" y="1590" width="1480" height="34" as="geometry"/>
++                </mxCell><mxCell id="m5_bc" value="构建期 —— gmake build: build-frontend(vite) → cargo build → content-build" style="rounded=1;dashed=1;whiteSpace=wrap;fillColor=none;strokeColor=#999999;fontSize=13;fontStyle=1;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;" parent="1" vertex="1">
++                    <mxGeometry x="40" y="1650" width="1480" height="430" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_src" value="唯一内容源 jailtpl/content/blog/*.md&#xa;无 frontmatter, 目录树即结构&#xa;· slug = 相对路径去 .md (白名单 [a-z0-9/-], 违规构建失败)&#xa;· 标题 = 首个 H1 · 日期 = git 最后提交时间&#xa;· 摘要 = 首段 (~160 字)&#xa;· 顶层散文件只进 jail, 不进镜像与 feed" style="rounded=1;whiteSpace=wrap;fill=#fff2cc;strokeColor=#d6b656;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
++                    <mxGeometry x="80" y="1720" width="250" height="180" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_cb" value="content-build (Rust, crates/content-build)&#xa;pulldown-cmark 一次解析 → 事件流喂两个 renderer&#xa;(ENABLE_TABLES | ENABLE_STRIKETHROUGH)&#xa;slug 违规 → 构建失败 (逐文件列出)&#xa;日期: git commit date, 无历史 fallback mtime + 告警&#xa;清理旧产物 (删文不留僵尸, 幂等)" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
++                    <mxGeometry x="420" y="1720" width="280" height="180" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_html" value="HTML 投影 → frontend/dist (ServeDir 直接服务)&#xa;· blog/&lt;slug&gt;/index.html 镜像页: 静态全文 +&#xa;  termblog-slug meta + canonical/OG + ssh 提示&#xa;· blog/index.html 列表页 (纯静态, 不引导终端)&#xa;· dist/index.html 首页 footer 注入 (幂等替换)&#xa;· sitemap.xml / atom.xml / robots.txt&#xa;· glob assets/index-*.js + index-*.css 注入镜像页&#xa;  (缺/多 → 构建失败; 缺 CSS 终端 DOM 会裸奔)" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
++                    <mxGeometry x="780" y="1670" width="330" height="230" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_ansi" value="ANSI 投影 → jailtpl/content/.rendered/&#xa;· &lt;slug&gt;: 76 显示列折行 + SGR (less -R 可读, CJK=2)&#xa;· .index: TSV 一行一篇 (日期倒序) 列表数据" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
++                    <mxGeometry x="780" y="1920" width="330" height="130" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_tpl" value="jail 模板 (build-template.sh)&#xa;· content/ 全量 → ~/blog/ (含 .rendered/)&#xa;· bin/blog + bin/webctl → /usr/local/bin (0555)&#xa;· zshrc: LANG=C.UTF-8 + MOTD (blog 用法)&#xa;内容更新: scripts/update-content.sh&#xa;(镜像即时发布; 模板销毁重建, 杀会话)" style="rounded=1;whiteSpace=wrap;fill=#e1d5e7;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
++                    <mxGeometry x="1180" y="1860" width="340" height="190" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_e1" value="*.md 递归收集" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d6b656;" parent="1" source="m5_src" target="m5_cb" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_e2" value="事件流 → HTML renderer (push_html, 全转义; 剥首块 H1)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#0e8088;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.25;entryDx=0;entryDy=0;" parent="1" source="m5_cb" target="m5_html" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_e3" value="事件流 → ANSI renderer (76 显示列, 样式跨行重发)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#0e8088;exitX=1;exitY=0.75;exitDx=0;exitDy=0;entryX=0;entryY=0.75;entryDx=0;entryDy=0;" parent="1" source="m5_cb" target="m5_ansi" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_e4" value=".rendered/ 随 content/ 拷进模板 ~/blog/" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#9673a6;" parent="1" source="m5_ansi" target="m5_tpl" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_rc" value="运行期 —— 一个源头, 两个投影: 爬虫读静态全文(不开 jail), 真人落进终端(OSC 双向同步)" style="rounded=1;dashed=1;whiteSpace=wrap;fillColor=none;strokeColor=#999999;fontSize=13;fontStyle=1;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;" parent="1" vertex="1">
++                    <mxGeometry x="40" y="2120" width="1480" height="570" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_bot" value="Googlebot / 无 JS 访客&#xa;GET /blog/hello/ → 200 静态全文&#xa;爬虫止步, 不开 jail&#xa;沿首页链接/sitemap/atom 发现" style="rounded=1;whiteSpace=wrap;fill=#ffe6cc;strokeColor=#d79b00;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
++                    <mxGeometry x="80" y="2200" width="150" height="90" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_hum" value="真人访客&#xa;点开落地页 URL&#xa;最终体验 = 终端本身" style="rounded=1;whiteSpace=wrap;fill=#ffe6cc;strokeColor=#d79b00;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
++                    <mxGeometry x="80" y="2360" width="150" height="90" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_browser" value="浏览器 / 前端 (frontend/)" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#dae8fc;strokeColor=#6c8ebf;" parent="1" vertex="1">
++                    <mxGeometry x="290" y="2180" width="380" height="420" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_static" value="#static-view 静态正文层&#xa;全文留在 DOM (同一份 HTML, 无 cloaking)&#xa;爬虫 / 无 JS / 降级时可见" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="m5_browser" vertex="1">
++                    <mxGeometry x="20" y="46" width="340" height="70" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_cover" value="#mirror-cover 等待层 (JS 用户首屏)&#xa;不透明盖住正文, 正文不闪现&#xa;无 JS: &lt;noscript&gt; 隐藏本层 → 全文直接可读" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="m5_browser" vertex="1">
++                    <mxGeometry x="20" y="126" width="340" height="70" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_osc" value="osc.ts: parser.registerOscHandler(7777)&#xa;只认 url= · 白名单 ^/[a-z0-9-]*(/[a-z0-9-]+)*/?$ 且 ≤512&#xa;只 history.replaceState —— 绝不跳转 / 不写 DOM&#xa;天花板 = 地址栏显示一个站内路径" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#b85450;fontSize=12;" parent="m5_browser" vertex="1">
++                    <mxGeometry x="20" y="206" width="340" height="80" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_main" value="main.ts 落地状态机&#xa;· 新会话: 等首帧数据(zsh 就绪)后 200ms&#xa;  自动敲 blog ~/blog/blog/&lt;slug&gt;.md&#xa;· attach: Ctrl-C 退旧分页器 + 同一终端敲 blog&#xa;· 首条 OSC + 200ms → 等待层淡出, 终端接管&#xa;· 5s 兜底 / WS 断: 撤等待层露全文 + 手动入口" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="m5_browser" vertex="1">
++                    <mxGeometry x="20" y="296" width="340" height="110" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_web" value="termblog-web (axum, www) —— M5 路由零新增" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
++                    <mxGeometry x="720" y="2180" width="330" height="210" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_serve" value="ServeDir(frontend/dist)&#xa;/blog/hello/ → 200 (目录下 index.html)&#xa;/blog/hello → 307 → 尾斜杠 (canonical 统一)&#xa;镜像页/列表页/sitemap/atom/robots 全静态" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="m5_web" vertex="1">
++                    <mxGeometry x="20" y="46" width="290" height="90" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_wsgw" value="WS 网关 (M3 原样纯透传)&#xa;Data 帧 = 裸 PTY 字节, OSC 只是普通字节&#xa;web 二进制不知道『文章』" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#82b366;fontSize=12;" parent="m5_web" vertex="1">
++                    <mxGeometry x="20" y="146" width="290" height="50" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_jaild" value="jaild [root] 泵 —— 数据面零改动&#xa;PTY 输出 → Data 帧 · 键入/Resize → PTY" style="rounded=1;whiteSpace=wrap;fill=#fff2cc;strokeColor=#d6b656;fontSize=12;" parent="1" vertex="1">
++                    <mxGeometry x="720" y="2440" width="330" height="90" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_jail" value="jail 会话 (每访客一个真实 FreeBSD jail, guest)" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
++                    <mxGeometry x="1100" y="2180" width="420" height="440" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_zsh" value="zsh (guest)&#xa;落地页自动敲入 blog ~/blog/blog/&lt;slug&gt;.md&#xa;(正常键入通路, 进 zsh 历史)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="m5_jail" vertex="1">
++                    <mxGeometry x="20" y="46" width="380" height="80" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_blog" value="blog —— cat 式文件阅读器 (sh)&#xa;任意层级 md 路径 (相对 cwd / 相对 ~/blog / 绝对)&#xa;在 ~/blog/blog/ 下 → 算 slug (白名单 [a-z0-9/-])&#xa;webctl url /blog/&lt;slug&gt;/ → less -RXc (清屏重画)&#xa;退出 → webctl url /" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="m5_jail" vertex="1">
++                    <mxGeometry x="20" y="136" width="380" height="130" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_webctl" value="webctl (sh): printf '\033]7777;url=%s\007'&#xa;ssh 客户端不认识 → 按 VT 规范吞掉, 零副作用" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="m5_jail" vertex="1">
++                    <mxGeometry x="20" y="276" width="380" height="60" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_ssh" value="ssh -p 2222 访客&#xa;同一条 blog 命令&#xa;同文阅读" style="rounded=1;whiteSpace=wrap;fill=#ffe6cc;strokeColor=#d79b00;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
++                    <mxGeometry x="950" y="2540" width="130" height="100" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_r1" value="GET /blog/hello/ → 200 静态全文 · /blog/hello → 307 → 尾斜杠 (canonical 统一)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d79b00;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" parent="1" source="m5_bot" target="m5_web" edge="1">
++                    <mxGeometry relative="1" as="geometry">
++                        <Array as="points">
++                            <mxPoint x="155" y="2158"/>
++                            <mxPoint x="880" y="2158"/>
++                        </Array>
++                    </mxGeometry>
++                </mxCell>
++<mxCell id="m5_r2" value="点开 /blog/&lt;slug&gt;/" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d79b00;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="m5_hum" target="m5_browser" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_r3" value="WS /ws (proto 帧) + 静态资源 (入口 JS/CSS 带 hash)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#6c8ebf;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="m5_browser" target="m5_web" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_r4" value="socket 帧透传 (SEQPACKET)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#82b366;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" parent="1" source="m5_web" target="m5_jaild" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_r5" value="PTY: 键入 / 输出 / Resize" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d6b656;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.2;entryDx=0;entryDy=0;" parent="1" source="m5_jaild" target="m5_jail" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_r7" value="同文阅读, 未知 OSC 自动吞掉" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d79b00;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.85;entryDx=0;entryDy=0;" parent="1" source="m5_ssh" target="m5_jail" edge="1">
++                    <mxGeometry relative="1" as="geometry"/>
++                </mxCell>
++<mxCell id="m5_r6" value="OSC 7777 闭环: ESC]7777;url=/blog/hello/BEL · jail stdout → PTY → jaild 泵 → web 透传 → osc.ts (白名单) → history.replaceState · 刷新 attach 回放重放, 最后一条胜出 (地址栏收敛到当前文章)" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#b85450;dashed=1;exitX=0.1;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" parent="1" source="m5_jail" target="m5_browser" edge="1">
++                    <mxGeometry relative="1" as="geometry">
++                        <Array as="points">
++                            <mxPoint x="1142" y="2655"/>
++                            <mxPoint x="480" y="2655"/>
++                        </Array>
++                    </mxGeometry>
++                </mxCell>
++</root>
+         </mxGraphModel>
+     </diagram>
+ </mxfile>
+diff --git a/etc/termblog.toml b/etc/termblog.toml
+index 230688d..f27217f 100644
+--- a/etc/termblog.toml
++++ b/etc/termblog.toml
+@@ -4,6 +4,9 @@
+ # 生产直连公网; 后续想挂反代/Anubis 时改回 127.0.0.1:8080
+ listen = "0.0.0.0:8080"
+ static_dir = "/usr/local/share/termblog/frontend"
++# 站点对外绝对地址(不带尾斜杠)。canonical/sitemap/atom/OG 用;不设则镜像页
++# 照常生成, 只是不产出 sitemap/atom 与 canonical(部署后务必设置!)
++# site_url = "https://your-real-domain.example.com"
+ 
+ [ssh]
+ # 降权 www 跑不了特权端口 22, 生产用 2222
+diff --git a/frontend/public/blog.css b/frontend/public/blog.css
+new file mode 100644
+index 0000000..bf78014
+--- /dev/null
++++ b/frontend/public/blog.css
+@@ -0,0 +1,104 @@
++/* blog.css —— M5 静态镜像层 + 文章列表样式。加载于镜像页与注入后的首页。 */
++
++/* #app 变为定位上下文, 静态层以覆盖层姿态盖在终端之上(不能 display:none 终端,
++   否则 FitAddon 量不到尺寸)。inset 与 #app 的 padding 对齐。 */
++#app { position: relative; }
++
++#static-view {
++  position: absolute;
++  inset: 12px;
++  z-index: 20;
++  background: var(--bg);      /* 不透明: 终端在其下就绪但不被看见 */
++  overflow-y: auto;
++  padding: 24px 18px;
++  transition: opacity 400ms ease-out;
++}
++#static-view.fade-out { opacity: 0; pointer-events: none; }
++
++/* 落地页等待层: JS 用户首屏只看它(不透明盖住静态正文, 正文不闪现),
++   终端就绪后淡出; 无 JS 时由镜像页里的 <noscript> 隐藏本层 */
++#mirror-cover {
++  position: absolute;
++  inset: 12px;
++  z-index: 21;
++  background: var(--bg);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  transition: opacity 400ms ease-out;
++}
++#mirror-cover.fade-out { opacity: 0; pointer-events: none; }
++#mirror-cover .mirror-status { margin: 0; }
++
++#static-view article {
++  max-width: 80ch;
++  margin: 0 auto;
++  font-size: 15px;
++  line-height: 1.7;
++}
++#static-view article h1 { font-size: 1.6em; margin: 0 0 .6em; }
++#static-view article h2 { font-size: 1.3em; margin: 1.4em 0 .5em; }
++#static-view article h3 { font-size: 1.1em; margin: 1.2em 0 .4em; }
++#static-view article p { margin: .6em 0; }
++#static-view article pre {
++  background: #f0f2f4;
++  border: 1px solid var(--border);
++  border-radius: 6px;
++  padding: 10px 12px;
++  overflow-x: auto;
++}
++#static-view article code { font-family: inherit; }
++#static-view article pre code { padding: 0; background: none; border: 0; }
++#static-view article :not(pre) > code {
++  background: #f0f2f4;
++  border-radius: 4px;
++  padding: 1px 5px;
++}
++#static-view article blockquote {
++  border-left: 3px solid var(--border);
++  margin: .8em 0;
++  padding: 2px 0 2px 14px;
++  color: #6a737d;
++}
++#static-view article a { color: #0969da; }
++#static-view article img { max-width: 100%; }
++.post-meta { color: #6a737d; font-size: 13px; margin-top: 2.5em; }
++
++.mirror-status { color: #6a737d; font-size: 13px; margin: 0 0 1.5em; }
++
++/* 降级手动入口: 由 main.ts 揭示 */
++#enter-terminal {
++  position: fixed;
++  top: 16px;
++  right: 16px;
++  z-index: 30;
++  font: inherit;
++  font-size: 13px;
++  padding: 6px 14px;
++  background: var(--fg);
++  color: var(--bg);
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++}
++#enter-terminal:hover { opacity: .85; }
++
++/* 首页底部文章列表(content-build 注入, 对爬虫与无 JS 访客可见) */
++#blog-index {
++  max-width: 80ch;
++  margin: 0 auto 24px;
++  padding: 8px 12px;
++  border-top: 1px solid var(--border);
++  font-size: 13px;
++  color: #6a737d;
++}
++#blog-index h2 { font-size: 1em; margin: 12px 0 6px; color: var(--fg); }
++#blog-index ul { list-style: none; margin: 0; padding: 0; }
++#blog-index li { margin: 4px 0; }
++#blog-index a { color: #0969da; text-decoration: none; }
++#blog-index .date { color: #6a737d; margin-right: 10px; }
++
++@media (max-width: 640px) {
++  #static-view { inset: 4px; padding: 14px 8px; }
++  #mirror-cover { inset: 4px; }
++}
+diff --git a/frontend/src/main.ts b/frontend/src/main.ts
+index 120b767..411e947 100644
+--- a/frontend/src/main.ts
++++ b/frontend/src/main.ts
+@@ -1,6 +1,7 @@
+ import { Terminal } from "@xterm/xterm";
+ import { FitAddon } from "@xterm/addon-fit";
+ import "@xterm/xterm/css/xterm.css";
++import { installOsc } from "./osc";
+ 
+ // ── proto 帧编解码(格式与 crates/proto 完全一致: u8 kind | u32 len | payload) ──
+ const T_OPEN = 0x01;
+@@ -22,6 +23,17 @@ function frame(kind: number, payload: Uint8Array): ArrayBuffer {
+ }
+ const jsonFrame = (kind: number, v: unknown) => frame(kind, textEnc.encode(JSON.stringify(v)));
+ 
++// ── 落地页接管状态机(M5): 镜像页带 <meta name="termblog-slug">, 普通页面无 ──
++// 时序常量: 接管兜底 5000ms; attach 回放宽限 1500ms; 淡出 450ms(400ms 过渡 + 余量)
++const LANDING =
++  document.querySelector<HTMLMetaElement>('meta[name="termblog-slug"]')?.content?.trim() ?? "";
++const onMirror = LANDING !== "";
++let takeoverDone = false; // 静态层是否已交给终端(一次性)
++let lastAttached = false; // 最近一次 Opened 的 attached
++let sawData = false; // 本连接是否已收到 Data(attach 回放标志)
++let autoArmed = false; // 新会话落地页: 等首帧数据后补敲 blog 命令
++let autoSent = false; // 自动命令已发出(一次性)
++
+ // ── 终端(视觉参数配合 style.css 的浅色 CRT 主题) ──
+ const term = new Terminal({
+   fontFamily: '"Maple Mono", monospace',
+@@ -63,6 +75,7 @@ async function boot() {
+   void document.body.offsetHeight; // 强制同步布局, 让已加载的字体度量生效
+ 
+   term.open(document.getElementById("term-screen")!);
++  installOsc(term, handleOscUrl);
+   refit();
+   document.getElementById("term-host")!.classList.add("ready");
+   connect();
+@@ -105,14 +118,47 @@ function connect() {
+     switch (b[0]) {
+       case T_DATA:
+         term.write(payload); // 裸 PTY 字节, ANSI 原样上屏
++        if (autoArmed && !autoSent) {
++          // 自动命令推迟到 zsh 已开始输出(MOTD/提示符已在画)之后才发:
++          // 早发的字节会被 tty 驱动立刻回显在屏幕顶部(那时提示符还不存在),
++          // 造成第一行孤儿回显 + 与提示符绘制交错的乱象。
++          autoSent = true;
++          setTimeout(() => {
++            send(frame(T_DATA, textEnc.encode(`blog ~/blog/blog/${LANDING}.md\r`)));
++          }, 200);
++        }
++        if (!sawData) {
++          sawData = true;
++          // attach 场景: 回放里可能没有 OSC(会话停在提示符), 收到数据 1.5s 后仍无 OSC
++          // 就直接接管 —— 老用户回来看的是会话本身, 不必等 blog 命令。
++          if (onMirror && lastAttached && !takeoverDone) {
++            setTimeout(takeOver, 1500);
++          }
++        }
+         break;
+       case T_OPENED: {
+         const opened = JSON.parse(textDec.decode(payload));
+         // 恢复的会话: 屏幕清干净, 由 SIGWINCH 触发前台程序重绘; 新会话本来就是新画面
+         term.reset();
+         sessionStorage.setItem(TOKEN_KEY, opened.attach_token);
+-        if (opened.attached) term.write("\x1b[90m[已恢复原会话]\x1b[0m\r\n");
++        // 横幅只在普通页面打: 镜像页回放要逐字节对应原会话画面, 横幅会把它下移两行
++        if (opened.attached && !onMirror) term.write("\x1b[90m[已恢复原会话]\x1b[0m\r\n");
+         sendResize(); // attach 后服务端 winsize 可能还是旧值, 主动同步一次
++        lastAttached = !!opened.attached;
++        if (onMirror) {
++          if (!lastAttached) {
++            // 新会话: 发送推迟到首帧 T_DATA 之后(见上), 避免回显抢在提示符之前。
++            autoArmed = true;
++          } else {
++            // 已有终端: 在现终端里继续 —— 先 Ctrl-C 退掉可能挂着的分页器/命令,
++            // 再敲 blog(less -c 会清屏重画文章, 视图收敛到干净的文章页)。
++            send(frame(T_DATA, textEnc.encode("\x03")));
++            setTimeout(() => {
++              send(frame(T_DATA, textEnc.encode(`blog ~/blog/blog/${LANDING}.md\r`)));
++            }, 300);
++          }
++        }
++        armFallback(); // 5s 兜底(§9.2 末)
+         break;
+       }
+       case T_CLOSED: {
+@@ -122,10 +168,59 @@ function connect() {
+         } catch { /* 非 JSON 就直接显示 */ }
+         term.write(`\r\n\x1b[31m[会话结束: ${reason}]\x1b[0m\r\n`);
+         sessionStorage.removeItem(TOKEN_KEY);
++        if (onMirror && !takeoverDone) revealStaticFallback();
+         break;
+       }
+     }
+   };
+ 
+-  socket.onclose = () => term.write("\r\n\x1b[90m[连接已断开, 刷新页面重连]\x1b[0m\r\n");
++  socket.onclose = () => {
++    term.write("\r\n\x1b[90m[连接已断开, 刷新页面重连]\x1b[0m\r\n");
++    if (onMirror && !takeoverDone) revealStaticFallback();
++  };
++}
++
++// ── 落地页接管: 等待层淡出交给终端 / 降级露出静态正文 ──
++// 等待层(#mirror-cover)从首屏就盖住静态正文(正文不闪现, 由内容编译期写入
++// 镜像页 HTML); 终端就绪的信号与 §9.2 一致 —— 本会话首条 OSC 7777。
++
++function handleOscUrl(_path: string) {
++  // replaceState 已在 osc.ts 完成; 这里只负责镜像层接管。
++  // blog 脚本先发 OSC、less 随后才画第一帧 —— 延迟 200ms 让内容画到
++  // 等待层下面, 淡出时透出的就是已经画好的终端, 而不是空屏。
++  if (onMirror && !takeoverDone) setTimeout(takeOver, 200);
++}
++
++function takeOver() {
++  if (takeoverDone) return;
++  takeoverDone = true;
++  // 先藏正文再淡等待层: 淡出过程透出的是终端, 不是静态正文
++  const sv = document.getElementById("static-view");
++  if (sv) sv.style.display = "none";
++  const cover = document.getElementById("mirror-cover");
++  cover?.classList.add("fade-out"); // 400ms 淡出(blog.css)
++  setTimeout(() => cover?.remove(), 450); // 之后彻底移出 DOM
++  document.getElementById("enter-terminal")?.setAttribute("hidden", "");
+ }
++
++function revealStaticFallback() {
++  // 会话死了 / WS 断了 / 5s 无 OSC: 撤掉等待层, 静态正文保留可读 + 手动入口。
++  // 若 OSC 稍后才到, takeOver 会继续完成接管(正文再藏起), 此态不是终态。
++  document.getElementById("static-view")?.style.removeProperty("display");
++  const cover = document.getElementById("mirror-cover");
++  cover?.classList.add("fade-out");
++  setTimeout(() => cover?.remove(), 450);
++  revealEnterButton();
++}
++
++function revealEnterButton() {
++  document.getElementById("enter-terminal")?.removeAttribute("hidden");
++}
++
++function armFallback() {
++  setTimeout(() => {
++    if (!takeoverDone) revealStaticFallback();
++  }, 5000);
++}
++
++document.getElementById("enter-terminal")?.addEventListener("click", takeOver);
+diff --git a/frontend/src/osc.ts b/frontend/src/osc.ts
+new file mode 100644
+index 0000000..4101760
+--- /dev/null
++++ b/frontend/src/osc.ts
+@@ -0,0 +1,22 @@
++// OSC 7777: 终端 → 浏览器地址栏。payload 不可信(jail 内任意进程可 printf),
++// 只做"同源纯路径"的 replaceState, 天花板 = 地址栏显示一个站内路径。
++import type { Terminal } from "@xterm/xterm";
++
++// 站内纯路径白名单: / 或 /a/b/ 形, 禁止 ? # . .. 与非 ASCII
++const PATH_RE = /^\/[a-z0-9-]*(\/[a-z0-9-]+)*\/?$/;
++
++export function installOsc(term: Terminal, onUrl: (path: string) => void): void {
++  term.parser.registerOscHandler(7777, (payload) => {
++    // 只认 url= 子命令, 其余一律吞掉
++    if (!payload.startsWith("url=")) return true;
++    const v = payload.slice(4);
++    if (v.length < 1 || v.length > 512 || !PATH_RE.test(v)) return true;
++    try {
++      history.replaceState(null, "", v);
++    } catch {
++      /* 某些环境(如 about:blank)会抛 SecurityError, 忽略 */
++    }
++    onUrl(v);
++    return true;
++  });
++}
+diff --git a/jailtpl/bin/blog b/jailtpl/bin/blog
+new file mode 100755
+index 0000000..8e07b53
+--- /dev/null
++++ b/jailtpl/bin/blog
+@@ -0,0 +1,67 @@
++#!/bin/sh
++# blog —— 文章阅读入口(termblog M5)。像 cat 一样读 markdown 文件,
++# 顺手把浏览器地址栏同步到该文对应的镜像 URL。
++#   blog                列出文章(~/blog/.rendered/.index)
++#   blog <文件.md>      读一篇 markdown: 相对/绝对路径均可, 任意目录层级;
++#                       文件在 ~/blog/blog/ 下时同步地址栏 /blog/<slug>/,
++#                       退出分页器后复位到 /。交互终端用 less -RX 分页
++#                       (无备用屏, 不闪屏), 非交互管道直接 cat。
++# 模板构建时由 build-template.sh 安装到 /usr/local/bin(0555)。
++
++set -eu
++R="$HOME/blog"
++
++case "${1:-}" in
++    "")
++        if [ -f "$R/.rendered/.index" ]; then
++            cat "$R/.rendered/.index"
++        else
++            echo "暂无文章(模板里没有 .rendered/.index, 重建模板试试)"
++        fi
++        ;;
++    *)
++        # 解析文件: 先按原样(相对 cwd / 绝对), 再相对 ~/blog
++        file=""
++        for cand in "$1" "$R/$1"; do
++            if [ -f "$cand" ]; then
++                file=$cand
++                break
++            fi
++        done
++        if [ -z "$file" ]; then
++            echo "blog: 没有这个文件: $1 (敲 blog 看列表)" >&2
++            exit 1
++        fi
++        # 规范化成绝对路径(相对 cwd 的补 $PWD), 便于按 ~/blog/blog/ 前缀算 slug
++        case "$file" in
++            /*) ;;
++            *) file="$PWD/$file" ;;
++        esac
++
++        # 文件在 ~/blog/blog/ 下 → 算 slug 并同步地址栏(带尾斜杠 = canonical 形态)
++        # slug 白名单 [a-z0-9/-] 与内容编译器一致, 违规则不同步(仅阅读)
++        slug=""
++        case "$file" in
++            "$R/blog/"*.md)
++                slug=${file#"$R/blog/"}
++                slug=${slug%.md}
++                ;;
++        esac
++        case "$slug" in
++            *[!a-z0-9/-]*|""|*/|*//*) slug="" ;;
++        esac
++        if [ -n "$slug" ] && command -v webctl >/dev/null 2>&1; then
++            webctl url "/blog/$slug/"
++        fi
++        if [ -t 0 ]; then
++            # -X: 不进备用屏、退出后内容留在屏幕; -c: 每次绘制前先清屏重画,
++            #     文章永远画在干净画面上(不会叠在 attach 回放的旧画面上)
++            less -RXc "$file" || true
++        else
++            cat "$file"
++        fi
++        if [ -n "$slug" ] && command -v webctl >/dev/null 2>&1; then
++            webctl url /
++        fi
++        ;;
++esac
+diff --git a/jailtpl/bin/webctl b/jailtpl/bin/webctl
+new file mode 100755
+index 0000000..52409f8
+--- /dev/null
++++ b/jailtpl/bin/webctl
+@@ -0,0 +1,19 @@
++#!/bin/sh
++# webctl —— 终端↔网页桥(termblog M5)。
++# 唯一职责: 把 OSC 7777 序列打到 stdout, 由前端的 osc.ts 消费(replaceState)。
++# ssh 客户端不认识该 OSC, 按 VT 规范吞掉, 无副作用。
++# 用法: webctl url /path       (path 必须以 / 开头)
++# 子命令位留给后续(theme 等, 本期不做)。
++
++case "$1" in
++    url)
++        case "$2" in
++            /*) printf '\033]7777;url=%s\007' "$2" ;;
++            *) echo "usage: webctl url /path" >&2; exit 2 ;;
++        esac
++        ;;
++    *)
++        echo "usage: webctl url /path" >&2
++        exit 2
++        ;;
++esac
+diff --git a/jailtpl/build-template.sh b/jailtpl/build-template.sh
+index 024097b..002867b 100755
+--- a/jailtpl/build-template.sh
++++ b/jailtpl/build-template.sh
+@@ -50,13 +50,15 @@ pkg -c "$MOUNT" install -y zsh less tree
+ # 5. guest 用户(会话 jail 里降权运行; uid 1001 避开 base 自带用户)
+ pw -R "$MOUNT" useradd -n "$GUEST" -u 1001 -d "/home/$GUEST" -s /usr/local/bin/zsh -m
+ 
+-# 6. 定制 zshrc(欢迎语 / 提示符 / 受限 PATH)
++# 6. 定制 zshrc(欢迎语 / 提示符 / 受限 PATH / locale / MOTD)
+ cat > "$MOUNT/home/$GUEST/.zshrc" <<'EOF'
+ # termblog guest shell —— 每个访客一个真实 FreeBSD jail
+ export PATH=/usr/local/bin:/usr/bin:/bin
++export LANG=C.UTF-8
+ umask 022
+ PS1='%F{green}blog@jail%f %~ %# '
+ setopt INTERACTIVE_COMMENTS
++echo '博客: 敲 blog 看文章列表, 读一篇: blog <路径.md>(如 blog ~/blog/blog/hello.md)'
+ EOF
+ 
+ # 7. 博客内容(可选: jailtpl/content/ 下的文件进 ~/blog)
+@@ -66,6 +68,11 @@ if [ -d "$SCRIPT_DIR/content" ]; then
+ fi
+ chown -R 1001:1001 "$MOUNT/home/$GUEST"
+ 
++# 7.5 blog / webctl 命令(0555, 只读; .rendered/ 已随第 7 步 content 拷贝进 ~/blog)
++if [ -d "$SCRIPT_DIR/bin" ]; then
++    install -m 555 "$SCRIPT_DIR/bin/blog" "$SCRIPT_DIR/bin/webctl" "$MOUNT/usr/local/bin/"
++fi
++
+ # 8. 收尾: 卸 devfs, 清 DNS, 打 snapshot, 模板转只读
+ umount -f "$MOUNT/dev" 2>/dev/null || true
+ rm -f "$MOUNT/etc/resolv.conf"
+diff --git a/jailtpl/content/README.md b/jailtpl/content/README.md
+index 0ba21d8..4a909df 100644
+--- a/jailtpl/content/README.md
++++ b/jailtpl/content/README.md
+@@ -1,2 +1,12 @@
+-# 博客内容目录: build-template.sh 会把这些文件拷进 jail 模板的 ~/guest/blog/
+-# 放 markdown 源文件即可(终端友好的文本内容)。
++# 博客内容目录
++
++build-template.sh 会把这里的全部文件拷进 jail 模板的 ~/blog/。约定:
++
++- 文章放 `blog/` 子树:每篇一个 md,**无 frontmatter**;
++- 文件名即 slug,字符集限 `[a-z0-9/-]`(违规构建失败):`blog/hello.md` →
++  网页 `/blog/hello/`、终端 `blog ~/blog/blog/hello.md`(blog 是 cat 式
++  阅读器,任意层级的 md 都能读,路径在 `blog/` 下时同步地址栏);
++- 标题取文中第一个 `# 一级标题`(缺失则用文件名);日期取 git 最后提交时间;
++- 顶层散文件(本 README、about.md)只进 jail,不进镜像与 feed;
++- `blog/` 下的 md 由 content-build 同时编译为网页镜像(frontend/dist/blog/)与
++  终端预渲染(.rendered/,均为生成物,勿手改、勿提交)。
+diff --git a/jailtpl/content/blog/hello.md b/jailtpl/content/blog/hello.md
+new file mode 100644
+index 0000000..213f0fc
+--- /dev/null
++++ b/jailtpl/content/blog/hello.md
+@@ -0,0 +1,24 @@
++# 你好, 世界
++
++这是 termblog 的第一篇文章。你现在读到的, 是同一份 markdown 的两种投影之一:
++搜索引擎看到的是这个静态镜像, 终端用户看到的是 `blog hello` 的排版输出。
++
++## 两种入口, 一个源头
++
++- 网页:打开 `/blog/hello/`,几秒后由真实终端接管
++- SSH:`ssh -p 2222 blog@<host>`,然后敲 `blog hello`
++
++> 文章本体只有一个:`jailtpl/content/blog/hello.md`,其余全是编译产物。
++
++## 排版自检
++
++```sh
++$ blog hello
++```
++
++行内代码 `less -R`、**粗体**、*斜体* 与 [链接](https://example.com) 会被两种
++渲染器各自正确呈现;中文段落按 76 列折行,连字符与标点悬挂不做特殊处理。
++
++---
++
++这里是分隔线之后的一段,验证块间距。
+diff --git a/jailtpl/content/blog/why-a-terminal-blog.md b/jailtpl/content/blog/why-a-terminal-blog.md
+new file mode 100644
+index 0000000..97529f4
+--- /dev/null
++++ b/jailtpl/content/blog/why-a-terminal-blog.md
+@@ -0,0 +1,10 @@
++# 为什么把博客做成一个终端
++
++很多人问: 2026 年了, 为什么博客不是一个漂亮的响应式网站, 而是一个 xterm?
++
++因为写作的终点不是排版, 是对话。终端是文本最诚实的形态: 没有点赞数, 没有推荐流,
++没有 cookie 横幅。访客 ssh 进来, 敲一条 blog, 读到的就是作者写下并编译出的字节,
++和一个真实 FreeBSD jail 里的 zsh。
++
++搜索引擎看不到终端里的字, 所以每篇文章又同时编译成静态镜像页: 爬虫读 HTML,
++真人落进终端 —— 一个源头, 两个投影。你正在读的, 正是这两个投影合流之后的样子。
+diff --git a/plan_m5.md b/plan_m5.md
+new file mode 100644
+index 0000000..9d4591a
+--- /dev/null
++++ b/plan_m5.md
+@@ -0,0 +1,1347 @@
++# M5 实现规格书:SEO 静态镜像 + URL⇄终端双向同步
++
++> 本文档是**实现规格书**:目标读者是被指派实现 M5 的 AI(或人)。旧版 plan_m5.md 的
++> 全部决策原样保留(见 §2),本文在其基础上补齐到"照着做就能落地"的粒度:精确的
++> 文件清单、数据格式、算法规则、完整的小脚本源码、逐条验收命令。
++>
++> 前情:M1–M3 已完成(见 m3.md,16/16 验收通过);M4(打磨)与本计划无依赖,可先做。
++>
++> 问题:博客是纯终端(WS/SSH → jail 里的 zsh),文章没有任何静态 URL。爬虫访问
++> `/` 只能看到一个空的 xterm 容器 —— 搜索引擎检索不到任何一篇文章。
++>
++> 目标:每篇文章有真实、稳定、爬虫可读的 URL;真人点开该 URL 的最终体验仍是
++> 终端本身;终端里翻文章时地址栏跟着变。**不是两套内容,是一个源头的两个投影。**
++
++---
++
++## 0. 本文档怎么读
++
++- §2 是**已定案的决策**,实现时不要再讨论、不要再发明替代方案;发现决策与现状
++  冲突时,停下来在交付说明里说明,不要自行改设计。
++- §4 是**已核实的事实基线**(2026-08-29 在本机 FreeBSD 16.0-CURRENT 实测),直接
++  采信,不要重复验证;其中含一个与旧版计划表述不符的实测结果(§4.1 条目 1,
++  `/blog/hello` 的 307 重定向),相关设计已据此调整。
++- 每个交付物(§7 起)按"文件 → 职责 → 精确规格"组织。标注【完整源码】的小文件
++  (webctl、blog、update-content.sh、blog.css、HTML 模板)**必须逐字采用**;
++  其余(如 content-build 的 Rust 代码)给出行为规格,实现细节自定,但对外行为
++  (CLI、输出路径、文件格式、错误信息)必须与本规格一致,因为验收命令依赖它们。
++- 里程碑(§13)按 M5.1→M5.4 顺序执行,每步的验收命令全绿才进入下一步。标注
++  `[root]` 的命令需要 root(在 jailed 会话不可用时向人类申请,不要自行绕过);
++  标注 `[人工]` 的检查需要人类开浏览器确认。
++- 实现语言/风格约定:Rust 代码注释、日志、错误信息与仓库现有风格一致(中文注释
++  + 简洁错误信息);shell 脚本一律 POSIX sh(`#!/bin/sh`),不用 bash。
++
++### 0.1 术语
++
++| 术语 | 含义 |
++|---|---|
++| 真身 | `jailtpl/content/blog/*.md`,唯一的内容源文件,无 frontmatter |
++| 投影 | 由 content-build 从真身编译出的产物(HTML 镜像页、ANSI 预渲染) |
++| 镜像页 | `frontend/dist/blog/<slug>/index.html`,爬虫可读的静态全文页 |
++| 落地页 | 访客从搜索引擎点进来的那个镜像页 URL |
++| 接管(takeover) | 前端把镜像页的静态正文层淡出、露出底层已就绪终端的过程 |
++| slug | 文章在 URL/命令行里的标识,见 §5.1 |
++| OSC 7777 | 终端转义序列通道,终端→浏览器地址栏的 URL 同步协议,见 §6 |
++
++---
++
++## 1. 问题与目标(展开)
++
++现状:三个服务(jaild / termblog-web / termblog-ssh)已上线,内容在
++`jailtpl/content/`(目前只有 README.md,尚无文章)。爬虫抓 `/` 得到的是一个
++靠 JS 起终端的空壳页:`<div id="term-screen">` 里没有任何文本内容,WebSocket
++爬虫也不升级 —— 于是**全站对搜索引擎不可见**。
++
++要达到的终态(每一条都是验收项):
++
++1. 每篇文章有稳定 URL,GET 该 URL 返回**含全文**的 HTML(不需要执行 JS);
++2. sitemap.xml / atom.xml / robots.txt 齐备,Google Search Console 可提交;
++3. 真人打开文章 URL:静态正文秒开可读 → 终端在后台启动 → 自动执行 `blog <slug>`
++   → 静态层淡出,访客落进真实终端,画面与 ssh 进来敲同一条命令**逐字节一致**;
++4. 终端里 `blog <另一篇>` → 浏览器地址栏变为那篇的 URL(replaceState,不刷新);
++   复制地址栏即为精确分享链接;ssh 客户端看不到任何杂质(未知 OSC 被吞);
++5. 无 JS / 字体加载失败 / jail 配额满 / WS 挂了:文章照样完整可读(降级即静态博客);
++6. 写作流程不变:往 `jailtpl/content/blog/` 扔 markdown,跑构建,结束。
++
++---
++
++## 2. 已定案的决策(定案,不再讨论)
++
++1. **落地页形态**:静态页秒开 + 终端后台接管。爬虫止步静态页(不开 jail、不耗
++   配额);真人落进终端,不看"网页版备胎"。两层内容同源同文,无 cloaking(§12)。
++2. **URL 同步**:双向。
++   - 入站:落地页 JS 照常连 WS 开 jail,新会话就绪后**替访客敲** `blog <slug>\r`
++     (走正常键入通路,进 zsh 历史,诚实而非魔法);
++   - 出站:终端侧 `webctl` 打 OSC 7777,前端解析后 `history.replaceState`。
++   - 刷新页面:attach 回放把历史 OSC 一并重放,最后一条胜出,地址栏自动收敛到
++     "你正在读的那篇"(特性而非 bug,无需去重)。
++3. **阅读命令**:定制 `blog` 命令为推荐入口(发 OSC + less -R 排版);`~/blog/`
++   下的源 md 保留,`less`/`cat` 照用(不同步 URL,接受)。
++4. **编译器**:workspace 内新 crate `content-build`(Rust bin),不用 node 脚本;
++   pulldown-cmark 一次解析,事件流分别喂 HTML/ANSI 两个 renderer,杜绝方言分歧。
++5. **镜像页 = 纯静态文件**:tower-http `ServeDir` 直接服务,**axum 路由零新增**,
++   web 二进制不知道"文章"这个概念(解耦边界与 M3 一致)。
++6. **webctl/blog 都是 sh 脚本**,不建 crate(webctl 的全部职责是一句 printf)。
++7. **数据面零改动**:crates/proto、crates/jaild、crates/ssh、crates/web 的数据
++   通路一行不改;OSC 只是 Data 帧里的普通字节。唯一例外是 `crates/core/src/config.rs`
++   加一个 `site_url` 字段(§11.1)。
++
++---
++
++## 3. 总体架构
++
++```
++jailtpl/content/blog/**/*.md      (唯一真身, 无 frontmatter)
++        │
++        ├─[content-build]──▶ HTML 镜像页   frontend/dist/blog/<slug>/index.html
++        │                    文章列表页    frontend/dist/blog/index.html
++        │                    首页注入      frontend/dist/index.html (幂等追加)
++        │                    sitemap.xml / atom.xml / robots.txt  (进 dist)
++        │                    (ServeDir 直接服务, 爬虫吃这个, 永不碰 jail)
++        │
++        └─[content-build]──▶ ANSI 预渲染   jailtpl/content/.rendered/<slug>
++                             列表数据      jailtpl/content/.rendered/.index
++                             (build-template.sh 拷进 jail 模板 ~/blog/.rendered/,
++                              blog 命令用 less -R 读)
++```
++
++双向同步闭环:
++
++```
++入站:  Google → GET /blog/hello/ → 静态页秒开(全文可读, 爬虫到此为止)
++          └─ 同页 JS 照常连 WS 开 jail → Opened(attached=false)
++             → 前端发 Data 帧 "blog hello\r" (替访客敲命令)
++             → blog 脚本: webctl 发 OSC → less 显示同一篇
++             → 前端收到首条 OSC 7777 → 静态层淡出, 终端接管
++             → 画面与 ssh 进来敲 blog hello 逐字节一致
++
++出站:  终端里 blog world → webctl printf OSC 7777 (ESC]7777;url=/blog/world/BEL)
++          → 裸字节穿 PTY → jaild 泵 → web 网关(纯透传) → xterm.js OSC handler
++          → history.replaceState("/blog/world/")  (地址栏变, 不刷新)
++          → 访客复制地址栏 = 精确分享链接; ssh 客户端不认识该 OSC, 自动忽略
++```
++
++为什么这不是"硬融合":
++
++- 内容单一来源,镜像是编译产物,写文章流程不变(往 `jailtpl/content/blog/` 扔 md);
++- 爬虫与真人各取所需:爬虫读 HTML 不开 jail(省配额),真人进终端;
++- OSC 通道是原计划(plan_claude_aws_fable.md §6)预留的扩展点(`osc.ts` 注册点 +
++  webctl 骨架),本计划把它落地;
++- 数据面一行不改,ssh 侧零感知。
++
++---
++
++## 4. 实现前的事实基线(已实测核实,直接采信)
++
++1. **ServeDir 目录解析行为(tower-http 0.6.11,2026-08-29 实测)**:
++   - `GET /blog/hello/`(带尾斜杠,目录下有 index.html)→ **200**,直接返回
++     `blog/hello/index.html` 内容;
++   - `GET /blog/hello`(无尾斜杠)→ **307** 重定向,`Location: /blog/hello/`。
++   - **推论(设计已据此定案)**:canonical URL 统一采用**带尾斜杠**形式
++     `/blog/<slug>/`,本站自己发出的所有链接(sitemap、atom、OG、canonical、
++     首页列表、/blog/ 列表页、webctl 发的 OSC)全部带尾斜杠;无尾斜杠形态只可能
++     来自外部手敲,307 会被爬虫跟随,无害。web 二进制因此仍然零路由。
++2. **xterm.js 5.5(`@xterm/xterm`,frontend/package.json 已锁)**:
++   - `term.parser.registerOscHandler(7777, cb)` 存在且可用;cb 收到的 payload 是
++     `ESC]7777;` 之后、终止符(BEL 或 `ESC\`)之前的字符串,即 `url=/blog/hello/`;
++   - parser 状态机跨 `write()` 调用保持 —— OSC 序列被 WS 分帧拆开也能正确重组,
++     前端无需拼帧(这在 attach 回放按 4096 字节切片时同样成立);
++   - 通过 `term.parser` 注册的 handler 是配置而非状态,`term.reset()`(main.ts 在
++     attach 时会调用)不会注销它。
++3. **工具链(本机 FreeBSD 16.0-CURRENT,仓库 /home/yzs/termblog)**:`cargo 1.96`、
++   `gmake`、`node 22`/`npm`、`xmllint` 均可用;crates.io 可达
++   (pulldown-cmark 0.13.4 已验证可拉取)。
++4. **生产实例在跑**:termblog-web/termblog-ssh 以 www、jaild 以 root 运行;生产
++   web 服务 `/usr/local/share/termblog/frontend`(配置在 `/usr/local/etc/termblog.toml`)。
++   开发期想让 web 读仓库 `frontend/dist`:从仓库根跑
++   `TERMBLOG_CONFIG=/nonexistent.toml TERMBLOG_LISTEN=127.0.0.1:18099 ./target/release/termblog-web`
++   (已验证)。注意该 dev 实例以 yzs 身份连不上 root:www 的 jaild socket,开会话会
++   失败 —— 正好用来测"jail 不可用时的降级路径";完整流程测试须用生产实例(8080)。
++5. **前端构建产物布局**:`npm run build` 后 `frontend/dist/` = `index.html` +
++   `assets/index-<hash>.js`(+ css)+ `public/` 原样拷贝(`style.css`、`fonts/`、
++   `favicon.svg`)。镜像页引用的入口 JS 是**带 hash 的文件名**,content-build 需
++   在 dist 里 glob 出来(§8.3 步骤 5)。vite build 会清空 dist,因此构建顺序固定为
++   **vite 先、content-build 后**(§11.2)。
++6. **jail 模板现状**:`build-template.sh` 装 zsh/less/tree,guest 用户 uid 1001,
++   `~/blog` = content/ 全量拷贝;模板数据集存在时拒绝重跑(内容更新须 destroy 后
++   重建,runbook 见 §11.4)。jail 内 zshrc 目前**没有设置 locale**,中文在 less 里
++   会按字节错位 —— 本计划在 zshrc 加 `export LANG=C.UTF-8`(§10.3)。
++7. **仓库尚无文章**:`jailtpl/content/` 目前只有 README.md。M5.1 需先创建示例
++   文章(§10.4,兼作渲染器的测试夹具)。
++8. **git 日期可用**:`git log -1 --format=%cI -- <file>` 在本仓库正常;未提交文件
++   返回空(退 mtime + 告警),这是预期路径而非错误。
++
++---
++
++## 5. 内容模型规范
++
++沿用 ghpage 哲学:markdown 里没有任何元数据标记,目录树即结构。
++
++### 5.1 slug 规则(红线,构建期强制)
++
++- 文章 = `jailtpl/content/blog/` 下所有 `*.md`(递归);
++- **slug = 相对 `content/blog/` 的路径去掉 `.md`**:
++  `content/blog/hello.md` → slug `hello` → URL `/blog/hello/`;
++  `content/blog/2026/notes.md` → slug `2026/notes` → URL `/blog/2026/notes/`;
++- slug 字符集白名单:`^[a-z0-9/-]+$`(小写字母、数字、连字符、路径分隔;不允许
++  大写、下划线、点、空格、中文);
++- **违规即构建失败**,错误信息逐个列出违规文件与原因(宁可写作时改名,不做运行期
++  转义)。同时校验:slug 非空、不含 `//`、不以 `/` 结尾(这些在白名单下天然成立,
++  但防御性检查保留)。
++
++### 5.2 元数据提取(约定优于配置)
++
++| 元数据 | 来源 | fallback |
++|---|---|---|
++| slug / URL | §5.1 | — |
++| 标题 | 文中**第一个** `# ` 一级标题(收集该标题内全部 inline 文本) | 文件名 stem(如 `my-post`) |
++| 日期 | `git log -1 --format=%cI -- <file>`(commit date,ISO8601) | 文件 mtime + **构建告警** |
++| 摘要 | 第一个**段落**(Paragraph 块)的纯文本,折叠空白,截 ~160 字符(超长以 `…` 结尾) | 标题 |
++
++补充规则:
++
++- 读文件时统一去掉 UTF-8 BOM、CRLF→LF;
++- 标题里出现的 Tab 替换为空格(进 .index 的行是 TSV);
++- 日期同时用于:镜像页 footer 展示(`YYYY-MM-DD`)、sitemap `<lastmod>`
++  (`YYYY-MM-DD`)、atom `<updated>`(完整 RFC3339)、.index 排序;
++- 排序:日期倒序,同日按 slug 字典序升序。
++
++### 5.3 目录约定
++
++```
++jailtpl/content/
++├── README.md          # 顶层散文件: 进 jail(~/blog/README.md), 不进镜像、不进 feed
++├── about.md           # 同上(将来若要镜像再议, 本期不做)
++└── blog/              # 只有这个子树进镜像 + feed + .rendered
++    ├── hello.md
++    └── 2026/notes.md
++```
++
++`content/blog/` 下的非 `.md` 文件(图片等):忽略并 WARN(模板仍会原样拷进 jail,
++但镜像不引用)。`content/blog/` 不存在或为空:构建**不失败**,WARN"没有文章",
++仍产出 robots.txt,跳过 sitemap/atom(§8.9)、跳过首页注入。
++
++`jailtpl/content/README.md` 需更新为记录上述约定的说明(§10.4)。
++
++---
++
++## 6. OSC 7777 协议规范
++
++### 6.1 线上格式
++
++```
++ESC ] 7777 ; url = <path> BEL        (0x1b 0x5d '7' '7' '7' '7' ';' 'u' 'r' 'l' '=' <path> 0x07)
++```
++
++- 终止符 BEL(`\a`);`ESC\`(ST)同样合法(xterm.js parser 两种都接受),发射方
++  一律用 BEL;
++- `<path>` 例:`/`、`/blog/hello/`。**本站发出的所有文章路径带尾斜杠**(§4.1);
++- 该序列只从 jail 内进程的 stdout 进入 PTY,作为 Data 帧的普通字节穿透整条链路
++  (jaild/web 零感知);ssh 客户端不认识 OSC 7777,按 VT 规范吞掉,无副作用。
++
++### 6.2 前端侧约束(安全边界,红线)
++
++jail 里的任何进程都可以 printf 任意字节 —— **OSC payload 是不可信输入**。前端
++handler 必须:
++
++1. 只认 `url=` 前缀,其余子命令一律吞掉(handler 返回 true)不动作;
++2. path 必须匹配 `^\/[a-z0-9-]*(\/[a-z0-9-]+)*\/?$`(即 `/` 或 `/a/b/` 形的纯站内
++   路径,禁止 `?`、`#`、`.`、`..`、非 ASCII),长度 ≤ 512;
++3. **只 `history.replaceState(null, "", path)`,绝不 location 跳转、绝不写
++   innerHTML、绝不 fetch**;replaceState 包 try/catch;
++4. 天花板 = "地址栏显示一个站内路径",到此为止。
++
++### 6.3 收敛语义
++
++attach 回放(sessions.rs 把 scrollback 按序重放进 xterm)会把历史 OSC 逐条重放,
++handler 依次触发,**最后一条胜出** → 地址栏自动收敛到会话当前真实状态。无需去重、
++无需状态机;scrollback(128KiB)截断导致某条 OSC 被拦腰砍掉时,该条退化为纯文本
++上屏,不产生错误跳转(旧有的 ANSI 截断问题,非本计划引入,不处理)。
++
++---
++
++## 7. 交付物总览(文件清单)
++
++```
++termblog/
++├── crates/
++│   └── content-build/            [新增] 内容编译器(workspace 成员, bin)
++│       ├── Cargo.toml
++│       └── src/
++│           ├── main.rs           CLI + 流程编排
++│           ├── meta.rs           slug 校验 / 标题 / 摘要 / 日期
++│           ├── html.rs           镜像页 / 列表页 / 首页注入
++│           ├── ansi.rs           ANSI 预渲染(76 列)
++│           └── feed.rs           sitemap / atom / robots
++├── frontend/
++│   ├── index.html                [不改] 首页注入发生在构建产物 dist/index.html 上
++│   ├── src/
++│   │   ├── main.ts               [修改] 落地页接管状态机 + 自动敲命令(§9.2)
++│   │   └── osc.ts                [新增] OSC 7777 handler(§9.1)
++│   └── public/blog.css           [新增] 镜像层 + 列表样式(§9.3)
++├── jailtpl/
++│   ├── build-template.sh         [修改] §10.3(装脚本 + locale + MOTD)
++│   ├── bin/webctl                [新增] 【完整源码】§10.1
++│   ├── bin/blog                  [新增] 【完整源码】§10.2
++│   └── content/
++│       ├── README.md             [修改] 目录约定说明(§10.4)
++│       └── blog/
++│           ├── hello.md          [新增] 示例文章(§10.4)
++│           └── why-a-terminal-blog.md  [新增] 示例文章(§10.4)
++├── crates/core/src/config.rs     [修改] WebConfig 增加 site_url(§11.1)
++├── etc/termblog.toml             [修改] site_url 样例(注释态,§11.1)
++├── Makefile                      [修改] build-content 目标等(§11.2)
++├── .gitignore                    [修改] 忽略 jailtpl/content/.rendered/(§11.3)
++├── scripts/update-content.sh     [新增] 【完整源码】内容更新 runbook(§11.4)
++└── scripts/verify-m5.sh          [新增] 【完整源码】M5 验收脚本(§13 M5.4)
++```
++
++**明确不改**:crates/proto、crates/jaild、crates/ssh、crates/web(路由零新增,
++`ServeDir` 的目录→index.html 行为开箱即用)、frontend/index.html、
++frontend/vite.config.ts、scripts/deploy-root.sh(内容更新流程独立成
++update-content.sh,见 §11.4 的说明)。
++
++与旧版计划的清单差异(有意为之,理由):
++- `frontend/index.html` 从[修改]改为**不改**:首页的爬虫可见文章列表由 content-build
++  幂等注入到**构建产物** `dist/index.html`,不动 vite 模板(注入在每次 vite build
++  后重做,天然幂等);
++- `scripts/deploy-root.sh` 从[修改]改为**不改**:其 `gmake build` → `cp -R
++  frontend/dist/.` 链路已天然携带镜像产物;内容更新(含模板重建)独立成
++  `scripts/update-content.sh`,不把模板销毁逻辑塞进通用部署脚本。
++
++---
++
++## 8. 规格 A:content-build crate
++
++### 8.1 CLI 与配置
++
++```
++content-build [--content <dir>] [--dist <dir>] [--config <file>]
++              [--site-url <url>] [--site-title <title>]
++```
++
++- 默认值:`--content jailtpl/content`、`--dist frontend/dist`(相对 cwd,与仓库
++  "从根目录跑 make" 的惯例一致;Makefile 会显式传参)、`--site-title "~yzs"`;
++- `--config` 缺省时读 `TERMBLOG_CONFIG`,再缺省读 `/usr/local/etc/termblog.toml`
++  (复用 `termblog_core::Config::load` 的整套机制,文件不存在则全默认);
++- `site_url` 优先级:`--site-url` 参数 > 配置文件 `web.site_url`(§11.1)> 无;
++- `--site-url` 传入时须去掉尾部 `/`(规范化:程序内 strip 尾部 `/`)。
++
++### 8.2 依赖(Cargo.toml)
++
++```toml
++[package]
++name = "content-build"
++version = "0.1.0"
++edition = "2021"
++
++[dependencies]
++anyhow.workspace = true
++chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
++pulldown-cmark = "0.13"
++termblog-core = { path = "../core" }
++unicode-width = "0.2"
++```
++
++并在根 `Cargo.toml` 的 `members` 加 `"crates/content-build"`。
++(pulldown-cmark 只用默认特性;若想裁掉 getopts 可 `default-features = false,
++features = ["html"]`,以实际 0.13.x 的特性名为准,非硬性要求。)
++
++### 8.3 主流程(main.rs)
++
++按序执行,任何一步 Err 即以非零码退出并打印人话错误:
++
++1. 解析 CLI + 配置(§8.1);
++2. 扫描 `<content>/blog/` 递归收集 `*.md` → 校验 slug(§5.1,违规列出全部后统一
++   失败);空则 WARN 并继续(§5.3);
++3. 对每篇文章:读文件(BOM/CRLF 规范化)→ `Parser::new_ext` 解析(**选项只用
++   `ENABLE_TABLES | ENABLE_STRIKETHROUGH`,两个 renderer 共用同一套选项**)→ 收集
++   `Vec<Event>` 一次 → 提取元数据(§5.2)→ 从 git/mtime 取日期;
++4. 排序(§5.2);
++5. 在 `<dist>/assets/` glob `index-*.js`:恰 1 个 → 记为 entry_js;0 个 → 报错
++   "找不到前端入口 JS,请先 gmake build-frontend";>1 个 → 报错列出文件;
++6. **清理旧产物**(幂等,§8.10);
++7. 逐篇产出:HTML 镜像页 → `<dist>/blog/<slug>/index.html`(嵌套 slug 建目录);
++   ANSI 预渲染 → `<content>/.rendered/<slug>`;
++8. 产出 `.rendered/.index`(§8.6);
++9. 产出 `<dist>/blog/index.html` 列表页(§8.7);
++10. 产出 sitemap/atom(有 site_url 时;否则 WARN 跳过)与 robots.txt(§8.9);
++11. 首页注入(§8.8);
++12. 打印摘要:文章数、各产物路径、全部 WARN(日期 fallback、非 md 文件、无
++    site_url 等)。
++
++### 8.4 HTML 镜像页(html.rs)
++
++**标题去重规则**:若事件流的**第一个块级元素**是 H1(即元数据标题的来源),HTML
++投影从事件流中**剥掉这个 H1 块**(模板自己渲染 `<h1>`,并附带日期 footer);ANSI
++投影**保留** H1(终端里它是唯一的标题显示)。若文中无 H1(标题走文件名 fallback),
++HTML 模板仍渲染 `<h1>{{标题}}</h1>`,body 原样。两投影正文其余内容逐事件一致。
++
++**正文 HTML**:用 `pulldown_cmark::html::push_html` 生成(转义由其保证);H1 剥除
++后喂给它。镜像页完整模板(占位符 `{{...}}`,`{{#if site_url}}...{{/if}}` 条件块;
++实现用简单字符串替换即可,值先做 HTML 属性转义 `& < > "`):
++
++```html
++<!doctype html>
++<html lang="zh-CN">
++
++<head>
++  <meta charset="UTF-8" />
++  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++  <title>{{TITLE}} — {{SITE_TITLE}}</title>
++  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
++  <link rel="stylesheet" href="/style.css" />
++  <link rel="stylesheet" href="/blog.css" />
++  {{#if site_url}}<link rel="canonical" href="{{SITE_URL}}/blog/{{SLUG}}/" />{{/if}}
++  <meta name="description" content="{{EXCERPT}}" />
++  <meta name="termblog-slug" content="{{SLUG}}" />
++  <meta property="og:title" content="{{TITLE}}" />
++  {{#if site_url}}<meta property="og:url" content="{{SITE_URL}}/blog/{{SLUG}}/" />{{/if}}
++  <meta property="og:type" content="article" />
++  <meta property="og:description" content="{{EXCERPT}}" />
++  <meta property="og:site_name" content="{{SITE_TITLE}}" />
++  {{#if site_url}}<link rel="alternate" type="application/atom+xml" title="{{SITE_TITLE}}" href="/atom.xml" />{{/if}}
++</head>
++
++<body>
++  <!-- CRT 滤镜 defs: 与 frontend/index.html 中的完全一致(style.css 对
++       #term-screen 应用 url(#crt-smudge), 缺 defs 会导致滤镜引用失效) -->
++  <svg class="defs-only" aria-hidden="true" focusable="false">
++    <defs>
++      <filter id="crt-smudge" color-interpolation-filters="sRGB"
++              x="0" y="0" width="100%" height="100%">
++        <feTurbulence type="fractalNoise" baseFrequency="0.01" numOctaves="1" seed="5" result="noise"></feTurbulence>
++        <feDisplacementMap in="SourceGraphic" in2="noise" scale="4"
++                           xChannelSelector="R" yChannelSelector="G"></feDisplacementMap>
++      </filter>
++    </defs>
++  </svg>
++  <div id="app">
++    <!-- 静态正文层: 覆盖在终端之上(不透明), 接管时淡出(§9.2) -->
++    <div id="static-view">
++      <article>
++        <h1>{{TITLE}}</h1>
++        {{BODY_HTML}}
++        <footer class="post-meta">
++          {{DATE}}{{#if ssh_hint}} · 终端里也可以读: ssh -p 2222 blog@{{HOST}} 然后敲 blog {{SLUG}}{{/if}}
++        </footer>
++      </article>
++    </div>
++    <!-- 终端层: 与首页同构, 静态层不透明地盖在上面; 需保持正常布局
++         (不能 display:none, 否则 FitAddon 量不到尺寸) -->
++    <div id="term-host">
++      <div id="term-screen"></div>
++    </div>
++  </div>
++  <button id="enter-terminal" type="button" hidden>进入终端 ↵</button>
++  <script type="module" src="/assets/{{ENTRY_JS}}"></script>
++</body>
++
++</html>
++```
++
++要点:
++
++- `termblog-slug` 的值是**纯 slug**(`hello`,不含 `blog/` 前缀、不含斜杠包裹),
++  main.ts 据此拼 `blog {{slug}}\r`;
++- `ssh_hint` 仅当 site_url 存在时渲染,`{{HOST}}` 取 site_url 的 host 部分;
++- `<html lang>` 用 `zh-CN`(站点内容为中文);
++- **没有 `<noscript>` 特殊处理**:静态层本身就是 no-JS 视图(terminal 藏在下面,
++  JS 不跑就永远不接管);
++- `#enter-terminal` 初始 `hidden`,由 main.ts 在降级时揭示(§9.2)。
++
++### 8.5 ANSI 预渲染(ansi.rs)
++
++输出:UTF-8 文本 + SGR 颜色序列,`less -R` 直接读;**目标宽度 76 显示列**
++(unicode-width 计宽,CJK=2)。行尾 `\n`,文件尾保证一个 `\n`。
++
++块级规则(事件 → 输出;`「」`内为字面输出):
++
++| markdown 元素 | 渲染 |
++|---|---|
++| H1 | 空行 → `\x1b[1m标题\x1b[22m`(按 76 列折行,样式跨行重发)→ 空行 |
++| H2–H6 | 空行 → `\x1b[1m…\x1b[22m` → 空行(H3 起在行首加对应缩进不要求,统一顶格即可) |
++| 段落 | 折行到 76 列;块间空一行 |
++| Strong | `\x1b[1m…\x1b[22m` |
++| Emphasis | `\x1b[3m…\x1b[23m` |
++| 行内代码 | `\x1b[36m…\x1b[39m` |
++| 链接 | 文本后跟 `\x1b[36m(url)\x1b[39m`;文本与 url 相同或文本为空时只输出 url |
++| 图片 | 一行 `image: <alt> <url>`(dim) |
++| 围栏/缩进代码块 | 每行缩进 4 空格,**不折行**(长行原样),块前后空行;围栏线本身不输出;内容不上色 |
++| 块引用 | 每行前缀 `\x1b[2m> \x1b[22m`,内容照常折行 |
++| 无序列表 | 前缀 `  • `,续行缩进 4 空格;嵌套每级 +2 |
++| 有序列表 | 前缀 `  1. `(序号递增),续行缩进 4 空格 |
++| 分隔线 | 空行 → `\x1b[2m` + 76 个 `-` + `\x1b[22m` → 空行(用 ASCII,不用制表符:U+2500 宽度歧义) |
++| 表格 | 表头行: 单元格以 ` | ` 连接;下一行 dim 的 `---- | ----` 分隔;数据行同表头。对齐信息丢弃 |
++| Strikethrough | `\x1b[2m…\x1b[22m` |
++| 软换行 | 空格 |
++| 硬换行 | 换行 |
++| 内联/块级 HTML 事件 | 跳过(站点约定纯 markdown) |
++
++折行算法(必须处理样式):
++
++- 贪心填充:逐"原子"(一个字符或一个空格)累加显示宽度,超 76 即断行;
++- 断行机会:空格之后;或相邻两个字符中任一是宽字符(width==2,即 CJK 可在任意
++  字符间断);
++- 单个不可断原子超 76 列:硬切;
++- **样式跨行**:断行时若有活动 SGR,行尾发 `\x1b[0m`,新行行首重发活动样式;
++  行内的样式开启/关闭一律成对(开启 `1/3/36/2`,关闭 `22/23/39/22`),保证 less
++  分屏重绘时不串色。
++
++### 8.6 产物:`.rendered/` 与 `.index`
++
++- `<content>/.rendered/<slug>`:无扩展名(不是 markdown),UTF-8;嵌套 slug 建子目录;
++- `<content>/.rendered/.index`:一行一篇文章,TSV:
++
++```
++<YYYY-MM-DD>\t<slug>\t<title>
++```
++
++  按日期倒序排(与镜像列表一致);title 内 Tab 已被替换为空格。例:
++
++```
++2026-08-29	why-a-terminal-blog	为什么把博客做成一个终端
++2026-08-29	hello	你好, 世界
++```
++
++### 8.7 列表页 `<dist>/blog/index.html`
++
++纯静态、**不引导终端**(不引 entry JS、无 term-host/static-view),作用:人类浏览
++`/blog/` + 爬虫枢纽。结构:`<!doctype html>` + 与镜像页相同的 head 基础项
++(charset/viewport/title=`文章 — {{SITE_TITLE}}`/favicon/style.css/blog.css)+
++`<main>` 内 `<h1>文章</h1>` + `<ul>` 每篇 `<li><a href="/blog/<slug>/">title</a>
++<span class="date">date</span></li>`(排序同 .index)+ 指向 `/` 的返回链接。
++site_url 存在时同样输出 atom alternate link。
++
++### 8.8 首页注入(dist/index.html,幂等)
++
++- **注入 1**:`</head>` 前插入 `<link rel="stylesheet" href="/blog.css" />`
++  (若 dist/index.html 已含 `blog.css` 引用则跳过);
++- **注入 2**:`</body>` 前插入带标记注释的 footer 块(幂等:若标记已存在,先删旧块
++  再插入新块——vite build 会重新生成 index.html,旧块一般不存在,此逻辑防的是
++  content-build 重复运行):
++
++```html
++<!--BEGIN termblog:blog-index-->
++<footer id="blog-index">
++  <h2>文章</h2>
++  <ul>
++    <li><span class="date">2026-08-29</span><a href="/blog/hello/">你好, 世界</a></li>
++  </ul>
++</footer>
++<!--END termblog:blog-index-->
++```
++
++- footer 在 `#app`(100vh)之下,真人要滚动才看到,但**对爬虫和无 JS 访客完整
++  可见**——这是刻意的非 cloaking 设计:同一份 HTML,谁都能看到这个列表(§12);
++- 无文章时:跳过注入 2(WARN),注入 1 也跳过(首页没有镜像层样式需求);
++- `#blog-index` 样式在 blog.css(§9.3)。
++
++### 8.9 sitemap.xml / atom.xml / robots.txt(feed.rs)
++
++全部写到 `<dist>/` 根。site_url 缺失时:robots.txt 照写(无 Sitemap 行),
++sitemap/atom 跳过并 WARN。URL 一律尾斜杠形式。
++
++`sitemap.xml`(XML 声明 + urlset;loc 用 site_url 拼接;lastmod 只给文章页):
++
++```xml
++<?xml version="1.0" encoding="UTF-8"?>
++<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
++  <url><loc>{{SITE_URL}}/</loc></url>
++  <url><loc>{{SITE_URL}}/blog/</loc></url>
++  <url><loc>{{SITE_URL}}/blog/hello/</loc><lastmod>2026-08-29</lastmod></url>
++</urlset>
++```
++
++`atom.xml`:
++
++```xml
++<?xml version="1.0" encoding="utf-8"?>
++<feed xmlns="http://www.w3.org/2005/Atom">
++  <title>{{SITE_TITLE}}</title>
++  <id>{{SITE_URL}}/</id>
++  <updated>{{feed_updated}}</updated>
++  <link href="{{SITE_URL}}/" />
++  <link href="{{SITE_URL}}/atom.xml" rel="self" />
++  <author><name>{{SITE_TITLE}}</name></author>
++  <entry>
++    <title>{{title}}</title>
++    <id>{{SITE_URL}}/blog/{{slug}}/</id>
++    <link href="{{SITE_URL}}/blog/{{slug}}/" />
++    <updated>{{rfc3339_date}}</updated>
++    <summary>{{excerpt}}</summary>
++    <content type="html">{{body_html 转义}}</content>
++  </entry>
++</feed>
++```
++
++- `feed_updated` = 最新文章日期(无文章则构建时刻);
++- XML 转义统一函数:`& < > " '` → 实体;atom 的 content 是**转义后的完整 HTML**
++  (type="html" 语义);摘要里的控制字符剔除;
++- 每个文件生成后自检:用同一套转义保证 xmllint --noout 通过(验收 §13)。
++
++`robots.txt`:
++
++```
++User-agent: *
++Allow: /
++{{#if site_url}}Sitemap: {{SITE_URL}}/sitemap.xml{{/if}}
++```
++
++(/ws 无需屏蔽:爬虫不升级 WebSocket。)
++
++### 8.10 清理与幂等(content-build 拥有的输出树)
++
++每次运行,生成前先删除旧产物,保证删文后不留僵尸:
++
++- `rm -rf <dist>/blog`(整棵重建,含列表页);
++- `rm -f <dist>/sitemap.xml <dist>/atom.xml <dist>/robots.txt`;
++- `rm -rf <content>/.rendered`(整棵重建);
++- dist/index.html 的注入块按 §8.8 幂等替换;
++- **不碰** dist 的其余内容(assets/、fonts/、style.css、index.html 其余部分)。
++
++### 8.11 错误处理矩阵
++
++| 情形 | 行为 |
++|---|---|
++| slug 违规(§5.1) | 构建失败,列出全部违规文件 |
++| dist 缺 `assets/index-*.js` | 失败:"先跑 gmake build-frontend(vite build 先于 content-build)" |
++| `assets/index-*.js` 多于一个 | 失败,列出文件 |
++| 单篇 md 解析异常(理论上 pulldown 不失败) | 失败并指名文件 |
++| 文件无 git 历史(未提交) | mtime fallback + WARN |
++| content/blog/ 为空/缺失 | WARN,继续(robots 仍产出) |
++| site_url 缺失 | WARN,sitemap/atom 跳过,镜像页无 canonical/OG:url/ssh_hint |
++| 写文件失败(权限等) | 失败,指名路径 |
++
++### 8.12 单元测试(`cargo test -p content-build`,全部必须通过)
++
++1. slug 校验:合法/大写/下划线/中文/`..`/空,逐例断言;
++2. 标题提取:有 H1 / 无 H1(fallback 文件名)/ H1 带行内代码与链接;
++3. 摘要:首段纯文本、折叠空白、160 截断;
++4. HTML:首块 H1 被剥离、push_html 转义(`<script>` 字面量安全)、模板占位符替换
++   后无残留 `{{`;
++5. ANSI:76 列折行(纯 ASCII)、CJK 宽度(宽字符按 2 计,断行位置正确)、样式跨行
++   重发(断言行尾 `\x1b[0m` 与行首重发)、代码块不折行、列表缩进;
++6. .index:排序(TSV 内容断言)、title 含 Tab 被替换;
++7. feed:XML 转义、尾斜杠 URL、atom content 转义;
++8. 首页注入:幂等(注入两遍结果等于一遍)、无文章时不注入。
++
++---
++
++## 9. 规格 B:前端(frontend/)
++
++### 9.1 新文件 `frontend/src/osc.ts`【行为规格】
++
++```ts
++// OSC 7777: 终端 → 浏览器地址栏。payload 不可信(jail 内任意进程可 printf),
++// 只做"同源纯路径"的 replaceState, 天花板 = 地址栏显示一个站内路径。
++import type { Terminal } from "@xterm/xterm";
++
++export function installOsc(term: Terminal, onUrl: (path: string) => void): void;
++```
++
++实现约束(与 §6.2 一一对应):
++
++- `term.parser.registerOscHandler(7777, payload => { …; return true; })`;
++- payload 不以 `url=` 开头 → 直接 `return true`(吞掉);
++- 取 `v = payload.slice(4)`;校验 `v.length >= 1 && v.length <= 512` 且
++  `/^\/[a-z0-9-]*(\/[a-z0-9-]+)*\/?$/.test(v)`,不过 → `return true`;
++- `try { history.replaceState(null, "", v); } catch { /* 忽略 */ }`;
++- `onUrl(v)`,返回 `true`。
++
++### 9.2 `frontend/src/main.ts` 改动(落地页接管状态机)
++
++现有 131 行结构不变(boot → fonts → open → refit → connect → onmessage),新增
++以下逻辑。时序常量:**接管兜底 5000ms;attach 回放宽限 1500ms;淡出 450ms**。
++
++新增模块级状态(顶部,frame 编解码之后):
++
++```ts
++import { installOsc } from "./osc";
++
++// 落地页检测: 镜像页带 <meta name="termblog-slug" content="hello">; 普通页面无此 meta
++const LANDING = document.querySelector<HTMLMetaElement>('meta[name="termblog-slug"]')?.content?.trim() ?? "";
++const onMirror = LANDING !== "";
++let takeoverDone = false;        // 静态层是否已交给终端(一次性)
++let lastAttached = false;        // 最近一次 Opened 的 attached
++let sawData = false;             // 本连接是否已收到 Data(attach 回放标志)
++```
++
++(1)**boot() 内**,`term.open(...)` 之后、`connect()` 之前:
++
++```ts
++installOsc(term, handleOscUrl);
++if (onMirror) {
++  // JS 注入的状态行(无 JS 访客永远看不到, 诚实): 静态层顶部一行小字
++  const s = document.createElement("p");
++  s.className = "mirror-status";
++  s.textContent = "正文由静态镜像渲染, 正在接入真实终端…";
++  document.querySelector("#static-view article")!.prepend(s);
++}
++```
++
++(2)**connect() 的 `T_OPENED` 分支**(`term.reset()`、存 token、`sendResize()` 之后):
++
++```ts
++lastAttached = !!opened.attached;
++if (!lastAttached && onMirror) {
++  // 替访客敲一条命令: 走正常键入通路, 进 zsh 历史, 诚实而非魔法。
++  // 字节在 PTY 输入队列排队, zsh 就绪后按序执行, 无竞态。
++  send(frame(T_DATA, textEnc.encode(`blog ${LANDING}\r`)));
++}
++armFallback(); // 5s 兜底(§9.2 末)
++```
++
++(3)**`T_DATA` 分支**,`term.write(payload)` 之外:
++
++```ts
++if (!sawData) {
++  sawData = true;
++  // attach 场景: 回放里可能没有 OSC(会话停在提示符), 收到数据 1.5s 后仍无 OSC
++  // 就直接接管 —— 老用户回来看的是会话本身, 不必等 blog 命令。
++  if (onMirror && lastAttached && !takeoverDone) {
++    setTimeout(takeOver, 1500);
++  }
++}
++```
++
++(4)**`T_CLOSED` 分支**与 **`socket.onclose`** 末尾各加:
++`if (onMirror && !takeoverDone) revealEnterButton();`
++(会话死了 / WS 断了:静态层保留可读,给出手动入口;若 OSC 稍后才到,takeOver 会
++顺手把按钮重新藏掉,按钮出现不是终态)。
++
++(5)**OSC 回调**:
++
++```ts
++function handleOscUrl(_path: string) {
++  // replaceState 已在 osc.ts 完成; 这里只负责镜像层接管:
++  // 收到本会话首条 OSC = blog 命令已跑起来、内容已在画 —— 此时淡出静态层才不闪。
++  if (onMirror && !takeoverDone) takeOver();
++}
++```
++
++(6)**接管与兜底**:
++
++```ts
++function takeOver() {
++  if (takeoverDone) return;
++  takeoverDone = true;
++  const sv = document.getElementById("static-view");
++  sv?.classList.add("fade-out");            // 400ms 淡出(blog.css)
++  setTimeout(() => sv?.remove(), 450);      // 之后彻底移出 DOM
++  document.getElementById("enter-terminal")?.setAttribute("hidden", "");
++}
++function revealEnterButton() {
++  document.getElementById("enter-terminal")?.removeAttribute("hidden");
++}
++function armFallback() {
++  setTimeout(() => { if (!takeoverDone) revealEnterButton(); }, 5000);
++}
++document.getElementById("enter-terminal")?.addEventListener("click", takeOver);
++```
++
++行为要点(验收依据):
++
++- **静态层是覆盖层而不是 display:none 的兄弟层**:镜像页里 `#static-view` 以
++  `position:absolute` 不透明盖在 `#term-host` 上(§9.3),终端全程保持正常布局,
++  FitAddon 在字体就绪时量的尺寸有效——**绝不可用 display:none 藏 term-host 再切换**,
++  那会让 fit 量到 0 列;
++- 新会话(落地):静态层淡出的**唯一自动信号是首条 OSC 7777**(blog 命令已在画),
++  而不是"首条 Data"(避免把 zsh 启动 MOTD 的半成品亮给用户);5s 无 OSC(jail 满/
++  命令失败/连不上)→ 静态层保留 + 右上角"进入终端"按钮;
++- attach(刷新):scrollback 回放里的 OSC 触发接管(老路径);回放里没有 OSC 时由
++  (3) 的 1.5s 宽限兜底;地址栏由 §6.3 的收敛语义自动恢复;
++- 普通页面(`onMirror == false`):以上全部为 no-op,行为与现在逐字节一致;
++- `enter-terminal` 的 click 绑定对普通页面也执行(元素不存在,`?.` 短路,无害)。
++
++### 9.3 新文件 `frontend/public/blog.css`【完整源码】
++
++```css
++/* blog.css —— M5 静态镜像层 + 文章列表样式。加载于镜像页与注入后的首页。 */
++
++/* #app 变为定位上下文, 静态层以覆盖层姿态盖在终端之上(不能 display:none 终端,
++   否则 FitAddon 量不到尺寸)。inset 与 #app 的 padding 对齐。 */
++#app { position: relative; }
++
++#static-view {
++  position: absolute;
++  inset: 12px;
++  z-index: 20;
++  background: var(--bg);      /* 不透明: 终端在其下就绪但不被看见 */
++  overflow-y: auto;
++  padding: 24px 18px;
++  transition: opacity 400ms ease-out;
++}
++#static-view.fade-out { opacity: 0; pointer-events: none; }
++
++#static-view article {
++  max-width: 80ch;
++  margin: 0 auto;
++  font-size: 15px;
++  line-height: 1.7;
++}
++#static-view article h1 { font-size: 1.6em; margin: 0 0 .6em; }
++#static-view article h2 { font-size: 1.3em; margin: 1.4em 0 .5em; }
++#static-view article h3 { font-size: 1.1em; margin: 1.2em 0 .4em; }
++#static-view article p { margin: .6em 0; }
++#static-view article pre {
++  background: #f0f2f4;
++  border: 1px solid var(--border);
++  border-radius: 6px;
++  padding: 10px 12px;
++  overflow-x: auto;
++}
++#static-view article code { font-family: inherit; }
++#static-view article pre code { padding: 0; background: none; border: 0; }
++#static-view article :not(pre) > code {
++  background: #f0f2f4;
++  border-radius: 4px;
++  padding: 1px 5px;
++}
++#static-view article blockquote {
++  border-left: 3px solid var(--border);
++  margin: .8em 0;
++  padding: 2px 0 2px 14px;
++  color: #6a737d;
++}
++#static-view article a { color: #0969da; }
++#static-view article img { max-width: 100%; }
++.post-meta { color: #6a737d; font-size: 13px; margin-top: 2.5em; }
++
++.mirror-status { color: #6a737d; font-size: 13px; margin: 0 0 1.5em; }
++
++/* 降级手动入口: 由 main.ts 揭示 */
++#enter-terminal {
++  position: fixed;
++  top: 16px;
++  right: 16px;
++  z-index: 30;
++  font: inherit;
++  font-size: 13px;
++  padding: 6px 14px;
++  background: var(--fg);
++  color: var(--bg);
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++}
++#enter-terminal:hover { opacity: .85; }
++
++/* 首页底部文章列表(content-build 注入, 对爬虫与无 JS 访客可见) */
++#blog-index {
++  max-width: 80ch;
++  margin: 0 auto 24px;
++  padding: 8px 12px;
++  border-top: 1px solid var(--border);
++  font-size: 13px;
++  color: #6a737d;
++}
++#blog-index h2 { font-size: 1em; margin: 12px 0 6px; color: var(--fg); }
++#blog-index ul { list-style: none; margin: 0; padding: 0; }
++#blog-index li { margin: 4px 0; }
++#blog-index a { color: #0969da; text-decoration: none; }
++#blog-index .date { color: #6a737d; margin-right: 10px; }
++
++@media (max-width: 640px) {
++  #static-view { inset: 4px; padding: 14px 8px; }
++}
++```
++
++---
++
++## 10. 规格 C:jail 侧(jailtpl/)
++
++### 10.1 新文件 `jailtpl/bin/webctl`【完整源码】
++
++```sh
++#!/bin/sh
++# webctl —— 终端↔网页桥(termblog M5)。
++# 唯一职责: 把 OSC 7777 序列打到 stdout, 由前端的 osc.ts 消费(replaceState)。
++# ssh 客户端不认识该 OSC, 按 VT 规范吞掉, 无副作用。
++# 用法: webctl url /path       (path 必须以 / 开头)
++# 子命令位留给后续(theme 等, 本期不做)。
++
++case "$1" in
++    url)
++        case "$2" in
++            /*) printf '\033]7777;url=%s\007' "$2" ;;
++            *) echo "usage: webctl url /path" >&2; exit 2 ;;
++        esac
++        ;;
++    *)
++        echo "usage: webctl url /path" >&2
++        exit 2
++        ;;
++esac
++```
++
++### 10.2 新文件 `jailtpl/bin/blog`【完整源码】
++
++```sh
++#!/bin/sh
++# blog —— 文章阅读入口(termblog M5)。列表 / 阅读, 与网页镜像同源同文。
++#   blog            列出文章(读 ~/blog/.rendered/.index)
++#   blog <slug>     阅读一篇: 发 OSC 同步地址栏 → less -R → 退出后复位地址栏
++# 模板构建时由 build-template.sh 安装到 /usr/local/bin(0555)。
++
++set -eu
++R="$HOME/blog/.rendered"
++
++case "${1:-}" in
++    "")
++        if [ -f "$R/.index" ]; then
++            cat "$R/.index"
++        else
++            echo "暂无文章(模板里没有 .rendered/.index, 重建模板试试)"
++        fi
++        ;;
++    *)
++        slug=$1
++        case "$slug" in
++            *[!a-z0-9/-]*) echo "blog: 非法 slug: $slug" >&2; exit 2 ;;
++        esac
++        if [ ! -f "$R/$slug" ]; then
++            echo "blog: 没有这篇文章: $slug (敲 blog 看列表)" >&2
++            exit 1
++        fi
++        # 读文章: 先同步地址栏(带尾斜杠 = canonical 形态), less 退出后复位。
++        # webctl 不存在时(旧模板)优雅降级为纯阅读, 不报错。
++        if command -v webctl >/dev/null 2>&1; then
++            webctl url "/blog/$slug/"
++        fi
++        less -R "$R/$slug" || true
++        if command -v webctl >/dev/null 2>&1; then
++            webctl url /
++        fi
++        ;;
++esac
++```
++
++(slug 白名单 `[a-z0-9/-]` 与 §5.1 一致;`..` 因不含点字符天然不可构造,拼接
++`$R/$slug` 无逃逸。)
++
++### 10.3 `jailtpl/build-template.sh` 修改
++
++三处,其余不动:
++
++**(a) 第 6 步的 .zshrc heredoc 整体替换为**(新增两行:`export LANG=C.UTF-8`
++保证中文在 less/zsh 里按字符处理;末尾 MOTD 提示 blog 命令 —— 每个会话 jail 都是
++全新实例,每次登录提示一次恰好):
++
++```sh
++cat > "$MOUNT/home/$GUEST/.zshrc" <<'EOF'
++# termblog guest shell —— 每个访客一个真实 FreeBSD jail
++export PATH=/usr/local/bin:/usr/bin:/bin
++export LANG=C.UTF-8
++umask 022
++PS1='%F{green}blog@jail%f %~ %# '
++setopt INTERACTIVE_COMMENTS
++echo '博客: 敲 blog 看文章列表, blog <slug> 读一篇(如 blog hello)'
++EOF
++```
++
++**(b) 第 7 步内容拷贝之后新增 7.5 步**(脚本目录下 bin/ 两个脚本装进模板,guest 的
++受限 PATH 第一位就是 /usr/local/bin):
++
++```sh
++# 7.5 blog / webctl 命令(0555, 只读; .rendered/ 已随第 7 步 content 拷贝进 ~/blog)
++if [ -d "$SCRIPT_DIR/bin" ]; then
++    install -m 555 "$SCRIPT_DIR/bin/blog" "$SCRIPT_DIR/bin/webctl" "$MOUNT/usr/local/bin/"
++fi
++```
++
++**(c)** 无(readonly/快照收尾逻辑不变;`~/blog/.rendered/` 的属主跟随既有
++`chown -R 1001:1001`)。
++
++### 10.4 示例文章与 README(内容目录)
++
++`jailtpl/content/blog/hello.md`(同时是 ANSI/HTML 渲染器的联合测试夹具,覆盖:
++H1/H2、段落、CJK 折行、行内代码、粗斜体、链接、列表、引用、围栏代码块、分隔线):
++
++````markdown
++# 你好, 世界
++
++这是 termblog 的第一篇文章。你现在读到的, 是同一份 markdown 的两种投影之一:
++搜索引擎看到的是这个静态镜像, 终端用户看到的是 `blog hello` 的排版输出。
++
++## 两种入口, 一个源头
++
++- 网页:打开 `/blog/hello/`,几秒后由真实终端接管
++- SSH:`ssh -p 2222 blog@<host>`,然后敲 `blog hello`
++
++> 文章本体只有一个:`jailtpl/content/blog/hello.md`,其余全是编译产物。
++
++## 排版自检
++
++```sh
++$ blog hello
++```
++
++行内代码 `less -R`、**粗体**、*斜体* 与 [链接](https://example.com) 会被两种
++渲染器各自正确呈现;中文段落按 76 列折行,连字符与标点悬挂不做特殊处理。
++
++---
++
++这里是分隔线之后的一段,验证块间距。
++````
++
++`jailtpl/content/blog/why-a-terminal-blog.md`(第二篇,给列表排序/收敛验收用;
++两三段即可,内容随意但须含一个 H1 与至少一段中文长段落)。
++
++`jailtpl/content/README.md` 替换为:
++
++```markdown
++# 博客内容目录
++
++build-template.sh 会把这里的全部文件拷进 jail 模板的 ~/blog/。约定:
++
++- 文章放 `blog/` 子树:每篇一个 md,**无 frontmatter**;
++- 文件名即 slug,字符集限 `[a-z0-9/-]`(违规构建失败):`blog/hello.md` →
++  网页 `/blog/hello/`、终端 `blog hello`;
++- 标题取文中第一个 `# 一级标题`(缺失则用文件名);日期取 git 最后提交时间;
++- 顶层散文件(本 README、about.md)只进 jail,不进镜像与 feed;
++- `blog/` 下的 md 由 content-build 同时编译为网页镜像(frontend/dist/blog/)与
++  终端预渲染(.rendered/,均为生成物,勿手改、勿提交)。
++```
++
++---
++
++## 11. 规格 D:配置与构建集成
++
++### 11.1 配置增量
++
++`crates/core/src/config.rs` 的 `WebConfig` 增加字段(serde default,向后兼容,
++三个服务的二进制行为不变):
++
++```rust
++/// 站点对外绝对地址(https://host[:port], 尾部不带 /)。
++/// canonical / sitemap / atom / OG 的前缀, 仅 content-build 消费。
++pub site_url: Option<String>,
++```
++
++`WebConfig::default()` 里为 `None`。`etc/termblog.toml` 的 `[web]` 段追加(**保持
++注释态**——deploy-root.sh 会把样例刷成生产配置,占位域名直接生效会造成 canonical
++指向 example.com):
++
++```toml
++# 站点对外绝对地址(不带尾斜杠)。canonical/sitemap/atom/OG 用;不设则镜像页
++# 照常生成, 只是不产出 sitemap/atom 与 canonical(部署后务必设置!)
++# site_url = "https://your-real-domain.example.com"
++```
++
++### 11.2 Makefile 修改
++
++```make
++BIN_CONTENT := target/release/content-build
++```
++
++目标改动(其余不动;`.PHONY` 加 `build-content`):
++
++```make
++# 内容编译器: md → HTML 镜像(进 dist) + ANSI 预渲染(进 jailtpl/content/.rendered)
++# 注意顺序: 必须在 vite build 之后跑(产物写入 dist 且需读 assets/index-*.js)
++build-content:
++	cargo build --release -p content-build
++	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
++
++# ── 构建: 一次产出 web + ssh + jaild 三个二进制 + 前端 + 内容镜像 ──
++build: build-frontend
++	cargo build --release
++	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
++```
++
++`clean` 目标追加一行:`rm -rf jailtpl/content/.rendered`。
++
++(vite build 清空 dist → 镜像被冲掉的风险由此顺序消解:任何 `gmake build` 都以
++content-build 收尾;单独重跑 `gmake build-frontend` 后记得 `gmake build-content`。)
++
++### 11.3 .gitignore
++
++追加一行(生成物不入库):
++
++```
++jailtpl/content/.rendered/
++```
++
++### 11.4 新文件 `scripts/update-content.sh`【完整源码】(内容更新 runbook)
++
++背景:内容更新涉及两侧——静态镜像(纯文件,即时生效)与 jail 模板(readonly ZFS
++快照,必须销毁重建;重建会杀掉全部在线会话,且模板快照在有会话 clone 残留时删不掉,
++必须先清)。该流程做成脚本而非手改 deploy-root.sh:通用部署脚本不应背负"销毁模板"
++这种破坏性逻辑。
++
++```sh
++#!/bin/sh
++# update-content.sh —— 内容更新两步走(root 运行)
++#
++#   sh scripts/update-content.sh               # 镜像 + jail 两侧(重建模板, 杀会话)
++#   sh scripts/update-content.sh --static-only # 只发布静态镜像(jail 侧下次重建跟进)
++#
++# 前提: 文章 md 已改好并提交(git 日期进 sitemap/atom)。
++
++set -eu
++REPO=/home/yzs/termblog
++STATIC_DIR=/usr/local/share/termblog/frontend
++
++[ "$(id -u)" -eq 0 ] || { echo "需要 root (service/zfs/install)"; exit 1; }
++
++echo ">> 1/3 编译内容(以 yzs, 产物进 frontend/dist 与 jailtpl/content/.rendered)"
++su -l yzs -c "cd $REPO && gmake build-content"
++
++echo ">> 2/3 发布静态镜像(纯文件替换, 无感, 不重启)"
++rm -rf "$STATIC_DIR/blog"
++cp -R "$REPO/frontend/dist/." "$STATIC_DIR/"
++
++if [ "${1:-}" = "--static-only" ]; then
++    echo ">> 完成(仅镜像)。jail 侧将在下次模板重建时跟进。"
++    exit 0
++fi
++
++echo ">> 3/3 重建 jail 模板(杀掉全部在线会话, 走 deploy-root.sh 全流程)"
++service termblog stop 2>/dev/null || true
++service jaild stop 2>/dev/null || true
++sleep 5
++# 会话 jail 持有模板快照的 clone, 不先清掉则 zfs destroy template 失败
++for j in $(jls name 2>/dev/null | grep '^s-'); do
++    jail -r "$j" 2>/dev/null || true
++done
++for ds in $(zfs list -H -o name -r zroot/jails 2>/dev/null | grep 'zroot/jails/s-'); do
++    zfs destroy -f "$ds" 2>/dev/null || true
++done
++zfs destroy -r zroot/jails/template 2>/dev/null || true
++sh "$REPO/scripts/deploy-root.sh"
++```
++
++说明:镜像侧与 jail 侧允许短暂不一致(镜像先新、jail 后新),可接受;`--static-only`
++就是利用这一点做"发布即可读"的快路径。deploy-root.sh 本身**零修改**:其
++`gmake build` 链已含 content-build,`cp -R frontend/dist/.` 已携带镜像产物,模板
++不存在时会自动重建。
++
++---
++
++## 12. 安全与 SEO 红线(实现自检清单,逐条对照)
++
++**SEO(踩线即作弊,不可越)**
++
++- [ ] 无 UA 嗅探、无 cloaking:所有 UA 拿到同一份 HTML;静态层对真人同样可见
++      (几秒后被终端接管),Googlebot 与无 JS 访客停留在完整全文;
++- [ ] 每个镜像页:canonical(设 site_url 时)指向 `site_url + /blog/<slug>/`,
++      OG:title/description/type=article/url/site_name 齐备,`<title>` 含文章标题;
++- [ ] 全站内部链接(首页 footer、/blog/ 列表、atom)统一**尾斜杠**形态,与
++      canonical 一致(§4.1 的 307 实测结论);
++- [ ] 无 JS / 配额满 / WS 失败:文章完整可读(静态层不被移除);
++- [ ] 首页静态链接列表保证爬虫无 sitemap 也能沿链接发现全部文章;
++- [ ] sitemap/atom 通过 `xmllint --noout`。
++
++**安全**
++
++- [ ] osc.ts:payload 仅 `url=` + 同源纯路径白名单(§6.2),只 replaceState;
++- [ ] blog 脚本 slug 白名单 + 存在性检查,无路径逃逸;
++- [ ] webctl 参数必须 `/` 开头,其余 usage 报错;
++- [ ] HTML 输出全转义(push_html + 手写模板值的属性转义);
++- [ ] 数据面(proto/jaild/ssh/web)零改动 —— diff 审查确认。
++
++---
++
++## 13. 里程碑与验收(M5.1 → M5.4,顺序执行)
++
++> 验收命令均从仓库根执行;`$DEV` 指 §4 条目 4 的开发实例
++> (`TERMBLOG_CONFIG=/nonexistent.toml TERMBLOG_LISTEN=127.0.0.1:18099 ./target/release/termblog-web &`)。
++> `[root]` 需 root;`[人工]` 需人类开浏览器。
++
++### M5.1 编译器(content-build + 示例内容 + config 字段)
++
++交付:crate、示例文章(§10.4)、config site_url(§11.1)、Makefile(§11.2)、
++.gitignore(§11.3)、blog.css 占位可后补(前端不本步重点)。
++
++验收(全绿才进 M5.2):
++
++```sh
++cargo test -p content-build                 # §8.12 全过
++gmake build                                 # 全链路构建成功(无 site_url: 无 sitemap, 有 WARN, 预期)
++ls frontend/dist/blog/hello/index.html frontend/dist/blog/index.html
++ls jailtpl/content/.rendered/hello jailtpl/content/.rendered/.index
++
++# 带 site_url 再跑一遍编译器, 验 feed(本地验收用参数覆盖; 未提交的示例文章走
++# mtime fallback, 出现 WARN 是预期):
++target/release/content-build --content jailtpl/content --dist frontend/dist \
++    --site-url https://blog.example.com
++ls frontend/dist/sitemap.xml frontend/dist/atom.xml frontend/dist/robots.txt
++xmllint --noout frontend/dist/sitemap.xml frontend/dist/atom.xml && echo XML_OK
++grep -q '/blog/hello/' frontend/dist/sitemap.xml
++grep -q '<entry>' frontend/dist/atom.xml
++grep -q 'Sitemap: https://blog.example.com/sitemap.xml' frontend/dist/robots.txt
++grep -q 'termblog-slug' frontend/dist/blog/hello/index.html
++grep -q '<article>' frontend/dist/blog/hello/index.html
++grep -c 'termblog:blog-index' frontend/dist/index.html   # = 2(BEGIN+END 各一次)
++
++# 静态服务实测(ServeDir 尾斜杠语义):
++$DEV
++curl -s http://127.0.0.1:18099/blog/hello/ | grep -q 'termblog-slug'    # 200
++curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18099/blog/hello   # 307 → /blog/hello/
++kill %1
++
++# ANSI 侧人工核对面板:
++less -R jailtpl/content/.rendered/hello    # 标题加粗/折行/代码块缩进/颜色正常
++# 幂等: 连跑两遍 content-build, diff 产物无变化; 删一篇 md 重跑, dist/blog/<slug>/ 消失
++```
++
++### M5.2 jail 侧(webctl + blog + 模板重建)`[root]`
++
++交付:webctl、blog(§10.1/§10.2)、build-template.sh 修改(§10.3)、
++`scripts/update-content.sh`(§11.4 —— 本步就需要它来重建模板:模板数据集已存在,
++直接重跑 build-template.sh 会被拒绝,必须走"清会话 clone → destroy 模板 →
++deploy-root.sh 重建"的流程,脚本已封装)。
++
++验收(模板重建后;ssh 参数沿用 verify-jail.sh 的样式,下文以 `$SSH` 指代):
++
++```sh
++SSH="ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
++     -o PreferredAuthentications=none -o LogLevel=ERROR blog@127.0.0.1"
++
++# webctl/blog 已就位(输出两行路径即通过):
++(sleep 2; printf 'command -v blog\ncommand -v webctl\n'; sleep 1) | timeout 10 $SSH
++
++# blog 列表(日期倒序、含标题):
++(sleep 2; printf 'blog\n'; sleep 1) | timeout 10 $SSH 2>&1 | tr -d '\r' | grep hello
++
++# OSC 逐字节可见: cat -v 把 ESC 显示为 ^[、BEL 显示为 ^G。
++# 进入与复位两条都要有(注意 grep -F 字面量, BEL 在行尾是 ^G 不是行结束):
++(sleep 2; printf 'blog hello\n'; sleep 3) | timeout 15 $SSH 2>&1 | cat -v \
++  | grep -cF ']7777;url='                          # ≥ 2
++(sleep 2; printf 'blog hello\n'; sleep 3) | timeout 15 $SSH 2>&1 | cat -v \
++  | grep -qF ']7777;url=/blog/hello/^G'            # 进入: /blog/hello/
++(sleep 2; printf 'blog hello\n'; sleep 3) | timeout 15 $SSH 2>&1 | cat -v \
++  | grep -qF ']7777;url=/^G'                       # 复位: /
++# less 在无 pty 的管道里可能打印 "WARNING: terminal is not fully functional", 无害
++
++# 纯 ssh 会话无杂质(未知 OSC 被客户端吞掉, 肉眼无异样):
++(sleep 2; printf 'echo CLEAN_$((6*7))\n'; sleep 1) | timeout 10 $SSH 2>&1 | tr -d '\r' | grep CLEAN_42
++# 中文正常(jail 内 LANG=C.UTF-8, less 按 UTF-8 处理):
++(sleep 2; printf 'blog hello\n'; sleep 3) | timeout 15 $SSH 2>&1 | grep -q '你好'
++```
++
++`[人工]`:手机窄终端 ssh 读一篇,确认 76 列内容软换行可接受。
++
++### M5.3 前端(osc.ts + 接管状态机)
++
++验收:
++
++```sh
++cd frontend && npx tsc --noEmit && cd ..     # 类型过
++gmake build && $DEV
++# 镜像页 DOM 结构就位(静态层 + 手动入口按钮在源码里; 5s 揭示与淡出是 JS 行为,
++# 属 [人工] 项):
++curl -s http://127.0.0.1:18099/blog/hello/ | grep -q 'id="static-view"'
++curl -s http://127.0.0.1:18099/blog/hello/ | grep -q 'id="enter-terminal"'
++curl -s http://127.0.0.1:18099/blog/hello/ | grep -q 'assets/index-'   # 注入了带 hash 的入口 JS
++kill %1
++```
++
++`[人工]`(对生产实例 :8080;root 先发布新前端:`su -l yzs -c "cd /home/yzs/termblog && gmake build"`,
++再 `sh scripts/update-content.sh --static-only` 同步 dist):
++
++1. 打开 `http://<host>:8080/blog/hello/`:静态正文秒开 → 数秒内淡出,终端显示
++   `blog@jail ~ % blog hello` 与 less 内容 —— 与 ssh 敲同一命令逐字节一致;
++2. 终端里 `blog why-a-terminal-blog`:地址栏变为 `/blog/why-a-terminal-blog/`,
++   页面不刷新;`q` 退出后地址栏回到 `/`;
++3. 读文中刷新页面:接回原会话,scrollback 恢复画面,地址栏收敛回 `/blog/.../`;
++4. 首页(无 slug):行为与现在完全一致,无静态层、无自动敲命令;滚到底部可见
++   文章列表(带链接);
++5. 停掉 jaild(或占满配额)再开落地页:静态层保留可读,右上角"进入终端"出现。
++
++### M5.4 收尾(部署链 + 验收脚本)
++
++交付:`scripts/verify-m5.sh`【完整源码如下】+ update-content.sh(§11.4)。
++
++```sh
++#!/bin/sh
++# verify-m5.sh —— M5 验收(非 root, 需生产实例在跑; root 项标 [root])
++BASE=${1:-http://127.0.0.1:8080}
++SSH="ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
++     -o PreferredAuthentications=none -o LogLevel=ERROR blog@127.0.0.1"
++pass=0; fail=0
++check() { if [ "$1" -eq 0 ]; then echo "✅ $2"; pass=$((pass+1)); else echo "❌ $2"; fail=$((fail+1)); fi }
++
++echo "== 1. 镜像页 =="
++curl -sf "$BASE/blog/hello/" | grep -q '<article>'
++check $? "GET /blog/hello/ 返回含 <article> 的静态页"
++curl -sf "$BASE/blog/hello/" | grep -q 'name="termblog-slug" content="hello"'
++check $? "镜像页带 termblog-slug meta"
++curl -sf -o /dev/null -w '%{http_code}' "$BASE/blog/hello" | grep -q 307
++check $? "无尾斜杠 307 → 尾斜杠(canonical 形态)"
++
++echo "== 2. 发现链路 =="
++curl -sf "$BASE/" | grep -q 'termblog:blog-index'
++check $? "首页含注入的文章列表"
++curl -sf "$BASE/blog/" | grep -q '/blog/hello/'
++check $? "/blog/ 列表页含文章链接"
++
++echo "== 3. feed =="
++if grep -q '^site_url' /usr/local/etc/termblog.toml 2>/dev/null; then
++    curl -sf "$BASE/sitemap.xml" -o /tmp/m5-sitemap.xml
++    check $? "sitemap.xml 可取"
++    xmllint --noout /tmp/m5-sitemap.xml
++    check $? "sitemap.xml 是合法 XML"
++    curl -sf "$BASE/atom.xml" -o /tmp/m5-atom.xml && xmllint --noout /tmp/m5-atom.xml
++    check $? "atom.xml 可取且合法"
++else
++    echo "⚠️ 跳过 sitemap/atom 检查(未配置 web.site_url)"
++fi
++curl -sf "$BASE/robots.txt" | grep -q '^Allow: /'
++check $? "robots.txt 允许全站"
++
++echo "== 4. jail 侧 [需 ssh 通] =="
++(sleep 2; printf 'blog\n'; sleep 1) | timeout 10 $SSH 2>&1 | tr -d '\r' | grep -q hello
++check $? "ssh: blog 列表含 hello"
++(sleep 2; printf 'blog hello\n'; sleep 3) | timeout 15 $SSH 2>&1 | cat -v \
++  | grep -qF ']7777;url=/blog/hello/^G'
++check $? "ssh: blog hello 发出 OSC(进入)"
++(sleep 2; printf 'blog hello\n'; sleep 3) | timeout 15 $SSH 2>&1 | cat -v \
++  | grep -qF ']7777;url=/^G'
++check $? "ssh: 退出 less 后 OSC 复位 /"
++
++echo ""
++echo "== 结果: $pass 通过, $fail 失败 =="
++[ "$fail" -eq 0 ]
++```
++
++终验收(全链路):
++
++```sh
++gmake build && gmake install        # install 的 cp -R 已携带镜像产物 [root]
++sh scripts/verify-m5.sh             # 全绿
++sh scripts/verify-jail.sh [root]    # 16 项不回归
++```
++
++`[人工]`:Google Search Console 提交 sitemap(需真实域名 + site_url 配置);URL
++检查工具抓 `/blog/hello/` 应返回"已编入索引"可读全文。
++
++---
++
++## 14. 风险与预案
++
++| 风险 | 预案 |
++|---|---|
++| jail 内访客伪造 OSC 7777(printf 任意 payload) | osc.ts 只认 `url=` + 同源纯路径白名单;只 replaceState 不导航;天花板="地址栏显示站内路径"(§6.2) |
++| slug 特殊字符/中文文件名 | 构建期白名单 `^[a-z0-9/-]+$`,违规即失败,不做运行期转义(§5.1) |
++| vite build 清空 dist 冲掉镜像 | 构建顺序固定 vite → content-build;Makefile 显式排序 + content-build 的入口 JS glob 自检(缺则报错)(§8.3/§11.2) |
++| entry JS 文件名带 hash,镜像页无法静态引用 | content-build glob `assets/index-*.js` 注入(恰 1 个,否则失败)(§8.3) |
++| 静态层盖住终端导致 fit 量不到尺寸 | 静态层是不透明覆盖层(position:absolute),终端保持正常布局,禁止 display:none(§9.2/§9.3) |
++| 自动敲命令与 MOTD/zsh 启动竞态 | 命令字节在 PTY 输入队列排队,zsh 就绪后按序执行;接管时机以首条 OSC 为准而非首字节(§9.2) |
++| 接管超时(jail 满/命令失败) | 5s 兜底:静态层保留 + "进入终端"手动入口,降级即静态博客(§9.2) |
++| attach 回放里没有 OSC(会话停在提示符) | 收到首帧 Data 后 1.5s 宽限即接管;URL 以最后一次 replaceState 为准(§9.2) |
++| scrollback 128KiB 截断把 OSC 拦腰截断 | 退化为纯文本上屏,不产生错误跳转;既有 ANSI 截断问题,不处理(§6.3) |
++| git 日期在 shallow clone/脏树失效 | fallback mtime + 构建告警(§5.2) |
++| 镜像与 jail 模板短暂不一致 | 接受;update-content.sh 的两段式流程(镜像即时、jail 重建)即为此设计(§11.4) |
++| 模板重建时有会话 clone 残留导致 destroy 失败 | update-content.sh 先 `jail -r` + 清 s-* 数据集再 destroy(§11.4) |
++| 生产配置误带占位 site_url(example.com 进 canonical) | 样例保持注释态;部署后人工设置(§11.1) |
++| ANSI 76 列 vs 更窄终端 | less -R 软换行兜底;76 覆盖绝大多数;按需实时渲染本期不做 |
++
++---
++
++## 15. 明确不做(本期)
++
++webctl 除 `url` 外的子命令(theme 等)、文章内互链在终端里的可点击化、实时(按
++终端宽度)markdown 渲染、评论、Anubis 前置、多语言 slug、顶层散文件(about.md 等)
++的镜像、`/blog/` 列表页引导终端、sitemap 分页、JSON feed。
+diff --git a/scripts/update-content.sh b/scripts/update-content.sh
+new file mode 100755
+index 0000000..2869e39
+--- /dev/null
++++ b/scripts/update-content.sh
+@@ -0,0 +1,41 @@
++#!/bin/sh
++# update-content.sh —— 内容更新两步走(root 运行)
++#
++#   sh scripts/update-content.sh               # 镜像 + jail 两侧(重建模板, 杀会话)
++#   sh scripts/update-content.sh --static-only # 只发布静态镜像(jail 侧下次重建跟进)
++#
++# 前提: 文章 md 已改好并提交(git 日期进 sitemap/atom)。
++
++set -eu
++REPO=/home/yzs/termblog
++STATIC_DIR=/usr/local/share/termblog/frontend
++
++[ "$(id -u)" -eq 0 ] || { echo "需要 root (service/zfs/install)"; exit 1; }
++
++echo ">> 1/3 编译内容(以 yzs, 产物进 frontend/dist 与 jailtpl/content/.rendered)"
++su -l yzs -c "cd $REPO && gmake build-content"
++
++echo ">> 2/3 发布静态镜像(纯文件替换, 无感, 不重启)"
++rm -rf "$STATIC_DIR/blog"
++cp -R "$REPO/frontend/dist/." "$STATIC_DIR/"
++# 保证 www 可读(曾出过 600 权限导致 /blog.css 404 的事故)
++chmod -R a+rX "$STATIC_DIR"
++
++if [ "${1:-}" = "--static-only" ]; then
++    echo ">> 完成(仅镜像)。jail 侧将在下次模板重建时跟进。"
++    exit 0
++fi
++
++echo ">> 3/3 重建 jail 模板(杀掉全部在线会话, 走 deploy-root.sh 全流程)"
++service termblog stop 2>/dev/null || true
++service jaild stop 2>/dev/null || true
++sleep 5
++# 会话 jail 持有模板快照的 clone, 不先清掉则 zfs destroy template 失败
++for j in $(jls name 2>/dev/null | grep '^s-'); do
++    jail -r "$j" 2>/dev/null || true
++done
++for ds in $(zfs list -H -o name -r zroot/jails 2>/dev/null | grep 'zroot/jails/s-'); do
++    zfs destroy -f "$ds" 2>/dev/null || true
++done
++zfs destroy -r zroot/jails/template 2>/dev/null || true
++sh "$REPO/scripts/deploy-root.sh"
+diff --git a/scripts/verify-m5.sh b/scripts/verify-m5.sh
+new file mode 100755
+index 0000000..b801762
+--- /dev/null
++++ b/scripts/verify-m5.sh
+@@ -0,0 +1,50 @@
++#!/bin/sh
++# verify-m5.sh —— M5 验收(非 root, 需生产实例在跑; root 项标 [root])
++BASE=${1:-http://127.0.0.1:8080}
++SSH="ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
++     -o PreferredAuthentications=none -o LogLevel=ERROR blog@127.0.0.1"
++pass=0; fail=0
++check() { if [ "$1" -eq 0 ]; then echo "✅ $2"; pass=$((pass+1)); else echo "❌ $2"; fail=$((fail+1)); fi }
++
++echo "== 1. 镜像页 =="
++curl -sf "$BASE/blog/hello/" | grep -q '<article>'
++check $? "GET /blog/hello/ 返回含 <article> 的静态页"
++curl -sf "$BASE/blog/hello/" | grep -q 'name="termblog-slug" content="hello"'
++check $? "镜像页带 termblog-slug meta"
++curl -sf -o /dev/null -w '%{http_code}' "$BASE/blog/hello" | grep -q 307
++check $? "无尾斜杠 307 → 尾斜杠(canonical 形态)"
++
++echo "== 2. 发现链路 =="
++curl -sf "$BASE/" | grep -q 'termblog:blog-index'
++check $? "首页含注入的文章列表"
++curl -sf "$BASE/blog/" | grep -q '/blog/hello/'
++check $? "/blog/ 列表页含文章链接"
++
++echo "== 3. feed =="
++if grep -q '^site_url' /usr/local/etc/termblog.toml 2>/dev/null; then
++    curl -sf "$BASE/sitemap.xml" -o /tmp/m5-sitemap.xml
++    check $? "sitemap.xml 可取"
++    xmllint --noout /tmp/m5-sitemap.xml
++    check $? "sitemap.xml 是合法 XML"
++    curl -sf "$BASE/atom.xml" -o /tmp/m5-atom.xml && xmllint --noout /tmp/m5-atom.xml
++    check $? "atom.xml 可取且合法"
++else
++    echo "⚠️ 跳过 sitemap/atom 检查(未配置 web.site_url)"
++fi
++curl -sf "$BASE/robots.txt" | grep -q '^Allow: /'
++check $? "robots.txt 允许全站"
++
++echo "== 4. jail 侧 [需 ssh 通] =="
++(sleep 2; printf 'blog\n'; sleep 1) | timeout 10 $SSH 2>&1 | tr -d '\r' | grep -q hello
++check $? "ssh: blog 列表含 hello"
++(sleep 2; printf 'blog ~/blog/blog/hello.md\n'; sleep 3) | timeout 15 $SSH 2>&1 | cat -v \
++  | grep -qF ']7777;url=/blog/hello/^G'
++check $? "ssh: blog 读 md 发出 OSC(进入)"
++# 复位检查按真实阅读路径: 读完后敲 q 退出 less, blog 脚本随后把地址栏复位为 /
++(sleep 2; printf 'blog ~/blog/blog/hello.md\n'; sleep 2; printf 'q'; sleep 1) | timeout 15 $SSH 2>&1 | cat -v \
++  | grep -qF ']7777;url=/^G'
++check $? "ssh: 退出 less 后 OSC 复位 /"
++
++echo ""
++echo "== 结果: $pass 通过, $fail 失败 =="
++[ "$fail" -eq 0 ]

@@ -14,4 +14,7 @@ termblog-config = { path = "../../config" }
 termblog-proto = { path = "../proto" }
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+termblog-commentd = { path = "../commentd" }
 tower-http = { version = "0.6", features = ["fs"] }

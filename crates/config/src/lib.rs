@@ -1,4 +1,4 @@
-//! 全局配置(TOML)。web / ssh / jaild 三个服务器二进制与 content-build 共用同一份配置文件。
+//! 全局配置(TOML)。web / ssh / jaild / commentd 与 content-build 共用同一份配置文件。
 
 use std::path::{Path, PathBuf};
 
@@ -8,13 +8,14 @@ use serde::Deserialize;
 /// 默认配置路径(不存在时退回内置默认值, 方便开发)。
 pub const DEFAULT_CONFIG: &str = "/usr/local/etc/termblog.toml";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub web: WebConfig,
     pub ssh: SshConfig,
     pub session: SessionConfig,
     pub jail: JailConfig,
+    pub comments: CommentsConfig,
 }
 
 impl Config {
@@ -25,22 +26,57 @@ impl Config {
             Some(p) => p.to_path_buf(),
             None => PathBuf::from(DEFAULT_CONFIG),
         };
-        if p.exists() {
-            let s = std::fs::read_to_string(&p).with_context(|| format!("读配置 {}", p.display()))?;
+        let cfg = if p.exists() {
+            let s =
+                std::fs::read_to_string(&p).with_context(|| format!("读配置 {}", p.display()))?;
             toml::from_str(&s).with_context(|| format!("解析配置 {}", p.display()))
         } else {
             Ok(Config::default())
+        }?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let c = &self.comments;
+        if !c.public_socket.is_absolute()
+            || !c.private_socket.is_absolute()
+            || !c.data_dir.is_absolute()
+            || !c.targets_file.is_absolute()
+        {
+            anyhow::bail!("comments 的 socket、data_dir 与 targets_file 必须是绝对路径");
         }
+        if c.public_socket == c.private_socket {
+            anyhow::bail!("comments public/private socket 不能相同");
+        }
+        if c.public_socket == self.jail.socket || c.private_socket == self.jail.socket {
+            anyhow::bail!("comments socket 不能与 jail socket 相同");
+        }
+        if c.session_drain_ms == 0 {
+            anyhow::bail!("comments drain 超时必须大于 0");
+        }
+        Ok(())
     }
 }
 
-impl Default for Config {
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CommentsConfig {
+    pub public_socket: PathBuf,
+    pub private_socket: PathBuf,
+    pub data_dir: PathBuf,
+    pub targets_file: PathBuf,
+    pub session_drain_ms: u64,
+}
+
+impl Default for CommentsConfig {
     fn default() -> Self {
         Self {
-            web: WebConfig::default(),
-            ssh: SshConfig::default(),
-            session: SessionConfig::default(),
-            jail: JailConfig::default(),
+            public_socket: PathBuf::from("/var/run/commentd-public.sock"),
+            private_socket: PathBuf::from("/var/run/commentd-private.sock"),
+            data_dir: PathBuf::from("/var/db/termblog-commentd"),
+            targets_file: PathBuf::from("/usr/local/share/termblog/comment-targets.tsv"),
+            session_drain_ms: 1000,
         }
     }
 }
@@ -102,7 +138,11 @@ pub struct SessionConfig {
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { max_total: 64, max_per_ip: 3, hard_lifetime_secs: 7200 }
+        Self {
+            max_total: 64,
+            max_per_ip: 3,
+            hard_lifetime_secs: 7200,
+        }
     }
 }
 
@@ -150,4 +190,3 @@ impl Default for JailConfig {
         }
     }
 }
-

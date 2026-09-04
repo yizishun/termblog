@@ -7,6 +7,7 @@
 //!
 //!   blog                列出文章(~/.rendered/.index)
 //!   blog hello          = blog ~/blog/hello.md, 读预渲染排版
+//!   blog ~/help.md       读首页说明, 并显示首页留言
 //!   blog <其他文件.md>   像 cat 一样读原始内容(不渲染、不同步地址栏)
 //!
 //! 读 ~/blog/ 下文章时: 进入同步地址栏 /blog/<slug>/(尾斜杠 = canonical 形态),
@@ -20,6 +21,7 @@
 //! reader(TUI 阅读器)与 iip(IIP 编码器)是 blog 命令的私有实现, 不是独立
 //! 命令, 故作为本模块的子模块放在 blog/ 目录下。
 
+mod comments;
 mod iip;
 mod reader;
 
@@ -81,6 +83,7 @@ pub fn run(args: &[String]) -> i32 {
             file = cwd.join(file);
         }
     }
+    let is_home_help = file == home.join("help.md");
 
     // 文件在 ~/blog/ 下 → 算 slug 并同步地址栏(带尾斜杠 = canonical 形态)
     // slug 白名单 [a-z0-9/-] 与内容编译器一致, 违规则不同步(仅阅读)
@@ -94,6 +97,7 @@ pub fn run(args: &[String]) -> i32 {
         let rp = rendered_dir.join(&slug);
         if rp.is_file() {
             if let Some(code) = self::reader::try_run(&slug, &home, &rp) {
+                render_article_comments(&slug);
                 emit_osc("/");
                 return code;
             }
@@ -121,9 +125,32 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     if !slug.is_empty() {
+        render_article_comments(&slug);
         emit_osc("/");
+    } else if is_home_help {
+        comments::render("/", "暂无留言 —— echo 'alice: 你好' > ~/comment 写第一条");
     }
     0
+}
+
+fn render_article_comments(slug: &str) {
+    let (target, fifo) = comment_location_for_slug(slug);
+    comments::render(
+        &target,
+        &format!("暂无评论 —— echo 'alice: 好文' > {fifo} 写第一条"),
+    );
+}
+
+fn comment_location_for_slug(slug: &str) -> (String, String) {
+    let directory = slug.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+    if directory.is_empty() {
+        ("/blog/".into(), "~/blog/comment".into())
+    } else {
+        (
+            format!("/blog/{directory}/"),
+            format!("~/blog/{directory}/comment"),
+        )
+    }
 }
 
 /// 文件在 ~/blog/ 下且以 .md 结尾 → 相对 slug; 白名单 [a-z0-9/-] 校验
@@ -142,7 +169,11 @@ fn slug_of(file: &Path, blog_dir: &Path) -> String {
         && stem
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '-');
-    if valid { stem.to_string() } else { String::new() }
+    if valid {
+        stem.to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn emit_osc(path: &str) {
@@ -167,13 +198,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn comments_attach_to_immediate_article_directory() {
+        assert_eq!(
+            comment_location_for_slug("hello"),
+            ("/blog/".into(), "~/blog/comment".into())
+        );
+        assert_eq!(
+            comment_location_for_slug("topic/one"),
+            ("/blog/topic/".into(), "~/blog/topic/comment".into())
+        );
+        assert_eq!(
+            comment_location_for_slug("topic/deep/two"),
+            (
+                "/blog/topic/deep/".into(),
+                "~/blog/topic/deep/comment".into(),
+            )
+        );
+    }
+
+    #[test]
     fn slug_whitelist() {
         let bd = Path::new("/home/guest/blog");
         assert_eq!(slug_of(Path::new("/home/guest/blog/hello.md"), bd), "hello");
         assert_eq!(slug_of(Path::new("/home/guest/blog/a/b/c.md"), bd), "a/b/c");
-        assert_eq!(slug_of(Path::new("/home/guest/blog/a-b/9x.md"), bd), "a-b/9x");
+        assert_eq!(
+            slug_of(Path::new("/home/guest/blog/a-b/9x.md"), bd),
+            "a-b/9x"
+        );
         assert_eq!(slug_of(Path::new("/home/guest/blog/x.md.md"), bd), ""); // 残留 . 不在白名单
-        // 违规: 大写/非白名单字符/双斜杠/目录外/非 .md
+                                                                            // 违规: 大写/非白名单字符/双斜杠/目录外/非 .md
         assert_eq!(slug_of(Path::new("/home/guest/blog/HeLLo.md"), bd), "");
         assert_eq!(slug_of(Path::new("/home/guest/blog/中文.md"), bd), "");
         assert_eq!(slug_of(Path::new("/home/guest/blog/a//b.md"), bd), "");

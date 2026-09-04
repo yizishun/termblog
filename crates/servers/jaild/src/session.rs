@@ -1,31 +1,29 @@
-//! 会话核心(jaild 私有): 会话表 + 配额 + 每会话一个 PTY 读写泵 task。
-//!
-//! 共享 API 类型(Control / SessionHandle)不在这里, 而在
-//! `termblog_core::handle`, 本文件与接入层共用那一份定义。
+//! 会话核心：配额、PTY 泵与固定 FIFO 投稿。
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use std::os::unix::io::AsRawFd;
+use termblog_commentd::{Client as CommentClient, SubmitRequest};
 use termblog_core::{Control, SessionHandle};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::jail::JailBackend;
-use crate::pty::{set_winsize, ShellChild};
+use crate::pty::{CommentFifo, ShellChild};
 
-/// 输出队列容量(条; PTY 读块 ≤ 8192B, ≈ 1 MiB)。终端字节流是有状态协议
-/// (ANSI/IIP 无帧界), 任意丢一块都会破坏后续序列且不能靠"下次重绘"自愈,
-/// 所以这里从 broadcast(慢消费者丢帧)改为有界 mpsc + 背压: 队列满时停读
-/// PTY → 内核 PTY 缓冲填满 → 子进程 write(2) 阻塞 = 端到端背压, 字节零丢失。
-/// 单消费者链路(jaild → core → web)用 mpsc 语义正合适。
 const OUTPUT_CHUNKS: usize = 128;
+const COMMENT_QUEUE: usize = 16;
+const ACK_QUEUE: usize = 32;
+const MAX_COMMENT_LINE: usize = 512;
+const MAX_SESSION_COMMENTS: usize = 8;
 
 pub struct Quota {
     pub max_total: usize,
@@ -35,7 +33,7 @@ pub struct Quota {
 struct Inner {
     backend: Arc<JailBackend>,
     quota: Quota,
-    table: Mutex<HashMap<String, IpAddr>>, // sid -> 来源 IP(配额计数用)
+    table: Mutex<HashMap<String, IpAddr>>,
 }
 
 #[derive(Clone)]
@@ -50,9 +48,6 @@ impl SessionManager {
         }))
     }
 
-    /// 开一个会话: 配额检查(入口直接拒绝, 不排队) -> spawn shell -> 启动读写泵
-    /// caps: 能力白名单值(见 main.rs 的 filter_caps), 传给 backend 注入
-    /// TERMBLOG_IMG 环境变量。
     pub async fn create(
         &self,
         peer: IpAddr,
@@ -61,11 +56,8 @@ impl SessionManager {
         caps: Vec<String>,
     ) -> Result<SessionHandle> {
         let inner = &self.0;
-
         static NEXT_SID: AtomicU64 = AtomicU64::new(1);
         let sid = format!("{:08x}", NEXT_SID.fetch_add(1, Ordering::Relaxed));
-
-        // 配额检查与占位一次完成(同一把锁), 并发 create 不会超发
         {
             let mut table = inner.table.lock().unwrap();
             if table.len() >= inner.quota.max_total {
@@ -80,71 +72,126 @@ impl SessionManager {
         let child = match inner.backend.spawn(&sid, cols, rows, &caps).await {
             Ok(c) => c,
             Err(e) => {
-                inner.table.lock().unwrap().remove(&sid); // 释放占位
+                inner.table.lock().unwrap().remove(&sid);
                 return Err(e);
             }
         };
-
         let (input_tx, input_rx) = mpsc::channel(64);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
-        let (out_tx, out_rx) = mpsc::channel(OUTPUT_CHUNKS); // 有界: 满即背压(见泵)
-
-        tokio::spawn(pump(self.0.clone(), sid.clone(), child, input_rx, ctrl_rx, out_tx));
-
-        Ok(SessionHandle { id: sid, input: input_tx, output: out_rx, control: ctrl_tx })
+        let (out_tx, out_rx) = mpsc::channel(OUTPUT_CHUNKS);
+        tokio::spawn(pump(
+            self.0.clone(),
+            sid.clone(),
+            peer,
+            child,
+            input_rx,
+            ctrl_rx,
+            out_tx,
+        ));
+        Ok(SessionHandle {
+            id: sid,
+            input: input_tx,
+            output: out_rx,
+            control: ctrl_tx,
+        })
     }
 }
 
-/// 每会话一个 task: 键入 / Resize / PTY 输出 三路的 select 循环。
-/// 循环退出(三种情况: 接入层断开、shell 退出、IO 错误) => 回收会话。
+struct Submission {
+    target: String,
+    line: String,
+}
+
 async fn pump(
     inner: Arc<Inner>,
     sid: String,
+    peer: IpAddr,
     child: ShellChild,
     mut input: mpsc::Receiver<Bytes>,
     mut ctrl: mpsc::Receiver<Control>,
     out: mpsc::Sender<Bytes>,
 ) {
-    let master = match AsyncFd::new(child.master) {
+    let ShellChild {
+        master: master_fd,
+        pid,
+        comment_fifos,
+    } = child;
+    let master = match AsyncFd::new(master_fd) {
         Ok(m) => m,
         Err(_) => {
-            // pump 未能启动: 收掉已 fork 出的 shell, 释放配额占位;
-            // backend 资源(如 jail)一并回收, 不留泄漏
-            let _ = kill(Pid::from_raw(-child.pid.as_raw()), Signal::SIGHUP);
-            reap(child.pid).await;
+            let _ = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGHUP);
+            reap(pid).await;
             let _ = inner.backend.cleanup(&sid).await;
             inner.table.lock().unwrap().remove(&sid);
             return;
         }
     };
-    let mut buf = [0u8; 8192];
+    let fifos = match prepare_fifos(comment_fifos) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(sid, %e, "评论 FIFO 注册失败");
+            let _ = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGHUP);
+            reap(pid).await;
+            let _ = inner.backend.cleanup(&sid).await;
+            inner.table.lock().unwrap().remove(&sid);
+            return;
+        }
+    };
 
-    // 循环退出原因(泄漏排障: 每条退出路径都落日志)
+    let (submit_tx, submit_rx) = mpsc::channel(COMMENT_QUEUE);
+    let (ack_tx, mut ack_rx) = mpsc::channel::<Bytes>(ACK_QUEUE);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let mut readers = Vec::new();
+    for (fifo, target) in fifos {
+        readers.push(tokio::spawn(fifo_reader(
+            fifo,
+            target,
+            submit_tx.clone(),
+            ack_tx.clone(),
+            shutdown_rx.clone(),
+            accepted.clone(),
+        )));
+    }
+    drop(submit_tx);
+
+    let mut worker = tokio::spawn(comment_worker(
+        inner.backend.comment_client(),
+        peer.to_string(),
+        submit_rx,
+        ack_tx,
+    ));
+    let mut buf = [0u8; 8192];
+    let mut ack_open = true;
     let why: &str;
     loop {
         tokio::select! {
-            // 键入 -> 写 PTY 主端
             data = input.recv() => match data {
                 Some(b) => { let _ = write_all(&master, &b).await; }
                 None => { why = "input 通道关闭(接入层断开)"; break; }
             },
-            // 控制帧; control 通道关闭 => 接入层断开 => 回收
             c = ctrl.recv() => match c {
                 Some(Control::Resize { cols, rows }) => {
-                    let _ = set_winsize(master.get_ref(), cols, rows);
-                    let _ = kill(child.pid, Signal::SIGWINCH);
+                    let _ = crate::pty::set_winsize(master.get_ref(), cols, rows);
+                    let _ = kill(pid, Signal::SIGWINCH);
                 }
                 None => { why = "control 通道关闭(接入层断开)"; break; }
             },
-            // PTY 输出 -> 有界队列(背压)
+            ack = ack_rx.recv(), if ack_open => match ack {
+                Some(bytes) => {
+                    // ack 只进已有输出队列；绝不写 PTY master（否则等价于模拟键盘）。
+                    if out.send(bytes).await.is_err() {
+                        why = "输出通道关闭(接入层断开)";
+                        break;
+                    }
+                }
+                None => ack_open = false,
+            },
             ready = master.readable() => {
                 let mut g = match ready { Ok(g) => g, Err(_) => { why = "master readable 错误"; break; } };
                 match nix::unistd::read(master.as_raw_fd(), &mut buf) {
                     Ok(0) => { why = "PTY EOF(shell 退出)"; break; }
                     Ok(n) => {
-                        // 队列满时停读 PTY: 内核 PTY 缓冲填满 -> 子进程
-                        // write(2) 阻塞 = 端到端背压, 字节零丢失。
-                        // 队列只被背压瞬间填满, 正常情况远小于容量。
                         if out.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
                             why = "输出通道关闭(接入层断开)";
                             break;
@@ -157,39 +204,248 @@ async fn pump(
         }
     }
 
-    // ---- 回收: 杀进程组(forkpty 里 setsid 过, pid == pgid) -> wait -> 移出会话表 ----
-    // (链路日志: 泄漏排障用, 每一环都有迹可查)
-    tracing::info!(sid, why, "pump 退出, 回收开始: SIGHUP 进程组");
-    let _ = kill(Pid::from_raw(-child.pid.as_raw()), Signal::SIGHUP);
-    reap(child.pid).await;
+    tracing::info!(sid, why, "pump 退出，停止投稿并做最终 drain");
+    // 先停 writer，再让每个已打开 FIFO 读到 EAGAIN；路径从不重开。
+    let _ = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGHUP);
+    let _ = shutdown_tx.send(true);
+    let drain = inner.backend.comment_drain_timeout();
+    let deadline = tokio::time::Instant::now() + drain;
+    let mut readers = readers;
+    if tokio::time::timeout_at(deadline, async {
+        for reader in &mut readers {
+            let _ = reader.await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        for reader in &readers {
+            reader.abort();
+        }
+    }
+    // PTY 已结束但接入层可能仍连着；在同一个 drain deadline 内继续转发
+    // 已持久化投稿的 ack。ack 队列有界，慢客户端不会撑大 jaild 内存。
+    let mut worker_done = false;
+    let mut ack_done = false;
+    let mut deliver_acks = true;
+    'drain: while !(worker_done && ack_done) {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                if !worker_done {
+                    worker.abort();
+                }
+                break;
+            }
+            result = &mut worker, if !worker_done => {
+                if let Err(e) = result {
+                    tracing::warn!(sid, %e, "评论 worker 异常结束");
+                }
+                worker_done = true;
+            }
+            ack = ack_rx.recv(), if !ack_done => match ack {
+                Some(bytes) if deliver_acks => {
+                    match tokio::time::timeout_at(deadline, out.send(bytes)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => deliver_acks = false,
+                        Err(_) => {
+                            if !worker_done {
+                                worker.abort();
+                            }
+                            break 'drain;
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => ack_done = true,
+            }
+        }
+    }
+
+    reap(pid).await;
     tracing::info!(sid, "shell 已收尸, backend 清理开始");
     let _ = inner.backend.cleanup(&sid).await;
-    tracing::info!(sid, "backend 清理完成, 移出会话表");
     inner.table.lock().unwrap().remove(&sid);
-    // out(mpsc::Sender) 随本 task 结束被 drop => 接入层收到 None, 得知会话终结
 }
 
-/// 等 shell 退出并收尸。waitpid 是阻塞调用, 放 blocking 线程;
-/// SIGHUP 后宽限 5s 仍不退(shell 可能忽略 HUP)则 SIGKILL 兜底, 不留僵尸/泄漏。
+fn prepare_fifos(fifos: Vec<CommentFifo>) -> Result<Vec<(AsyncFd<OwnedFd>, String)>> {
+    fifos
+        .into_iter()
+        .map(|f| Ok((AsyncFd::new(f.fd)?, f.target)))
+        .collect()
+}
+
+async fn fifo_reader(
+    fifo: AsyncFd<OwnedFd>,
+    target: String,
+    tx: mpsc::Sender<Submission>,
+    ack: mpsc::Sender<Bytes>,
+    mut shutdown: watch::Receiver<bool>,
+    accepted: Arc<AtomicUsize>,
+) {
+    let mut line = Vec::with_capacity(MAX_COMMENT_LINE);
+    let mut discard = false;
+    let mut buf = [0u8; 1024];
+    loop {
+        tokio::select! {
+            ready = fifo.readable() => {
+                let mut guard = match ready { Ok(g) => g, Err(_) => break };
+                match nix::unistd::read(fifo.as_raw_fd(), &mut buf) {
+                    Ok(0) => guard.clear_ready(), // O_RDWR 主方案不应 EOF；清 readiness 防空转。
+                    Ok(n) => consume_fifo_bytes(&buf[..n], &target, &tx, &ack, &accepted, &mut line, &mut discard).await,
+                    Err(nix::errno::Errno::EAGAIN) => guard.clear_ready(),
+                    Err(_) => break,
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    loop {
+                        match nix::unistd::read(fifo.as_raw_fd(), &mut buf) {
+                            Ok(0) | Err(nix::errno::Errno::EAGAIN) => break,
+                            Ok(n) => consume_fifo_bytes(&buf[..n], &target, &tx, &ack, &accepted, &mut line, &mut discard).await,
+                            Err(_) => break,
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn consume_fifo_bytes(
+    bytes: &[u8],
+    target: &str,
+    tx: &mpsc::Sender<Submission>,
+    ack: &mpsc::Sender<Bytes>,
+    accepted: &AtomicUsize,
+    line: &mut Vec<u8>,
+    discard: &mut bool,
+) {
+    for &byte in bytes {
+        if *discard {
+            if byte == b'\n' {
+                *discard = false;
+            }
+            continue;
+        }
+        if byte == b'\n' {
+            let raw = std::mem::take(line);
+            let text = match String::from_utf8(raw) {
+                Ok(s) => s,
+                Err(_) => {
+                    send_ack(ack, "评论未提交：输入不是合法 UTF-8").await;
+                    continue;
+                }
+            };
+            let slot = accepted.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_SESSION_COMMENTS).then_some(n + 1)
+            });
+            if slot.is_err() {
+                send_ack(ack, "评论未提交：每个会话最多 8 条").await;
+                continue;
+            }
+            if tx
+                .send(Submission {
+                    target: target.to_string(),
+                    line: text,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        } else if line.len() == MAX_COMMENT_LINE {
+            line.clear();
+            *discard = true;
+            send_ack(ack, "评论未提交：单行超过 512 字节").await;
+        } else {
+            line.push(byte);
+        }
+    }
+}
+
+async fn comment_worker(
+    client: CommentClient,
+    ip: String,
+    mut rx: mpsc::Receiver<Submission>,
+    ack: mpsc::Sender<Bytes>,
+) {
+    while let Some(item) = rx.recv().await {
+        let notice = match client
+            .submit(&SubmitRequest {
+                target: item.target,
+                line: item.line,
+                ip: ip.clone(),
+            })
+            .await
+        {
+            Ok(res) => res.notice,
+            Err(_) => "评论未提交：评论服务暂不可用".into(),
+        };
+        send_ack(&ack, &notice).await;
+    }
+}
+
+async fn send_ack(tx: &mpsc::Sender<Bytes>, notice: &str) {
+    let _ = tx.send(Bytes::from(format!("\r\n{notice}\r\n"))).await;
+}
+
 async fn reap(pid: Pid) {
     let wait = |pid| tokio::task::spawn_blocking(move || nix::sys::wait::waitpid(pid, None));
-    let grace = std::time::Duration::from_secs(5);
+    let grace = Duration::from_secs(5);
     if tokio::time::timeout(grace, wait(pid)).await.is_err() {
         let _ = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGKILL);
         let _ = wait(pid).await;
     }
 }
 
-/// 尽力把一段键入完整写入 PTY(交互输入很小, 几乎不会真的阻塞)
-async fn write_all(master: &AsyncFd<std::os::unix::io::OwnedFd>, mut b: &[u8]) -> Result<()> {
-    while !b.is_empty() {
-        match nix::unistd::write(master.get_ref(), b) {
-            Ok(n) => b = &b[n..],
-            Err(nix::errno::Errno::EAGAIN) => {
-                master.writable().await?.clear_ready();
-            }
+async fn write_all(master: &AsyncFd<OwnedFd>, mut bytes: &[u8]) -> Result<()> {
+    while !bytes.is_empty() {
+        match nix::unistd::write(master.get_ref(), bytes) {
+            Ok(n) => bytes = &bytes[n..],
+            Err(nix::errno::Errno::EAGAIN) => master.writable().await?.clear_ready(),
             Err(e) => return Err(e.into()),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fifo_lines_are_strict_utf8_bounded_and_session_limited() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (ack, mut ack_rx) = mpsc::channel(16);
+        let accepted = AtomicUsize::new(0);
+        let mut line = Vec::new();
+        let mut discard = false;
+        consume_fifo_bytes(
+            b"alice: ok\n",
+            "/",
+            &tx,
+            &ack,
+            &accepted,
+            &mut line,
+            &mut discard,
+        )
+        .await;
+        assert_eq!(rx.recv().await.unwrap().line, "alice: ok");
+        consume_fifo_bytes(
+            &[0xff, b'\n'],
+            "/",
+            &tx,
+            &ack,
+            &accepted,
+            &mut line,
+            &mut discard,
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&ack_rx.recv().await.unwrap()).contains("UTF-8"));
+        let mut over = vec![b'x'; 513];
+        over.push(b'\n');
+        consume_fifo_bytes(&over, "/", &tx, &ack, &accepted, &mut line, &mut discard).await;
+        assert!(String::from_utf8_lossy(&ack_rx.recv().await.unwrap()).contains("512"));
+    }
 }

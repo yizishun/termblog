@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# PROVIDE: commentd
+# REQUIRE: LOGIN
+# BEFORE: jaild termblog
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="commentd"
+rcvar="commentd_enable"
+command="/usr/sbin/daemon"
+command_args="-H -p /var/run/commentd.pid -P /var/run/commentd-super.pid -o /var/log/commentd.log /usr/local/sbin/commentd"
+pidfile="/var/run/commentd.pid"
+
+load_rc_config "$name"
+: "${commentd_enable:=NO}"
+run_rc_command "$1"

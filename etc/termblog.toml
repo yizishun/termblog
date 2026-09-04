@@ -37,3 +37,10 @@ openfiles = 256
 pcpu = 25
 zsh = "/usr/local/bin/zsh"
 guest_user = "guest"
+
+[comments]
+public_socket = "/var/run/commentd-public.sock"
+private_socket = "/var/run/commentd-private.sock"
+data_dir = "/var/db/termblog-commentd"
+targets_file = "/usr/local/share/termblog/comment-targets.tsv"
+session_drain_ms = 1000

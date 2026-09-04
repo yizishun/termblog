@@ -28,13 +28,19 @@ pub fn attr_escape(s: &str) -> String {
 ///    不再过转义, 否则会被转义成文本)。
 /// 2. 若第一个块级元素是 H1(即元数据标题的来源)则整块剥掉, 其余喂 push_html。
 /// image_meta: 本地图 dest_url 原文 → (宽, 高, /blog/ 路径); 查不到 = 外链(原样, 无宽高)。
-pub fn body_html(events: &[Event<'static>], image_meta: &HashMap<String, (u32, u32, String)>) -> String {
+pub fn body_html(
+    events: &[Event<'static>],
+    image_meta: &HashMap<String, (u32, u32, String)>,
+) -> String {
     let mut out = String::new();
     let pre = preprocess_events(events, image_meta);
     let mut iter = pre.into_iter();
     if matches!(
         events.first(),
-        Some(Event::Start(Tag::Heading { level: HeadingLevel::H1, .. }))
+        Some(Event::Start(Tag::Heading {
+            level: HeadingLevel::H1,
+            ..
+        }))
     ) {
         // 剥掉首块 H1: 从 Start(H1) 到与之配对的 End(H1) 整块丢弃
         let mut depth = 0usize;
@@ -64,7 +70,9 @@ fn preprocess_events(
     let mut i = 0;
     while i < events.len() {
         match &events[i] {
-            Event::Start(Tag::Image { dest_url, title, .. }) => {
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => {
                 // 收集 alt 纯文本(Text/Code 拼接, 换行按空格; 嵌套样式容器拍平)
                 let mut alt = String::new();
                 let mut j = i + 1;
@@ -111,7 +119,11 @@ fn build_img_tag(
         Some((w, h, url)) => (url.as_str(), Some((*w, *h))),
         None => (dest_url, None), // 外链: 不进表, 原样输出, 省略宽高
     };
-    let mut tag = format!("<img src=\"{}\" alt=\"{}\"", attr_escape(src), attr_escape(alt));
+    let mut tag = format!(
+        "<img src=\"{}\" alt=\"{}\"",
+        attr_escape(src),
+        attr_escape(alt)
+    );
     if let Some((w, h)) = dims {
         tag.push_str(&format!(" width=\"{w}\" height=\"{h}\""));
     }
@@ -140,7 +152,9 @@ fn fill(tpl: &str, conds: &[(&str, bool)], vars: &[(&str, String)]) -> String {
         let open = format!("{{{{#if {name}}}}}");
         loop {
             let Some(start) = s.find(&open) else { break };
-            let Some(rel_end) = s[start..].find("{{/if}}") else { break };
+            let Some(rel_end) = s[start..].find("{{/if}}") else {
+                break;
+            };
             let end = start + rel_end;
             if *on {
                 let inner = s[start + open.len()..end].to_string();
@@ -214,6 +228,11 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
         <footer class="post-meta">
           {{DATE}}{{#if ssh_hint}} · 终端里也可以读: ssh -p 2222 blog@{{HOST}} 然后敲 blog {{SLUG}}{{/if}}
         </footer>
+        <section class="comments" data-comments-target="{{COMMENT_TARGET}}">
+          <h2>评论</h2>
+          <p class="comments-status">正在加载…</p>
+          <ol class="comment-list"></ol>
+        </section>
       </article>
     </div>
     <!-- 等待层: JS 用户首屏只看到它(不透明盖住静态正文, 正文不闪现);
@@ -229,6 +248,7 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
   </div>
   <button id="enter-terminal" type="button" hidden>进入终端 ↵</button>
   <script type="module" src="/assets/{{ENTRY_JS}}"></script>
+  <script type="module" src="/assets/{{COMMENTS_JS}}"></script>
 </body>
 
 </html>
@@ -250,6 +270,7 @@ pub fn render_mirror_page(
     a: &Article,
     entry_js: &str,
     entry_css: &str,
+    comments_js: &str,
     site_url: Option<&str>,
     site_title: &str,
     first_image: Option<&str>,
@@ -260,17 +281,26 @@ pub fn render_mirror_page(
     let og_image = site_url.is_some() && first_image.is_some();
     fill(
         MIRROR_TEMPLATE,
-        &[("site_url", site_url.is_some()), ("ssh_hint", ssh_hint), ("og_image", og_image)],
+        &[
+            ("site_url", site_url.is_some()),
+            ("ssh_hint", ssh_hint),
+            ("og_image", og_image),
+        ],
         &[
             ("TITLE", attr_escape(&a.title)),
             ("SITE_TITLE", attr_escape(site_title)),
             ("SITE_URL", attr_escape(site_url.unwrap_or(""))),
             ("SLUG", attr_escape(&a.slug)),
+            (
+                "COMMENT_TARGET",
+                attr_escape(&crate::comment_location_for_slug(&a.slug).1),
+            ),
             ("EXCERPT", attr_escape(&a.excerpt)),
             ("DATE", a.date10.clone()),
             ("HOST", attr_escape(host)),
             ("ENTRY_JS", attr_escape(entry_js)),
             ("ENTRY_CSS", attr_escape(entry_css)),
+            ("COMMENTS_JS", attr_escape(comments_js)),
             ("BLOG_CSS", blog_css_href(entry_js)),
             ("OG_IMAGE", attr_escape(first_image.unwrap_or(""))),
             ("BODY_HTML", body),
@@ -368,12 +398,18 @@ mod tests {
     #[test]
     fn body_keeps_later_headings() {
         let b = body_html(&parse("正文\n\n# 后出现的 H1\n\n尾段\n"), &HashMap::new());
-        assert!(b.contains("<h1>后出现的 H1</h1>"), "非首块的 H1 应保留: {b}");
+        assert!(
+            b.contains("<h1>后出现的 H1</h1>"),
+            "非首块的 H1 应保留: {b}"
+        );
     }
 
     #[test]
     fn body_escapes_html() {
-        let b = body_html(&parse("小心 <script>alert(1)</script> 注入\n"), &HashMap::new());
+        let b = body_html(
+            &parse("小心 <script>alert(1)</script> 注入\n"),
+            &HashMap::new(),
+        );
         assert!(b.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!b.contains("<script>"));
     }
@@ -398,7 +434,10 @@ mod tests {
     #[test]
     fn body_image_alt_escaped() {
         let mut meta = HashMap::new();
-        meta.insert("x.png".to_string(), (2u32, 2u32, "/blog/t/x.png".to_string()));
+        meta.insert(
+            "x.png".to_string(),
+            (2u32, 2u32, "/blog/t/x.png".to_string()),
+        );
         let b = body_html(&parse("![含 \"引号\" & <标签>](x.png)\n"), &meta);
         assert!(
             b.contains("alt=\"含 &quot;引号&quot; &amp; &lt;标签&gt;\""),
@@ -411,11 +450,20 @@ mod tests {
 
     #[test]
     fn body_external_image_no_dims() {
-        let b = body_html(&parse("![外链](https://cdn.example.com/a.png)\n"), &HashMap::new());
-        assert!(b.contains("<img src=\"https://cdn.example.com/a.png\" alt=\"外链\""), "外链原样: {b}");
+        let b = body_html(
+            &parse("![外链](https://cdn.example.com/a.png)\n"),
+            &HashMap::new(),
+        );
+        assert!(
+            b.contains("<img src=\"https://cdn.example.com/a.png\" alt=\"外链\""),
+            "外链原样: {b}"
+        );
         assert!(!b.contains("width="), "外链无宽高属性: {b}");
         // alt 里的嵌套样式被拍平
-        let b = body_html(&parse("![**粗** `码`](https://x.example/a.png)\n"), &HashMap::new());
+        let b = body_html(
+            &parse("![**粗** `码`](https://x.example/a.png)\n"),
+            &HashMap::new(),
+        );
         assert!(b.contains("alt=\"粗 码\""), "alt 嵌套应拍平: {b}");
     }
 
@@ -429,6 +477,7 @@ mod tests {
             &a,
             "index-abc123.js",
             "index-abc123.css",
+            "comments-abc123.js",
             Some("https://blog.example.com"),
             "~yzs",
             a.first_image.as_deref(),
@@ -438,24 +487,55 @@ mod tests {
             "有 site_url 且有首图应出 og:image: {page}"
         );
         // 无 site_url → 不出 og:image
-        let page = render_mirror_page(&a, "index-abc123.js", "index-abc123.css", None, "~yzs", a.first_image.as_deref());
-        assert!(!page.contains("og:image"), "无 site_url 不出 og:image: {page}");
+        let page = render_mirror_page(
+            &a,
+            "index-abc123.js",
+            "index-abc123.css",
+            "comments-abc123.js",
+            None,
+            "~yzs",
+            a.first_image.as_deref(),
+        );
+        assert!(
+            !page.contains("og:image"),
+            "无 site_url 不出 og:image: {page}"
+        );
         // 有 site_url 但无首图 → 不出
         let b = article("plain", "纯文本", "# 纯文本\n\n正文\n");
-        let page = render_mirror_page(&b, "index-abc123.js", "index-abc123.css", Some("https://blog.example.com"), "~yzs", None);
+        let page = render_mirror_page(
+            &b,
+            "index-abc123.js",
+            "index-abc123.css",
+            "comments-abc123.js",
+            Some("https://blog.example.com"),
+            "~yzs",
+            None,
+        );
         assert!(!page.contains("og:image"), "无首图不出 og:image: {page}");
     }
 
     #[test]
     fn mirror_page_fills_all_placeholders() {
         let a = article("hello", "你好, 世界", "# 你好, 世界\n\n正文\n");
-        let page = render_mirror_page(&a, "index-abc123.js", "index-abc123.css", Some("https://blog.example.com"), "~yzs", None);
+        let page = render_mirror_page(
+            &a,
+            "index-abc123.js",
+            "index-abc123.css",
+            "comments-abc123.js",
+            Some("https://blog.example.com"),
+            "~yzs",
+            None,
+        );
         assert!(!page.contains("{{"), "模板残留占位符: {page}");
         assert!(page.contains("<h1>你好, 世界</h1>"));
         assert!(page.contains("name=\"termblog-slug\" content=\"hello\""));
         assert!(page.contains("href=\"https://blog.example.com/blog/hello/\""));
+        assert!(page.contains("data-comments-target=\"/blog/\""));
         assert!(page.contains("src=\"/assets/index-abc123.js\""));
-        assert!(page.contains("href=\"/assets/index-abc123.css\""), "镜像页必须引打包样式(xterm.css): {page}");
+        assert!(
+            page.contains("href=\"/assets/index-abc123.css\""),
+            "镜像页必须引打包样式(xterm.css): {page}"
+        );
         assert!(page.contains("ssh -p 2222 blog@blog.example.com"));
         // 等待层 + 无 JS 兜底: 正文留在 DOM, cover 由 noscript 对无 JS 隐藏
         assert!(page.contains("id=\"mirror-cover\""));
@@ -463,7 +543,15 @@ mod tests {
         assert!(page.contains("noscript") && page.contains("#mirror-cover{display:none}"));
         assert!(page.contains("id=\"static-view\"") && page.contains("<article>"));
         // 无 site_url: 无 canonical / ssh_hint / og:url
-        let page = render_mirror_page(&a, "index-abc123.js", "index-abc123.css", None, "~yzs", None);
+        let page = render_mirror_page(
+            &a,
+            "index-abc123.js",
+            "index-abc123.css",
+            "comments-abc123.js",
+            None,
+            "~yzs",
+            None,
+        );
         assert!(!page.contains("canonical"));
         assert!(!page.contains("og:url"));
         assert!(!page.contains("ssh -p 2222"));
@@ -471,20 +559,47 @@ mod tests {
 
     #[test]
     fn mirror_page_escapes_title_attr() {
-        let a = article("hello", "含 \"引号\" & <标签>", "# 含 \"引号\" & <标签>\n\n正文\n");
-        let page = render_mirror_page(&a, "index-abc123.js", "index-abc123.css", None, "~yzs", None);
+        let a = article(
+            "hello",
+            "含 \"引号\" & <标签>",
+            "# 含 \"引号\" & <标签>\n\n正文\n",
+        );
+        let page = render_mirror_page(
+            &a,
+            "index-abc123.js",
+            "index-abc123.css",
+            "comments-abc123.js",
+            None,
+            "~yzs",
+            None,
+        );
         assert!(page.contains("&quot;引号&quot; &amp; &lt;标签&gt;"));
     }
 
     #[test]
     fn list_page_content() {
         let a = article("hello", "你好, 世界", "# 你好, 世界\n\n正文\n");
-        let page = render_list_page(std::slice::from_ref(&a), Some("https://blog.example.com"), "~yzs", "index-abc123.js");
+        let page = render_list_page(
+            std::slice::from_ref(&a),
+            Some("https://blog.example.com"),
+            "~yzs",
+            "index-abc123.js",
+        );
         assert!(page.contains("<title>文章 — ~yzs</title>"));
         assert!(page.contains("<a href=\"/blog/hello/\">你好, 世界</a>"));
         assert!(page.contains("atom.xml"));
-        assert!(!page.contains("assets/"), "列表页不引 entry JS");
-        let page = render_list_page(std::slice::from_ref(&a), None, "~yzs", "index-abc123.js");
+        assert!(
+            !page.contains("src=\"/assets/index-abc123.js\""),
+            "列表页不引终端 entry JS"
+        );
+        assert!(!page.contains("comments-abc123.js"));
+        assert!(!page.contains("data-comments-target"));
+        let page = render_list_page(
+            std::slice::from_ref(&a),
+            None,
+            "~yzs",
+            "index-abc123.js",
+        );
         assert!(!page.contains("atom.xml"));
     }
 

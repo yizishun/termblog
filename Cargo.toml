@@ -7,6 +7,7 @@ members = [
     "crates/servers/web",
     "crates/servers/ssh",
     "crates/servers/jaild",
+    "crates/servers/commentd",
     "crates/tools/content-build",
     "crates/tools/jailbin",
 ]
@@ -21,3 +22,5 @@ tokio = { version = "1", features = ["full"] }
 tokio-seqpacket = "0.9"
 toml = "0.8"
 tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+sha2 = "0.10"

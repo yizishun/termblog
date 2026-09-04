@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     ensure_devfs_ruleset();
 
     let mgr = SessionManager::new(
-        JailBackend::new(cfg.jail.clone()),
+        JailBackend::new(cfg.jail.clone(), cfg.comments.clone()),
         Quota { max_total: cfg.session.max_total, max_per_ip: cfg.session.max_per_ip },
     );
     info!(socket = %socket.display(), "jaild 就绪, 开始 accept");
