@@ -1,9 +1,15 @@
+type ReplySummary = {
+  number: number;
+  author: string;
+};
+
 type CommentItem = {
-  id: number;
+  number: number;
   target: string;
   author: string;
   text: string;
   created_at: string;
+  reply_to?: ReplySummary;
 };
 
 type CommentsResponse = {
@@ -17,14 +23,14 @@ function emptyHint(target: string, fifo: string): string {
   return `暂无${noun} —— echo 'alice: 好文' > ${fifo} 写第一条`;
 }
 
-function renderComment(item: CommentItem, ordinal: number): HTMLLIElement {
+function renderComment(item: CommentItem): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "comment-item";
   const meta = document.createElement("p");
   meta.className = "comment-meta";
-  const id = document.createElement("span");
-  id.className = "comment-id";
-  id.textContent = `#${ordinal}`;
+  const number = document.createElement("span");
+  number.className = "comment-id";
+  number.textContent = `#${item.number}`;
   const author = document.createElement("strong");
   author.textContent = item.author;
   const time = document.createElement("time");
@@ -40,10 +46,17 @@ function renderComment(item: CommentItem, ordinal: number): HTMLLIElement {
         minute: "2-digit",
         hour12: false,
       }).format(date);
-  meta.append(id, "  ", author, " · ", time);
+  meta.append(number, "  ", author, " · ", time);
   const text = document.createElement("p");
   text.className = "comment-text";
-  text.textContent = item.text;
+  if (item.reply_to) {
+    const context = document.createElement("span");
+    context.className = "comment-reply-context";
+    context.textContent = `(In reply to ${item.reply_to.author} from comment #${item.reply_to.number}):`;
+    text.append(context, document.createElement("br"), item.text);
+  } else {
+    text.textContent = item.text;
+  }
   li.append(meta, text);
   return li;
 }
@@ -71,8 +84,8 @@ async function loadSection(section: HTMLElement): Promise<void> {
       return;
     }
     status.textContent = data.omitted_earlier > 0 ? `还有 ${data.omitted_earlier} 条更早评论` : "";
-    for (const [index, item] of data.comments.entries()) {
-      list.append(renderComment(item, data.omitted_earlier + index + 1));
+    for (const item of data.comments) {
+      list.append(renderComment(item));
     }
   } catch {
     status.textContent = "评论暂不可用";

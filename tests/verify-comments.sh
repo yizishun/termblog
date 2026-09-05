@@ -14,8 +14,12 @@ done
 [ -x "$COMMENTCTL" ] || { echo "FAIL: 缺少 commentctl"; exit 1; }
 [ -f /usr/local/share/termblog/comment-targets.tsv ] || { echo "FAIL: 缺少 target 清单"; exit 1; }
 TERMBLOG_CONFIG="$CONFIG" "$COMMENTCTL" queue --limit 10 >/dev/null
-curl -fsS -G --data-urlencode 'target=/' --data-urlencode 'limit=100' \
-    "$BASE_URL/api/comments" | grep -q '"comments"' || { echo "FAIL: public API"; exit 1; }
+root_response=$(curl -fsS -G --data-urlencode 'target=/' --data-urlencode 'limit=100' \
+    "$BASE_URL/api/comments")
+printf '%s\n' "$root_response" | grep -q '"comments"' || { echo "FAIL: public API"; exit 1; }
+if printf '%s\n' "$root_response" | grep -Eq '"(id|reply_to_id)"[[:space:]]*:'; then
+    echo "FAIL: public API 泄露数据库全局 ID"; exit 1
+fi
 curl -fsS -G --data-urlencode 'target=/notes/' --data-urlencode 'limit=100' \
     "$BASE_URL/api/comments" | grep -q '"comments"' || { echo "FAIL: 通用 /notes/ target"; exit 1; }
 grep -Fxq 'notes/comment	/notes/' /usr/local/share/termblog/comment-targets.tsv || {
@@ -38,10 +42,39 @@ row=$(TERMBLOG_CONFIG="$CONFIG" "$COMMENTCTL" queue | grep "$nonce" | tail -1)
 [ -n "$row" ] || { echo "FAIL: FIFO 投稿未进入 pending"; exit 1; }
 id=$(printf '%s\n' "$row" | awk -F '\t' '{sub(/^#/, "", $1); print $1}')
 TERMBLOG_CONFIG="$CONFIG" "$COMMENTCTL" approve "$id" >/dev/null
-curl -fsS -G --data-urlencode 'target=/' --data-urlencode 'limit=100' \
-    "$BASE_URL/api/comments" | grep -Fq "$nonce" || { echo "FAIL: approve 后 API 不可见"; exit 1; }
+api=$(curl -fsS -G --data-urlencode 'target=/' --data-urlencode 'limit=100' \
+    "$BASE_URL/api/comments")
+printf '%s\n' "$api" | grep -Fq "$nonce" || { echo "FAIL: approve 后 API 不可见"; exit 1; }
+comment_json=$(printf '%s\n' "$api" | sed 's/},{/}\
+{/g' | grep -F "$nonce" | tail -1)
+number=$(printf '%s\n' "$comment_json" | sed -n 's/.*"number":\([0-9][0-9]*\).*/\1/p')
+[ -n "$number" ] || { echo "FAIL: API 缺少目录内局部编号"; exit 1; }
+
+reply_nonce="${nonce}-reply"
+printf 'verify-reply: #%s: %s\n' "$number" "$reply_nonce" > "$JAIL_ROOT/home/guest/comment"
+sleep 1
+reply_row=$(TERMBLOG_CONFIG="$CONFIG" "$COMMENTCTL" queue | grep "$reply_nonce" | tail -1)
+[ -n "$reply_row" ] || { echo "FAIL: 嵌套回复未进入 pending"; exit 1; }
+printf '%s\n' "$reply_row" | awk -F '\t' -v parent="$id" '
+    $5 == "reply_to=#" parent { found=1 }
+    END { exit found ? 0 : 1 }
+' || { echo "FAIL: pending 回复未绑定父评论"; exit 1; }
+reply_id=$(printf '%s\n' "$reply_row" | awk -F '\t' '{sub(/^#/, "", $1); print $1}')
+TERMBLOG_CONFIG="$CONFIG" "$COMMENTCTL" approve "$reply_id" >/dev/null
+reply_api=$(curl -fsS -G --data-urlencode 'target=/' --data-urlencode 'limit=100' \
+    "$BASE_URL/api/comments")
+reply_json=$(printf '%s\n' "$reply_api" | sed 's/},{/}\
+{/g' | grep -F "$reply_nonce" | tail -1)
+printf '%s\n' "$reply_json" | grep -Fq '"reply_to":{' &&
+    printf '%s\n' "$reply_json" | grep -Fq "\"number\":$number" &&
+    printf '%s\n' "$reply_json" | grep -Fq '"author":"verify"' || {
+    echo "FAIL: API 回复摘要不是局部编号/父作者"; exit 1;
+}
 
 # 当前会话保留创建时快照；审核后的评论由新会话在启动 barrier 中取得。
 snapshot="$JAIL_ROOT/var/run/termblog/comments.jsonl"
 [ -r "$snapshot" ] || { echo "FAIL: 缺少初始评论快照"; exit 1; }
-echo "OK: FIFO -> queue -> approve -> API (#$id)；终端评论需新建会话后查看"
+if grep -Eq '"(id|reply_to_id)"[[:space:]]*:' "$snapshot"; then
+    echo "FAIL: guest 快照泄露数据库全局 ID"; exit 1
+fi
+echo "OK: FIFO -> queue -> approve -> nested reply -> local-number API；终端评论需新建会话后查看"

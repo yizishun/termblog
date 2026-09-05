@@ -11,7 +11,8 @@ URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期�
 - **commentd**(root, 评论单写者): 用独立 root-only JSONL 数据库存储待审/通过/删除状态，
   通过 public/private 两个 Unix socket 分隔只读查询与投稿、审核；访客向 jail 内 FIFO
   写一行即可投稿。评论 attachment 由内容配置显式列出；同目录文章共享一个 FIFO，
-  空目录也可独立启用评论。
+  空目录也可独立启用评论。`alice: #1: 内容`（或 guest 的 `#1: 内容`）可回复同目录的
+  已公开评论；数据库全局 ID 不进入公开 API 或 guest 快照。
 - **termblog-web / termblog-ssh**(降权 www): 浏览器(WS)/ SSH 两个接入网关,
   经 SEQPACKET Unix socket 连 jaild, 零协议转换。
 - **content-build**: 把 `jailtpl/content/` 可见目录中的全部 `.md` 一次解析成两个投影 ——
@@ -74,7 +75,9 @@ frontend/        # xterm.js 前端(vite)
 
 - `sh tests/verify-m3.sh`(root): 进程形态 / 真实 jail / 隔离 / rctl / 配额 / zfs 无泄漏
 - `sh tests/verify-m5.sh`: 镜像页 / 发现链路 / feed / robots + ssh 侧 blog 行为
-- `sh tests/verify-comments.sh`(root): 双 socket / FIFO 投稿 / 审核 / API / 初始会话快照
+- `sh tests/verify-comments.sh`(root): 双 socket / FIFO 投稿 / 审核 / 嵌套回复 / 局部编号 API /
+  初始会话快照
+- `TERMBLOG_PW=1 node tests/e2e-comments-playwright.mjs`: mock API 下的回复线性顺序与注入回归
 - `node tests/e2e-reconnect.mjs`: 断线重连协议
 - `node tests/e2e-content-paths.mjs`: 通用 content/HOME 路径、清理与冲突回归
 

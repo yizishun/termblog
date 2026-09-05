@@ -19,10 +19,10 @@
 6. Web：`GET /api/comments` 只读转译；独立 comments bundle；文章镜像页末尾按直属目录展示。
 7. `commentctl`：`queue` / `approve` / `reject` 三个命令。
 8. 配置节 `[comments]`、rc.d、部署脚本与端到端验证。
+9. 多层嵌套回复：用目录内可见编号引用父评论，展示始终按局部编号线性排列。
 
 **不做**（第一版，部分留位）：
 
-- 嵌套回复（平铺；想回复就写 `回复 #12: ...`）。
 - 审核之外的自动策略（防滥用只靠默认 pending、限流和去重）。
 - HTML/Web 投稿入口、Anubis 联动；Web 始终只读。
 - 把评论内容烘焙进静态 HTML；`content-build` 只生成评论区结构与 target，
@@ -48,6 +48,10 @@
 | D12 | public socket 只允许按 target 查询 approved；submit、同步和审核只走 private socket。 |
 | D13 | 会话快照位于 jail 内 `/var/run/termblog/comments.jsonl`，其父目录和文件均由 root 管理。 |
 | D14 | Web 文章评论由 `content-build` 放在文章末尾；终端接管后通过“文章/终端”视图切换访问，不在终端下方另铺评论。 |
+| D15 | 数据库全局 ID 只存在于 root 私有存储、private 协议和 `commentctl`；public 协议与 guest 快照只使用 target 内的动态连续编号。 |
+| D16 | `alice: #1: text` 与 `#1: text` 分别提交具名/guest 回复；父项必须是同 target 当前已 approved 的评论，提交时解析为稳定 `reply_to_id`。 |
+| D17 | 先选最新 100 条，再严格按局部编号升序线性显示；回复关系不触发重排或视觉缩进。 |
+| D18 | 父项落在最新窗口之外时不做特殊处理；回复仍显示其父作者与父局部编号。 |
 
 ## 3. Target 与 FIFO 布局
 
@@ -91,10 +95,13 @@ initialized 标记，每一步均 fsync 文件与目录。之后任一文件缺�
 避免主文件被删后误判成首次安装、从 ID 1 重新开始。
 
 ```json
-{"id":42,"target":"/blog/hello/","author":"alice","text":"好文","ip_hash":"sha256…","created_at":"2026-09-01T12:34:56Z","status":"pending"}
+{"id":42,"target":"/blog/","author":"alice","text":"好文","ip_hash":"sha256…","created_at":"2026-09-01T12:34:56Z","status":"pending"}
+{"id":43,"target":"/blog/","author":"bob","text":"同意","reply_to_id":42,"ip_hash":"sha256…","created_at":"2026-09-01T12:35:56Z","status":"pending"}
 ```
 
 - `id`：commentd 分配、单调递增；三种状态都占住 ID，永不重号。
+- `reply_to_id`：回复才有的可选内部字段，绑定父评论的稳定全局 ID；旧 JSONL 行缺少该字段
+  时按普通根评论读取，不做数据迁移或重写。
 - `target`：`/`、`/blog/` 或合法的 `/blog/<slug>/`，最长 200 UTF-8 字节。
 - `author`：commentd 从 `line` 的第一个 `名字: 内容` 前缀解析；无合法前缀为
   `guest`；清洗后最长 32 UTF-8 字节。
@@ -111,8 +118,17 @@ initialized 标记，每一步均 fsync 文件与目录。之后任一文件缺�
    lossy conversion。commentd 对 private socket 调用再次检查长度。
 3. commentd 删除 C0 `U+0000..U+001F`、DEL `U+007F`、C1
    `U+0080..U+009F`，再解析名字前缀。
-4. 清洗后正文为空、author/text 超限或 target 非法都拒绝；按 UTF-8 字节完整判断，
+4. `alice: #1: text` 是具名回复，`#1: text` 是 guest 回复。开头精确匹配
+   `#` + ASCII 数字 + `:` 时保留为回复语法；`#rust:` 等非数字标签仍按普通文本/名字处理。
+   `#0:`、数字溢出和空回复正文均拒绝，存储的 `text` 不包含 `#N:` 标记。
+5. `N` 是提交当时该 target 内按全局 ID 排序的第 N 条 approved 评论。commentd 将它立即
+   解析为 `reply_to_id`；父项不存在、未审核或属于别的 target 时拒绝，因此父项永远更早，
+   关系不会形成环。多层回复只记录直接父项。
+6. 清洗后正文为空、author/text 超限或 target 非法都拒绝；按 UTF-8 字节完整判断，
    绝不在多字节字符中间截断。
+
+公开 `number` 在每次读取时由当前 approved 集合动态计算。如果一个更早的 pending 评论
+后来获批，后续可见编号会顺延；已保存的父子关系仍绑定全局 ID，并会投影成父项的新局部编号。
 
 ### 4.1 Copy-on-write 提交
 
@@ -133,7 +149,8 @@ rename 前失败时删除临时文件，旧内存与旧主文件不变。rename 
 由人工/服务管理器检查后重启；不能继续暴露旧内存。ack 只在完整提交成功后生成。
 
 启动时完整校验 JSON、字段、ID 唯一且严格递增、状态、target 和时间。任何损坏都保留
-原文件原位、报告具体行号并退出非零；不绑定 socket、不改名原文件、不空库继续。
+原文件原位、报告具体行号并退出非零；同时校验每个 `reply_to_id` 指向同 target、状态为
+approved 且全局 ID 更小的现存父项。不绑定 socket、不改名原文件、不空库继续。
 已有数据但 salt 缺失或非法时也拒绝启动，避免静默换盐。
 
 ## 5. commentd、权限边界与协议
@@ -155,16 +172,25 @@ commentd 同时监听两个 `SOCK_SEQPACKET` socket。分离 listener 是权限�
 
 | kind | 请求 | 成功响应 |
 | --- | --- | --- |
-| 1 approved query | `{target, after_id?, limit?, revision?}` | `{ok, revision, total, omitted_earlier, comments, next_after_id?, has_more}` |
+| 1 approved query | `{target, after_number?, limit?, revision?}` | `{ok, revision, total, omitted_earlier, comments, next_after_number?, has_more}` |
 
 - `target` 必填；不能查全部 target，也不接受 status 参数。
 - `limit` 默认 100，范围 `1..=100`。
-- 无 `after_id`：取该 target 最新 `limit` 条，再按 ID/时间正序返回；
+- 无 `after_number`：取该 target 最新 `limit` 条，再按局部编号正序返回；
   `omitted_earlier` 是未返回的更早评论数。
-- `after_id=0` 且无 revision 时，从当前 revision 的最早记录开始正向分页；
-  `after_id>0` 时必须带同一轮首响应的 revision，只返回 `id > after_id`。
-- revision 变化时返回 `stale_revision`，调用方丢弃整轮并重试。after_id 只用于固定
-  revision 内的分页，不作为跨审核变更的实时游标；刷新最新列表应重新发无 after_id 请求。
+- `after_number=0` 且无 revision 时，从当前 revision 的第 1 条开始正向分页；
+  `after_number>0` 时必须带同一轮首响应的 revision，只返回更大的局部编号。
+- revision 变化时返回 `stale_revision`，调用方丢弃整轮并重试。局部游标只用于固定
+  revision 内的分页，不作为跨审核变更的实时游标；刷新最新列表应重新发无游标请求。
+
+公开评论模型只包含局部编号；根评论省略 `reply_to`：
+
+```json
+{"number":2,"target":"/blog/","author":"bob","text":"同意","created_at":"2026-09-01T12:35:56Z","reply_to":{"number":1,"author":"alice"}}
+```
+
+public socket 的请求与响应都不提供 `id`、`reply_to_id` 或兼容别名。全局 ID 仅留在私有
+管理链路，避免访客把数据库整体编号误认为目录内编号。
 
 ### 5.2 Private socket
 
@@ -177,8 +203,9 @@ commentd 同时监听两个 `SOCK_SEQPACKET` socket。分离 listener 是权限�
 | 5 reject | `{ids:[…]}` | `{ok, changed}` |
 
 submit 不接受预解析的 `author`/`text`；commentd 是前缀解析与规范化的单一事实源。
-处理链为：校验 → 清洗/解析 → 空值和长度拒绝 → 同 `ip_hash` 每小时 10 条 →
-同 `ip_hash + target + text` 300 秒判重 → COW 写入 pending → 返回 notice。
+处理链为：校验 → 清洗/解析 → 回复父项解析 → 空值和长度拒绝 → 同 `ip_hash` 每小时
+10 条 → 同 `ip_hash + target + text + reply_to_id` 300 秒判重 → COW 写入 pending →
+返回 notice。相同正文回复不同父项不是重复投稿。
 
 两种私有查询的 `limit` 也为 `1..=100`。第一页用 `after_id=0` 且不传 revision，
 后续页固定携带首响应 revision。翻页期间发生任何存储变更，下一页返回
@@ -248,11 +275,16 @@ ack 在提交完成后异步到达，可能晚于下一条 prompt。pump 把 ack
 /var/run/termblog/comments.jsonl  0644 root:wheel
 ```
 
-这是 jail 内路径，由宿主 jaild 经 jail 根写入。每行包含 ID：
+这是 jail 内路径，由宿主 jaild 经 jail 根写入。jaild 从 private 模型统一投影后，每行
+只包含访客可见的 target 内编号；根项省略 `reply_to`：
 
 ```json
-{"id":42,"target":"/blog/hello/","author":"alice","date10":"2026-09-01","text":"好文"}
+{"number":1,"target":"/blog/","author":"alice","date10":"2026-09-01","text":"好文"}
+{"number":2,"target":"/blog/","author":"bob","date10":"2026-09-01","text":"同意","reply_to":{"number":1,"author":"alice"}}
 ```
+
+快照不得包含数据库 `id` 或 `reply_to_id`；每个 target 的 `number` 必须从 1 连续递增，
+回复摘要必须匹配同 target 中更早父项的编号和作者，否则 jailbin 拒绝整份快照。
 
 首次同步阻塞会话交付，并通过 private socket 做 revision 固定的全量分页；revision 变化时
 丢弃临时结果并重试。快照在 root-owned 目录内写临时文件、fsync、rename，guest 无法
@@ -277,11 +309,22 @@ ack 在提交完成后异步到达，可能晚于下一条 prompt。pump 把 ack
 
 #54  guest · 2026-09-01
     沙发
+
+#55  bob · 2026-09-01
+    (In reply to alice from comment #53):
+    同意
+
+#56  carol · 2026-09-02
+    (In reply to bob from comment #55):
+    再补充一点
 ```
 
-- 取最新 100 条，再在内部按时间/ID 正序展示。
+- 先按局部编号取最新 100 条，并始终按局部编号升序线性显示；不构造或重排回复树。
+- 回复提示单独占一行，只标出直接父项；多层回复语义保留，但不增加视觉缩进。
+- 父项不在最新窗口内时不做特殊处理；回复按自身编号显示，并保留父项提示。
 - `N` 是 approved 总数；省略的是更早评论，因此提示放在列表顶部。
-- `#序号` 在当前目录 target 内连续显示；数据库全局 ID 只用于审核和分页。序号/日期 dim、author 加粗、正文缩进 4 格，条目间空行。
+- `#序号` 在当前目录 target 内连续显示；数据库全局 ID 只用于审核和 private 分页。
+  序号/日期 dim、author 加粗、正文缩进 4 格，条目间空行。
 - 终端只显示日期；第一版交给终端自动折行。
 - jailbin 在输出边界再次过滤 C0、DEL、C1。JSON/字段校验失败时整段显示“评论暂不可用”，
   不跳过坏行后展示不完整结果。
@@ -300,12 +343,13 @@ ack 在提交完成后异步到达，可能晚于下一条 prompt。pump 把 ack
 ### 8.1 只读 API
 
 ```text
-GET /api/comments?target=/blog/hello/&limit=100
-GET /api/comments?target=/blog/hello/&after_id=42&limit=100&revision=<opaque>
+GET /api/comments?target=/blog/&limit=100
+GET /api/comments?target=/blog/&after_number=42&limit=100&revision=<opaque>
 ```
 
-路由位于 `ServeDir` fallback 前，只连接 public socket。target 必填，after_id/limit
-按 public 协议校验；返回 `{revision,total,omitted_earlier,comments,has_more}`。
+路由位于 `ServeDir` fallback 前，只连接 public socket。target 必填，
+`after_number`/limit 按 public 协议校验；返回
+`{revision,total,omitted_earlier,comments,next_after_number?,has_more}`。
 commentd 不可用返回 503 JSON。没有 POST，也不代理 private kind。
 
 ### 8.2 独立 comments bundle
@@ -339,8 +383,10 @@ comments bundle 不依赖切换即可加载；终端视图外不追加常驻评�
 </div>
 ```
 
-网页同样显示最新 100 条、内部正序，并在顶部提示“还有 N 条更早评论”。空态给出对应
-完整终端命令；错误态为“评论暂不可用”。pending/deleted 不进入任何展示面。
+网页同样先取最新 100 条，再按 API 返回的局部编号顺序线性显示，并在顶部提示“还有 N 条
+更早评论”。回复提示单独占一行，正文从下一行开始；提示和正文均以文本节点显示，保持
+DOM 安全。
+空态给出对应完整终端命令；错误态为“评论暂不可用”。pending/deleted 不进入任何展示面。
 
 ## 9. commentctl
 
@@ -353,8 +399,9 @@ commentctl approve <id…>   # 或 --all
 commentctl reject <id…>
 ```
 
-`queue` 默认自动分页列出全部 pending（id、target、author、时间、正文首行）；分页期间
-revision 变化则从头重试。所有命令只以 root/sudo 运行。不做面板、编辑器或审核规则。
+`queue` 默认自动分页列出全部 pending（全局 id、target、author、时间、`root` 或
+`reply_to=#<全局 ID>`、正文首行）；分页期间 revision 变化则从头重试。所有命令只以
+root/sudo 运行。不做面板、编辑器或审核规则。
 
 M1 使用 Rust 集成测试客户端或 `commentctl` 验证协议；`nc -U` 不能构造带 5 字节
 二进制帧头的 `SOCK_SEQPACKET` 请求，不作为验收手段。
@@ -388,6 +435,8 @@ session_drain_ms   = 1000
 | commentd 在新会话初始化时不可用 | 首次同步失败，不交付 shell；接入层显示暂时不可用。 |
 | commentd 在已有会话期间宕机 | 投稿得到异步失败 ack；固定初始快照仍可读；API 返回 503。 |
 | public socket 收到 submit/审核 kind | 协议层拒绝；www 无法触达 private listener。 |
+| 回复编号不存在、父项未审核或不在同 target | submit 在分配新 ID 前拒绝，pending 队列不产生记录。 |
+| 父项不在最新 100 条窗口内 | 回复仍按自身局部编号显示，并保留直接父项标签。 |
 | guest 删除/替换 FIFO | 已打开 fd 安全保留；jaild 不重开、不遍历。 |
 | guest 移动已打开 FIFO 后写入 | 仍提交到启动时固定 target。 |
 | guest 自建无读端 FIFO 并写入 | 只阻塞自己的 shell；会话回收时终止。 |
@@ -414,7 +463,8 @@ session_drain_ms   = 1000
 ### M1：commentd + commentctl
 
 - 双 socket kind 白名单与权限测试通过；www 只能查询 approved。
-- 单测覆盖前缀、C0/DEL/C1、非法 UTF-8、长度、限流与判重。
+- 单测覆盖前缀、具名/guest 多层回复、非法回复引用、C0/DEL/C1、非法 UTF-8、长度、
+  限流与包含父关系的判重。
 - fault injection 覆盖写、文件 fsync、rename、目录 fsync；内存只在完整提交后变化。
 - 损坏 JSONL、重复 ID、丢失主文件/salt/initialized 标记都拒绝启动，原文件不变且
   ID 不复用。
@@ -427,6 +477,8 @@ session_drain_ms   = 1000
   可读到已有评论。
 - `echo 'alice: 好文' > ~/blog/comment` → ack 经 out 回显 → queue → approve；
   新建会话后，同目录文章末尾可见连续序号。
+- `echo 'bob: #1: 回复' > ~/blog/comment` 覆盖父项解析、审核、多层直接父项标签和线性编号，
+  并验证快照不包含全局 ID；父项在 100 条窗口外时回复仍保留标签。
 - 覆盖顶层目录、嵌套目录和 `/` 三类 target，确认同目录共享、不同目录不串区。
 - 证明 ack 不进 PTY 输入缓冲；覆盖异步 ack/prompt 交错、超长、非法 UTF-8、限流、
   rm/mv/symlink 和 `echo ...; exit` drain。
@@ -436,14 +488,16 @@ session_drain_ms   = 1000
 - 文章评论由 content-build 生成在文章末尾；终端接管后可切回完整文章查看，页面不在
   terminal host 或终端下方追加评论区域。
 - `/blog/` 文章列表和 `/` 首页不生成评论区。
-- 文章镜像页覆盖 loading、空态、最新 100 条、顶部省略提示和 503；DOM 注入测试通过。
+- 文章镜像页覆盖 loading、空态、最新 100 条、顶部省略提示、回复线性显示和 503；mock API
+  Playwright DOM 注入测试通过。
 - termblog-web 只连接 public socket，路由无写入口。
 
 ### M4：部署收口
 
 - `make deploy` 后各进程、两个 socket 权限、root-only 数据目录正确。
 - target 清单由真实文章的直属目录去重生成，不给无直属文章的目录创建 FIFO。
-- `tests/verify-comments.sh` 覆盖 FIFO → queue → approve → API，并检查会话初始快照存在；
+- `tests/verify-comments.sh` 覆盖 FIFO → queue → approve → nested reply → local-number API，
+  并检查 public API/会话快照不泄露全局 ID；
   新会话启动 barrier 负责取得最新 approved 评论。
 
 ## 13. 实施落点
@@ -484,6 +538,6 @@ session_drain_ms   = 1000
 
 ## 15. 后续候选
 
-评论静态烘焙供无 JS 访客/爬虫读取、`auto_approve`、推送通知、reply 嵌套、
+评论静态烘焙供无 JS 访客/爬虫读取、`auto_approve`、推送通知、
 `~/.comment-name` 会话粘性签名、评论数进入 `.index`/Atom、审核 Web UI、
 跨会话增量快照缓存。
