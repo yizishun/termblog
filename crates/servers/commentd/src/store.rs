@@ -216,7 +216,7 @@ impl Store {
         Ok(SubmitResponse {
             ok: true,
             id: Some(id),
-            notice: format!("[#{id}] 已投入待审队列，归属 {}", req.target),
+            notice: "评论已投入待审队列".into(),
             error: None,
         })
     }
@@ -547,6 +547,7 @@ mod tests {
             })
             .unwrap();
         assert!(r.ok);
+        assert_eq!(r.notice, "评论已投入待审队列");
         assert!(td.path().join(DATA_FILE).is_file());
         assert_eq!(
             s.page(

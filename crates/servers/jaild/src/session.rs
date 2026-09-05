@@ -184,6 +184,10 @@ async fn pump(
                         why = "输出通道关闭(接入层断开)";
                         break;
                     }
+                    // zsh 可能已在异步 ack 之前画好下一个 prompt。用默认为
+                    // ignore 的专用信号让 .zshrc 中的 ZLE trap 重画当前编辑行；
+                    // 仍不向 PTY 输入缓冲区注入任何字节。
+                    let _ = kill(pid, Signal::SIGURG);
                 }
                 None => ack_open = false,
             },

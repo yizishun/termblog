@@ -89,6 +89,12 @@ export LANG=C.UTF-8
 umask 022
 PS1='%F{green}blog@jail%f %~ %# '
 setopt INTERACTIVE_COMMENTS
+# jaild 的评论回执不经 PTY，可能在 prompt 之后异步到达。SIGURG
+# 默认为忽略；在 zsh 内只用它通知 ZLE 重画 prompt 和未提交的编辑行。
+TRAPURG() {
+    [[ -o zle ]] && zle -I
+    return 0
+}
 echo '帮助: blog ~/help.md    博客: blog 看列表, blog <article-key> 读文章'
 echo '录像: play 看列表, play <cast-key> 播放 (空格暂停, q 退出)'
 EOF

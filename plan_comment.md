@@ -185,7 +185,7 @@ submit 不接受预解析的 `author`/`text`；commentd 是前缀解析与规范
 `stale_revision`，调用方丢弃本轮并重试。这样数千条评论不会撞上现有 1 MiB 帧上限，
 也不会拼出跨版本快照。
 
-notice 由 commentd 生成，例如 `[#42] 已投入待审队列，归属 /blog/hello/`。
+notice 由 commentd 生成，例如 `评论已投入待审队列`；不得向访客暴露数据库全局 ID。
 它是持久化完成后的异步通知，不是 `echo` 的同步返回值。
 
 ## 6. jaild：安全打开、评论泵与快照
@@ -227,7 +227,10 @@ pump 的 `tokio::select!` 新增 ack 分支，并继续独占 `out`。任何 not
 `write_all(master, ...)`：写 PTY master 等价于模拟键盘输入，可能进入编辑缓冲甚至执行。
 
 `echo ... > comment` 成功只代表内核收到了字节，不代表 commentd 已持久化。成功/失败
-ack 在提交完成后异步到达，可能与下一条 prompt 交错；第一版接受此显示效果。
+ack 在提交完成后异步到达，可能晚于下一条 prompt。pump 把 ack 放入输出队列后向 shell
+发送 `SIGURG`；模板 `.zshrc` 的 trap 用 `zle -I` 使 zsh 重画 prompt 及尚未提交的编辑行。
+`SIGURG` 的默认动作是忽略，因此 shell 已退出或被 `exec` 替换时通知也不会误杀进程；trap
+无论 ZLE 是否活跃都返回成功。这个通知只触发 shell 自己重画，仍不向 PTY master 写入字节。
 
 会话总限额为 8 条。PTY EOF 或接入层关闭后，停止接收新投稿，对各 FIFO 做最后一次
 非阻塞 drain，关闭 ingress，再给已读入队列的投稿最多 1 秒完成 submit/ack，之后才
