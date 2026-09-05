@@ -84,15 +84,17 @@ try {
   write(join(content, "help.md"), "# Help\n\nRoot article.\n");
   write(join(content, "notes/unix.md"), "# Unix notes\n\nNested article.\n");
   write(join(content, "demos/boot.cast"), '{"version":2,"width":80,"height":24}\n');
+  write(join(content, "proc/readme.txt"), "HOME proc remains ordinary content.\n");
   write(join(content, ".draft.md"), "# Hidden\n");
   write(join(content, "notes/.secret.md"), "# Hidden nested\n");
   write(
     join(content, ".termblog.toml"),
-    '[comments]\ndirectories = ["", "empty-comments-dir"]\n',
+    '[scopes]\ndirectories = ["", "empty-comments-dir"]\n',
   );
 
   build();
   check(!existsSync(join(content, "blog")), "fixture 不含 blog/ 源目录");
+  check(existsSync(join(content, "proc/readme.txt")), "HOME 下的 proc 路径不被统计系统占用");
   check(existsSync(join(dist, "help/index.html")), "根文章生成 /help/");
   check(existsSync(join(dist, "notes/unix/index.html")), "嵌套文章生成 /notes/unix/");
   check(existsSync(join(dist, "blog/index.html")), "无 blog/ 源目录仍生成 /blog/ 全站列表");
@@ -124,7 +126,7 @@ try {
   check(readFileSync(join(dist, "sitemap.xml"), "utf8").includes("/notes/unix/"), "sitemap 使用明确 route");
   check(readFileSync(join(dist, "atom.xml"), "utf8").includes("/help/"), "Atom 覆盖根文章 route");
 
-  write(join(content, ".termblog.toml"), "[comments]\ndirectories = []\n");
+  write(join(content, ".termblog.toml"), "[scopes]\ndirectories = []\n");
   build();
   check(readFileSync(join(content, ".comment-targets.tsv"), "utf8") === "", "评论可整体禁用并生成空清单");
   check(
@@ -133,7 +135,7 @@ try {
   );
   write(
     join(content, ".termblog.toml"),
-    '[comments]\ndirectories = ["", "empty-comments-dir"]\n',
+    '[scopes]\ndirectories = ["", "empty-comments-dir"]\n',
   );
   build();
 

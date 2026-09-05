@@ -44,3 +44,9 @@ private_socket = "/var/run/commentd-private.sock"
 data_dir = "/var/db/termblog-commentd"
 targets_file = "/usr/local/share/termblog/comment-targets.tsv"
 session_drain_ms = 1000
+
+[stats]
+socket = "/var/run/termblog-statd.sock"
+data_dir = "/var/db/termblog-statd"
+# 统计是非关键链路；超时后访问照常继续。
+request_timeout_ms = 250

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 use serde::Deserialize;
-use termblog_content_model::{ArticlePath, CommentAttachment};
+use termblog_content_model::{ArticlePath, CommentAttachment, ContentScope};
 
 const GLOBAL_LIST_DIRECTORY: &str = "blog";
 const GLOBAL_LIST_OUTPUT: &str = "blog/index.html";
@@ -110,7 +110,10 @@ fn scan_content(
         let metadata = std::fs::symlink_metadata(&path)
             .with_context(|| format!("read directory entry metadata {}", path.display()))?;
         if metadata.file_type().is_symlink() {
-            path_errors.push(format!("{}: content does not support symlinks", rel.display()));
+            path_errors.push(format!(
+                "{}: content does not support symlinks",
+                rel.display()
+            ));
             continue;
         }
         if termblog_content_model::has_hidden_component(&rel_str) {
@@ -124,7 +127,10 @@ fn scan_content(
                         | ".web-outputs.tsv"
                 )
             {
-                warns.push(format!("skipping unknown hidden content: {}", rel.display()));
+                warns.push(format!(
+                    "skipping unknown hidden content: {}",
+                    rel.display()
+                ));
             }
             continue;
         }
@@ -160,52 +166,72 @@ fn scan_content(
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ContentConfig {
-    comments: ContentComments,
+    /// Preferred shared directory-scope spelling.
+    scopes: Option<ContentDirectories>,
+    /// Backward-compatible spelling used before statistics shared the scope.
+    comments: Option<ContentDirectories>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct ContentComments {
+struct ContentDirectories {
     directories: Vec<String>,
 }
 
-fn load_comment_attachments(content: &Path) -> Result<Vec<CommentAttachment>> {
+fn load_scopes(content: &Path) -> Result<Vec<ContentScope>> {
     let config_path = content.join(".termblog.toml");
     if !config_path.exists() {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(&config_path)
         .with_context(|| format!("read content config {}", config_path.display()))?;
-    let config: ContentConfig =
-        toml::from_str(&text).with_context(|| format!("parse content config {}", config_path.display()))?;
+    let config: ContentConfig = toml::from_str(&text)
+        .with_context(|| format!("parse content config {}", config_path.display()))?;
+    let directories = match (config.scopes, config.comments) {
+        (Some(_), Some(_)) => bail!(
+            "{}: configure either [scopes] or legacy [comments], not both",
+            config_path.display()
+        ),
+        (Some(scopes), None) => scopes.directories,
+        (None, Some(comments)) => comments.directories,
+        (None, None) => Vec::new(),
+    };
     let mut seen = BTreeSet::new();
-    let mut attachments = Vec::new();
-    for directory in config.comments.directories {
+    let mut scopes = Vec::new();
+    for directory in directories {
         if !seen.insert(directory.clone()) {
             bail!(
-                "{}: comments.directories duplicate entry {:?}",
+                "{}: configured directories duplicate entry {:?}",
                 config_path.display(),
                 directory
             );
         }
-        let attachment = CommentAttachment::from_directory_rel(&directory).map_err(|e| {
-            anyhow::anyhow!("{}: comment directory {:?}: {e}", config_path.display(), directory)
+        let scope = ContentScope::from_directory_rel(&directory).map_err(|e| {
+            anyhow::anyhow!(
+                "{}: configured directory {:?}: {e}",
+                config_path.display(),
+                directory
+            )
         })?;
-        let directory_path = content.join(&attachment.directory_rel);
-        let metadata = std::fs::symlink_metadata(&directory_path)
-            .with_context(|| format!("configured comment directory does not exist: {}", directory_path.display()))?;
+        let directory_path = content.join(&scope.directory_rel);
+        let metadata = std::fs::symlink_metadata(&directory_path).with_context(|| {
+            format!(
+                "configured directory does not exist: {}",
+                directory_path.display()
+            )
+        })?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             bail!(
-                "configured comment directory must be a real directory: {} ({:?})",
+                "configured directory must be a real directory: {} ({:?})",
                 directory_path.display(),
                 directory
             );
         }
-        let reserved = content.join(&attachment.fifo_rel);
+        let reserved = content.join(&scope.comment_rel);
         match std::fs::symlink_metadata(&reserved) {
             Ok(_) => {
                 bail!(
-                    "comment directory {:?} reserves path {} once enabled, but path is already taken by source content",
+                    "configured directory {:?} reserves comment path {}, but it is already taken by source content",
                     directory,
                     reserved.display()
                 );
@@ -213,13 +239,13 @@ fn load_comment_attachments(content: &Path) -> Result<Vec<CommentAttachment>> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("check comment reserved path {}", reserved.display()));
+                    .with_context(|| format!("check reserved path {}", reserved.display()));
             }
         }
-        attachments.push(attachment);
+        scopes.push(scope);
     }
-    attachments.sort_by(|a, b| a.fifo_rel.cmp(&b.fifo_rel));
-    Ok(attachments)
+    scopes.sort_by(|a, b| a.comment_rel.cmp(&b.comment_rel));
+    Ok(scopes)
 }
 /// 收集事件流里所有图片的 dest_url 原文(文档序, 含重复)。
 fn collect_image_dests(events: &[Event<'static>]) -> Vec<String> {
@@ -257,7 +283,11 @@ fn read_web_manifest(content: &Path) -> Result<(BTreeMap<String, String>, bool)>
             .ok_or_else(|| anyhow::anyhow!("{} line {} missing Tab", path.display(), index + 1))?;
         validate_output_rel(rel)?;
         if owner.is_empty() || outputs.insert(rel.to_owned(), owner.to_owned()).is_some() {
-            bail!("{} line {} is empty or duplicated", path.display(), index + 1);
+            bail!(
+                "{} line {} is empty or duplicated",
+                path.display(),
+                index + 1
+            );
         }
     }
     Ok((outputs, true))
@@ -307,7 +337,10 @@ fn walk_regular_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            bail!("Web static tree does not allow symlinks: {}", path.display());
+            bail!(
+                "Web static tree does not allow symlinks: {}",
+                path.display()
+            );
         }
         if metadata.is_dir() {
             walk_regular_files(root, &path, out)?;
@@ -330,7 +363,10 @@ fn walk_output_nodes(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            bail!("Web static tree does not allow symlinks: {}", path.display());
+            bail!(
+                "Web static tree does not allow symlinks: {}",
+                path.display()
+            );
         }
         let rel = path.strip_prefix(root)?.to_string_lossy();
         if metadata.is_dir() {
@@ -498,7 +534,8 @@ fn write_stage(stage: &Path, rel: &str, bytes: impl AsRef<[u8]>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, bytes).with_context(|| format!("write staging artifact {}", path.display()))
+    std::fs::write(&path, bytes)
+        .with_context(|| format!("write staging artifact {}", path.display()))
 }
 
 fn remove_empty_parents(mut path: PathBuf, stop: &Path) {
@@ -521,8 +558,9 @@ fn commit_web_outputs(
     if !has_manifest {
         let legacy = dist.join(GLOBAL_LIST_DIRECTORY);
         if legacy.exists() {
-            std::fs::remove_dir_all(&legacy)
-                .with_context(|| format!("clean up legacy content directory {}", legacy.display()))?;
+            std::fs::remove_dir_all(&legacy).with_context(|| {
+                format!("clean up legacy content directory {}", legacy.display())
+            })?;
         }
     }
     for rel in old_outputs.keys() {
@@ -541,7 +579,9 @@ fn commit_web_outputs(
     for rel in staged {
         let source = stage.join(&rel);
         let target = dist.join(&rel);
-        let parent = target.parent().context("Web artifact missing parent directory")?;
+        let parent = target
+            .parent()
+            .context("Web artifact missing parent directory")?;
         std::fs::create_dir_all(parent)?;
         let file_name = target
             .file_name()
@@ -579,7 +619,9 @@ fn replace_tree(staged: &Path, destination: &Path) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
-    let parent = path.parent().context("atomic write path missing parent directory")?;
+    let parent = path
+        .parent()
+        .context("atomic write path missing parent directory")?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -612,7 +654,10 @@ fn main() -> Result<()> {
     let content_metadata = std::fs::symlink_metadata(&cli.content)
         .with_context(|| format!("read content root {}", cli.content.display()))?;
     if !content_metadata.is_dir() || content_metadata.file_type().is_symlink() {
-        bail!("content root does not exist or is not a directory: {}", cli.content.display());
+        bail!(
+            "content root does not exist or is not a directory: {}",
+            cli.content.display()
+        );
     }
     validate_control_paths(&cli.content)?;
     let mut article_paths: Vec<ArticlePath> = Vec::new();
@@ -634,14 +679,16 @@ fn main() -> Result<()> {
         for error in &path_errors {
             eprintln!("content path violation: {error}");
         }
-        bail!("content path validation failed: {} issue(s)", path_errors.len());
+        bail!(
+            "content path validation failed: {} issue(s)",
+            path_errors.len()
+        );
     }
     article_paths.sort_by(|a, b| a.key.cmp(&b.key));
-    let attachments = load_comment_attachments(&cli.content)?;
-    let attachments_by_dir: BTreeMap<String, CommentAttachment> = attachments
+    let scopes = load_scopes(&cli.content)?;
+    let attachments_by_dir: BTreeMap<String, CommentAttachment> = scopes
         .iter()
-        .cloned()
-        .map(|attachment| (attachment.directory_rel.clone(), attachment))
+        .map(|scope| (scope.directory_rel.clone(), scope.comment_attachment()))
         .collect();
 
     // 逐篇: 读文件(BOM/CRLF 规范化)→ 解析(两投影共用同一套选项)→ 元数据 → 日期
@@ -656,7 +703,8 @@ fn main() -> Result<()> {
     let mut total_bytes = 0usize;
     for article_path in &article_paths {
         let path = cli.content.join(&article_path.source_rel);
-        let src = std::fs::read(&path).with_context(|| format!("read article {}", path.display()))?;
+        let src =
+            std::fs::read(&path).with_context(|| format!("read article {}", path.display()))?;
         let mut text = String::from_utf8(src)
             .with_context(|| format!("article is not UTF-8: {}", path.display()))?;
         if let Some(stripped) = text.strip_prefix('\u{feff}') {
@@ -696,7 +744,9 @@ fn main() -> Result<()> {
                 }
                 Ok(img::ResolvedImage::External(_)) => {
                     if dest.starts_with('/') {
-                        warns.push(format!("\"{key}\" site-absolute image is not managed by pipeline: {dest}"));
+                        warns.push(format!(
+                            "\"{key}\" site-absolute image is not managed by pipeline: {dest}"
+                        ));
                     }
                     continue;
                 }
@@ -710,7 +760,9 @@ fn main() -> Result<()> {
             };
             let img_path = cli.content.join(&rel_path);
             if !img_path.is_file() {
-                image_errors.push(format!("image referenced by \"{key}\" does not exist: {rel_path}"));
+                image_errors.push(format!(
+                    "image referenced by \"{key}\" does not exist: {rel_path}"
+                ));
                 continue;
             }
             match img::process_image(&img_path, &rel_path, key) {
@@ -766,7 +818,10 @@ fn main() -> Result<()> {
         for e in &image_errors {
             eprintln!("image error: {e}");
         }
-        bail!("image processing failed: {} issue(s), please fix and re-run", image_errors.len());
+        bail!(
+            "image processing failed: {} issue(s), please fix and re-run",
+            image_errors.len()
+        );
     }
     // 未被引用的资源仅告警(不处理不复制, 如 demo.cast 的先例)
     for a in &assets {
@@ -876,10 +931,11 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&rendered_assets)?;
     let dist_blog = stage_web.join(GLOBAL_LIST_DIRECTORY);
 
-    // 评论 attachment 完全来自显式内容配置，与文章集合无关。
-    let target_rows: Vec<(String, String)> = attachments
+    // Shared scopes come entirely from explicit content configuration and do
+    // not depend on whether a directory currently contains an article.
+    let target_rows: Vec<(String, String)> = scopes
         .iter()
-        .map(|attachment| (attachment.fifo_rel.clone(), attachment.target.clone()))
+        .map(|scope| (scope.comment_rel.clone(), scope.target.clone()))
         .collect();
     let target_manifest: String = target_rows
         .iter()
@@ -900,7 +956,8 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        std::fs::write(&q, bytes).with_context(|| format!("write processed image {}", q.display()))?;
+        std::fs::write(&q, bytes)
+            .with_context(|| format!("write processed image {}", q.display()))?;
     }
 
     // ANSI 占位框里 URL 的基址: 有 site_url 拼完整 URL(SSH 用户可直接复制进浏览器),
@@ -977,7 +1034,8 @@ fn main() -> Result<()> {
         serde_json::to_vec_pretty(&machine_index)?,
     )
     .with_context(|| format!("write {}", rendered.join(".index.json").display()))?;
-    std::fs::create_dir_all(&dist_blog).with_context(|| format!("create {}", dist_blog.display()))?;
+    std::fs::create_dir_all(&dist_blog)
+        .with_context(|| format!("create {}", dist_blog.display()))?;
     let entry_js_str = entry_js.as_deref().unwrap_or_default();
     let list = html::render_list_page(&arts, site_url.as_deref(), &site_title, entry_js_str);
     std::fs::write(dist_blog.join("index.html"), list)
@@ -1045,7 +1103,10 @@ fn main() -> Result<()> {
         total_bytes / 1024,
         img::MAX_ARTICLE_BYTES / 1024
     );
-    println!("  processed images: {}/.rendered-assets/", cli.content.display());
+    println!(
+        "  processed images: {}/.rendered-assets/",
+        cli.content.display()
+    );
     for w in &warns {
         println!("warning: {w}");
     }
@@ -1090,8 +1151,18 @@ mod tests {
         // 目录以尾 / 登记: 与目录内新文件不冲突(文章可以在既有目录下建页面)。
         let mut claims = BTreeMap::new();
         let mut errors = Vec::new();
-        claim_output(&mut claims, "help/", "existing directory help/", &mut errors);
-        claim_output(&mut claims, "help/index.html", "article help.md", &mut errors);
+        claim_output(
+            &mut claims,
+            "help/",
+            "existing directory help/",
+            &mut errors,
+        );
+        claim_output(
+            &mut claims,
+            "help/index.html",
+            "article help.md",
+            &mut errors,
+        );
         assert!(errors.is_empty(), "目录与子文件不应冲突: {errors:?}");
 
         // 同一输出的第二个 owner → 精确冲突。
@@ -1114,5 +1185,64 @@ mod tests {
         );
         claim_output(&mut claims, "new/index.html", "article new.md", &mut errors);
         assert_eq!(errors.len(), 1, "文件与同名目录应冲突: {errors:?}");
+    }
+
+    #[test]
+    fn configured_scopes_map_root_nested_and_empty_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("notes/deep")).unwrap();
+        std::fs::create_dir_all(directory.path().join("empty")).unwrap();
+        std::fs::create_dir_all(directory.path().join("proc")).unwrap();
+        std::fs::write(
+            directory.path().join(".termblog.toml"),
+            "[scopes]\ndirectories = [\"\", \"notes/deep\", \"empty\", \"proc\"]\n",
+        )
+        .unwrap();
+        let scopes = load_scopes(directory.path()).unwrap();
+        assert_eq!(
+            scopes
+                .iter()
+                .map(|scope| scope.stat_rel.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "proc/stat",
+                "proc/empty/stat",
+                "proc/notes/deep/stat",
+                "proc/proc/stat",
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_scope_rejects_duplicates_and_comment_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".termblog.toml");
+        std::fs::write(&config, "[scopes]\ndirectories = [\"\", \"\"]\n").unwrap();
+        assert!(load_scopes(directory.path()).is_err());
+
+        std::fs::write(&config, "[scopes]\ndirectories = [\"\"]\n").unwrap();
+        std::fs::create_dir(directory.path().join("proc")).unwrap();
+        assert!(
+            load_scopes(directory.path()).is_ok(),
+            "HOME proc is ordinary content"
+        );
+
+        std::fs::write(directory.path().join("comment"), b"occupied").unwrap();
+        let error = load_scopes(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("comment"));
+
+        std::fs::remove_file(directory.path().join("comment")).unwrap();
+        std::fs::write(
+            &config,
+            "[scopes]\ndirectories = []\n[comments]\ndirectories = []\n",
+        )
+        .unwrap();
+        assert!(load_scopes(directory.path()).is_err());
+
+        std::fs::write(&config, "[comments]\ndirectories = [\"\"]\n").unwrap();
+        assert_eq!(
+            load_scopes(directory.path()).unwrap()[0].stat_rel,
+            "proc/stat"
+        );
     }
 }

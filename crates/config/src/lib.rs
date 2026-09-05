@@ -1,4 +1,4 @@
-//! 全局配置(TOML)。web / ssh / jaild / commentd 与 content-build 共用同一份配置文件。
+//! 全局配置(TOML)。web / ssh / jaild / commentd / statd 与 content-build 共用同一份配置文件。
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,7 @@ pub struct Config {
     pub session: SessionConfig,
     pub jail: JailConfig,
     pub comments: CommentsConfig,
+    pub stats: StatsConfig,
 }
 
 impl Config {
@@ -27,8 +28,8 @@ impl Config {
             None => PathBuf::from(DEFAULT_CONFIG),
         };
         let cfg = if p.exists() {
-            let s =
-                std::fs::read_to_string(&p).with_context(|| format!("read config {}", p.display()))?;
+            let s = std::fs::read_to_string(&p)
+                .with_context(|| format!("read config {}", p.display()))?;
             toml::from_str(&s).with_context(|| format!("parse config {}", p.display()))
         } else {
             Ok(Config::default())
@@ -55,7 +56,47 @@ impl Config {
         if c.session_drain_ms == 0 {
             anyhow::bail!("comments drain timeout must be greater than 0");
         }
+        let s = &self.stats;
+        if !s.socket.is_absolute() || !s.data_dir.is_absolute() {
+            anyhow::bail!("stats socket and data_dir must be absolute paths");
+        }
+        if [
+            &self.jail.socket,
+            &self.comments.public_socket,
+            &self.comments.private_socket,
+        ]
+        .contains(&&s.socket)
+        {
+            anyhow::bail!("stats socket cannot be identical to another service socket");
+        }
+        if s.data_dir == self.comments.data_dir {
+            anyhow::bail!("stats and comments data directories cannot be identical");
+        }
+        if s.request_timeout_ms == 0 {
+            anyhow::bail!("stats request timeout must be greater than 0");
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StatsConfig {
+    /// Shared SEQPACKET socket used by jaild and the unprivileged Web process.
+    pub socket: PathBuf,
+    /// Root-only SQLite database and visitor-HMAC secret directory.
+    pub data_dir: PathBuf,
+    /// End-to-end timeout for a best-effort RecordBatch or Snapshot request.
+    pub request_timeout_ms: u64,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            socket: PathBuf::from("/var/run/termblog-statd.sock"),
+            data_dir: PathBuf::from("/var/db/termblog-statd"),
+            request_timeout_ms: 250,
+        }
     }
 }
 
@@ -188,5 +229,40 @@ impl Default for JailConfig {
             zsh: "/usr/local/bin/zsh".into(),
             guest_user: "guest".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_paths_and_timeout_are_validated() {
+        let mut cfg = Config::default();
+        cfg.stats.socket = "relative.sock".into();
+        assert!(cfg.validate().is_err());
+
+        let defaults = Config::default();
+        for socket in [
+            defaults.jail.socket,
+            defaults.comments.public_socket,
+            defaults.comments.private_socket,
+        ] {
+            let mut cfg = Config::default();
+            cfg.stats.socket = socket;
+            assert!(cfg.validate().is_err());
+        }
+
+        let mut cfg = Config::default();
+        cfg.stats.data_dir = "relative-data".into();
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.stats.data_dir = cfg.comments.data_dir.clone();
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.stats.request_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
     }
 }

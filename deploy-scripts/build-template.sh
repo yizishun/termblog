@@ -130,19 +130,23 @@ chown -R 1001:1001 "$BUILD_MOUNT/home/$GUEST"
 # 评论设备：只按 content-build 从 .termblog.toml 生成的可信清单创建。
 TARGETS="$REPO/jailtpl/content/.comment-targets.tsv"
 [ -f "$TARGETS" ] || { echo "missing comment targets manifest: $TARGETS"; exit 1; }
+ARTICLE_INDEX="$REPO/jailtpl/content/.rendered/.index.json"
+[ -f "$ARTICLE_INDEX" ] || { echo "missing article index: $ARTICLE_INDEX"; exit 1; }
 install -d -m 755 "$BUILD_MOUNT/usr/local/share/termblog"
 install -m 444 "$TARGETS" "$BUILD_MOUNT/usr/local/share/termblog/comment-targets.tsv"
+install -m 444 "$ARTICLE_INDEX" "$BUILD_MOUNT/usr/local/share/termblog/article-index.json"
 while IFS="$(printf '\t')" read -r rel target; do
     [ -n "$rel" ] && [ -n "$target" ] || { echo "invalid empty target line"; exit 1; }
     case "$rel" in
         /*|*//*|.|..|../*|*/../*|*/..) echo "invalid comment device path: $rel"; exit 1 ;;
     esac
     case "$rel" in
-        comment) expected="/" ;;
+        comment) expected="/"; scope_dir="" ;;
         */comment)
             dir=${rel%/comment}
             case "$dir" in ""|/*|*/|*//*|*[!a-z0-9/-]*) echo "invalid comment directory: $dir"; exit 1 ;; esac
             expected="/$dir/"
+            scope_dir=$dir
             ;;
         *) echo "invalid comment device path: $rel"; exit 1 ;;
     esac
@@ -153,9 +157,19 @@ while IFS="$(printf '\t')" read -r rel target; do
     install -d -m 755 -o 1001 -g 1001 "$parent"
     mkfifo -m 600 "$fifo"
     chown 1001:1001 "$fifo"
+
+    # One ordinary jail-root /proc tree mirrors configured HOME scopes.
+    # jaild publishes /proc/stat or /proc/<scope>/stat before the guest fork.
+    proc="$BUILD_MOUNT/proc"
+    [ -z "$scope_dir" ] || proc="$proc/$scope_dir"
+    if [ -e "$proc" ]; then
+        [ -d "$proc" ] && [ ! -L "$proc" ] || { echo "scope proc path is not a real directory: $proc"; exit 1; }
+    fi
+    install -d -m 555 -o root -g wheel "$proc"
+    [ ! -e "$proc/stat" ] || { echo "scope stat path already exists: $proc/stat"; exit 1; }
 done < "$TARGETS"
 
-# 会话快照目录由 root 管理；guest 只能读取 comments.jsonl。
+# 评论快照运行目录由 root 管理；guest 只能读取 comments.jsonl。
 install -d -m 755 "$BUILD_MOUNT/var/run/termblog"
 
 # 9. jailbin 命令(0555, 只读): blog / play / webctl 是指向 jailbin 的符号链接(busybox 式)

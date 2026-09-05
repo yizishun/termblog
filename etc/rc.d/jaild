@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # PROVIDE: jaild
-# REQUIRE: LOGIN zfs commentd
+# REQUIRE: LOGIN zfs commentd termblog_statd
 # BEFORE: termblog
 # KEYWORD: shutdown
 

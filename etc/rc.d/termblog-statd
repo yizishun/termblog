@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# PROVIDE: termblog_statd
+# REQUIRE: LOGIN
+# BEFORE: jaild termblog
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="termblog_statd"
+rcvar="termblog_statd_enable"
+command="/usr/sbin/daemon"
+command_args="-H -p /var/run/termblog-statd.pid -P /var/run/termblog-statd-super.pid -o /var/log/termblog-statd.log /usr/local/sbin/termblog-statd"
+pidfile="/var/run/termblog-statd.pid"
+
+load_rc_config "$name"
+: "${termblog_statd_enable:=NO}"
+run_rc_command "$1"

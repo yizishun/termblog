@@ -115,12 +115,12 @@ blog -- -draft.md     # -- 结束选项
 
 具备 `img-iterm2` capability 的 Web 会话使用 TUI 阅读器显示像素图；SSH 和旧前端自动回退到带 OSC 8 链接的稳定占位框。sidecar 从 rendered 文件 basename 推导，避免嵌套 key 被重复拼接。
 
-## 评论 attachment
+## 共享目录 scope
 
-评论归属由 `.termblog.toml` 显式配置：
+评论与统计归属共同由 `.termblog.toml` 显式配置：
 
 ```toml
-[comments]
+[scopes]
 directories = ["", "notes", "projects/demo"]
 ```
 
@@ -132,11 +132,13 @@ notes/comment           /notes/
 projects/demo/comment   /projects/demo/
 ```
 
-jaild 从 root-owned 清单取得 `(FIFO, target)`，以 HOME fd 为锚逐层使用 `O_NOFOLLOW` 打开，并确认末端确实是 FIFO。HTML 与终端只在文章直属目录存在 attachment 时展示评论；配置可以指向空目录，与文章发现互不依赖。
+jaild 从 root-owned 清单取得 `(FIFO, target)`，以 HOME fd 为锚逐层使用 `O_NOFOLLOW` 打开，并确认末端确实是 FIFO；所有 scope 的快照统一映射到 jail 根目录的一棵普通 `/proc` 树，不占用 HOME 中的 `proc` 路径。HTML 与终端只在文章直属目录存在 scope 时展示评论和记录文章统计；配置可以指向空目录，与文章发现互不依赖。
+
+每次会话在 guest fork 前从 `termblog-statd` 取一次统一快照，并原子生成 `/proc/stat` 或 `/proc/<scope>/stat`。该普通文件为 `root:wheel 0444`，会话内保持不变；统计服务不可用只会令文件标记 `stats_status unavailable`，不会阻断会话。
 
 ## HOME 模板与部署
 
-`build-template.sh` 将 content 中完整的非隐藏树按原路径复制到 guest HOME，再单独安装生成的 `.rendered/`、`.rendered-assets/` 和评论 FIFO。`.termblog.toml` 等隐藏控制面不会复制，`.zshrc` 仍由模板脚本生成。
+`build-template.sh` 将 content 中完整的非隐藏树按原路径复制到 guest HOME，再单独安装生成的 `.rendered/`、`.rendered-assets/`、评论 FIFO 和 jail-root `/proc` 目录树。`.termblog.toml` 等隐藏控制面不会复制，`.zshrc` 仍由模板脚本生成。
 
 常用入口：
 

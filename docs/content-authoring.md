@@ -28,25 +28,27 @@ Web URL：/notes/unix/arch.png
 
 允许 `png`、`jpg`、`jpeg`、`webp`、`gif`；资源路径字符集为 `[a-z0-9/._-]`。普通位图宽度超过 1080 px 会缩小，处理后单张上限 256 KiB，GIF 上限 512 KiB，单篇总量上限 1.5 MiB。WebP 的终端资产会统一转成 PNG。外部绝对 URL 原样保留，未被文章引用的本地图片不发布并给出告警。
 
-## 评论 attachment
+## 目录 scope、评论与统计快照
 
-评论目录由 `jailtpl/content/.termblog.toml` 显式配置，不从文章路径或目录名猜测：
+需要评论或统计的 HOME 目录由 `jailtpl/content/.termblog.toml` 显式配置，不从文章路径或目录名猜测：
 
 ```toml
-[comments]
+[scopes]
 # 空字符串代表 HOME 根。
 directories = ["", "notes", "projects/demo"]
 ```
 
-每个目录必须真实存在且不能是符号链接。配置后，该目录中的 `comment` 名称保留给 FIFO：
+每个目录必须真实存在且不能是符号链接。启用后，HOME 中只有该目录的 `comment` 路径保留给 FIFO；统计快照统一放在 jail 根目录的一棵普通 `/proc` 树中，HOME 里的 `proc` 仍是普通内容；这里不会挂载 procfs、FUSE 或其他文件系统：
 
-| 配置目录 | jail FIFO | 评论 target |
-| --- | --- | --- |
-| `""` | `~/comment` | `/` |
-| `notes` | `~/notes/comment` | `/notes/` |
-| `projects/demo` | `~/projects/demo/comment` | `/projects/demo/` |
+| 配置目录 | jail FIFO | 统计快照 | target |
+| --- | --- | --- | --- |
+| `""` | `~/comment` | `/proc/stat` | `/` |
+| `notes` | `~/notes/comment` | `/proc/notes/stat` | `/notes/` |
+| `projects/demo` | `~/projects/demo/comment` | `/proc/projects/demo/stat` | `/projects/demo/` |
 
-只有文章直属目录被配置时，文章页和终端阅读器才展示评论。同目录文章共享一个 target；空目录或只含录像的目录也可以启用评论。
+只有文章直属目录被配置时，文章页和终端阅读器才展示评论并记录该文章的阅读统计。同目录文章共享一个 target；空目录或只含录像的目录也可以配置。旧的 `[comments]` 拼写仍可读取以便升级，但不能与 `[scopes]` 同时出现。
+
+根 scope 的 `/proc/stat` 与其他 scope 的 `/proc/<scope>/stat` 都是在创建终端会话时生成的普通只读快照，owner/mode 为 `root:wheel 0444`；当前会话中内容不会变化，新会话才会读取最新统计。目录汇总包含终端阅读会话数、静态 HTML 请求数、基于加盐 IP 的近似访客数和 approved 评论数；文章行仅列当前文章，并分别给出 terminal/static 次数。统计服务不可用时仍会创建文件，写入 `stats_status unavailable` 和可用的评论数，不把缺失统计伪装成零。target 汇总会保留已删除或移动文章的历史，因此可能大于当前文章行之和；NAT 会让访客数偏低，动态 IP 会让它偏高。
 
 ## 终端录像和普通文件
 
@@ -66,7 +68,7 @@ play demos/boot
 - `.termblog.toml`：作者配置，不复制到 jail。
 - `.rendered/`：ANSI 文章、图片 sidecar、可读索引与 `.index.json` 机器索引。
 - `.rendered-assets/`：终端 TUI 使用的处理后图片。
-- `.comment-targets.tsv`：构建生成的 FIFO/target 清单。
+- `.comment-targets.tsv`：构建生成的共享 scope 清单（保留 FIFO/target 两列格式）。
 - `.web-outputs.tsv`：构建器拥有的 Web 输出清单，用于精确清理删文和移动后的旧文件。
 
 生成物不要手工修改或提交。
@@ -81,6 +83,7 @@ play demos/boot
 blog                  # 列出所有正式文章
 blog notes/unix       # 通过 HOME-relative key 阅读正式文章
 blog ~/help.md        # 也可给出明确文件路径
+cat /proc/stat       # 查看本会话启动时冻结的根 scope 统计
 less ~/notes/unix.md  # 查看原始 Markdown
 ```
 

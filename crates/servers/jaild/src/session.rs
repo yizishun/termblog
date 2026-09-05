@@ -13,11 +13,13 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use termblog_commentd::{Client as CommentClient, SubmitRequest};
 use termblog_core::{Control, SessionHandle};
+use termblog_statd::{RecordEvent, Source, MAX_BATCH_EVENTS};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 
 use crate::jail::JailBackend;
 use crate::pty::{CommentFifo, ShellChild};
+use crate::watcher::{ArticleRead, RunningArticleReads};
 
 const OUTPUT_CHUNKS: usize = 128;
 const COMMENT_QUEUE: usize = 16;
@@ -115,6 +117,7 @@ async fn pump(
         master: master_fd,
         pid,
         comment_fifos,
+        article_reads,
     } = child;
     let master = match AsyncFd::new(master_fd) {
         Ok(m) => m,
@@ -137,6 +140,19 @@ async fn pump(
             return;
         }
     };
+
+    // NOTE_READ registrations were installed before fork.  Starting their
+    // delivery task here cannot miss an early guest read because kqueue keeps
+    // the one-shot event pending.
+    let (article_tx, article_rx) = mpsc::channel(MAX_BATCH_EVENTS * 2);
+    let running_article_reads: Option<RunningArticleReads> =
+        article_reads.map(|reads| reads.start(article_tx));
+    let mut article_stats_worker = tokio::spawn(article_stats_worker(
+        inner.backend.stats_client(),
+        sid.clone(),
+        peer,
+        article_rx,
+    ));
 
     let (submit_tx, submit_rx) = mpsc::channel(COMMENT_QUEUE);
     let (ack_tx, mut ack_rx) = mpsc::channel::<Bytes>(ACK_QUEUE);
@@ -208,9 +224,20 @@ async fn pump(
         }
     }
 
-    tracing::info!(sid, why, "pump exited, stopping submissions and performing final drain");
+    tracing::info!(
+        sid,
+        why,
+        "pump exited, stopping submissions and performing final drain"
+    );
     // 先停 writer，再让每个已打开 FIFO 读到 EAGAIN；路径从不重开。
     let _ = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGHUP);
+    if let Some(reads) = running_article_reads {
+        reads.stop().await;
+    }
+    // Statistics must never lengthen jail reclamation.  Events already
+    // committed remain durable; queued best-effort events may be dropped.
+    article_stats_worker.abort();
+    let _ = (&mut article_stats_worker).await;
     let _ = shutdown_tx.send(true);
     let drain = inner.backend.comment_drain_timeout();
     let deadline = tokio::time::Instant::now() + drain;
@@ -269,6 +296,37 @@ async fn pump(
     tracing::info!(sid, "shell reaped, backend cleanup started");
     let _ = inner.backend.cleanup(&sid).await;
     inner.table.lock().unwrap().remove(&sid);
+}
+
+async fn article_stats_worker(
+    client: termblog_statd::Client,
+    sid: String,
+    peer: IpAddr,
+    mut reads: mpsc::Receiver<ArticleRead>,
+) {
+    while let Some(first) = reads.recv().await {
+        let mut events = vec![RecordEvent {
+            source: Source::TerminalReadSession,
+            target: first.target,
+            article: first.article,
+            ip: peer.to_string(),
+        }];
+        while events.len() < MAX_BATCH_EVENTS {
+            let next = match reads.try_recv() {
+                Ok(next) => next,
+                Err(_) => break,
+            };
+            events.push(RecordEvent {
+                source: Source::TerminalReadSession,
+                target: next.target,
+                article: next.article,
+                ip: peer.to_string(),
+            });
+        }
+        if let Err(error) = client.record_batch(events).await {
+            tracing::warn!(sid, %error, "failed to record terminal article reads");
+        }
+    }
 }
 
 fn prepare_fifos(fifos: Vec<CommentFifo>) -> Result<Vec<(AsyncFd<OwnedFd>, String)>> {

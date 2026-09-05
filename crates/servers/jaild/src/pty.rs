@@ -7,6 +7,8 @@ use anyhow::Result;
 use nix::pty::Winsize;
 use nix::unistd::Pid;
 
+use crate::watcher::PreparedArticleReads;
+
 pub struct CommentFifo {
     pub fd: OwnedFd,
     /// 启动时从 root-owned 清单固定；运行期移动 inode 不改变归属。
@@ -17,6 +19,7 @@ pub struct ShellChild {
     pub master: OwnedFd, // PTY 主端: 读写泵操作它
     pub pid: Pid,        // 子进程(PTY 会话首进程): 用于发信号 / 回收
     pub comment_fifos: Vec<CommentFifo>,
+    pub article_reads: Option<PreparedArticleReads>,
 }
 
 /// TIOCSWINSZ: 通知 PTY 窗口尺寸变了(配合给子进程发 SIGWINCH)

@@ -15,6 +15,7 @@
 mod jail;
 mod pty;
 mod session;
+mod watcher;
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::{chown, PermissionsExt};
@@ -92,8 +93,11 @@ async fn main() -> Result<()> {
     ensure_devfs_ruleset();
 
     let mgr = SessionManager::new(
-        JailBackend::new(cfg.jail.clone(), cfg.comments.clone()),
-        Quota { max_total: cfg.session.max_total, max_per_ip: cfg.session.max_per_ip },
+        JailBackend::new(cfg.jail.clone(), cfg.comments.clone(), cfg.stats.clone()),
+        Quota {
+            max_total: cfg.session.max_total,
+            max_per_ip: cfg.session.max_per_ip,
+        },
     );
     info!(socket = %socket.display(), "jaild ready, starting accept");
 
@@ -113,28 +117,27 @@ async fn main() -> Result<()> {
 async fn handle_conn(mgr: SessionManager, link: Link) {
     // 1) 握手: 第一条帧必须是 Open(限时), 网关已填好真实 peer_ip。
     //    Open.attach_token 已废弃(刷新重连由 web 层自己处理), 收到即忽略。
-    let open: proto::Open =
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, link.recv()).await {
-            Ok(Ok(f)) if f.kind == proto::OPEN => match f.parse() {
-                Ok(o) => o,
-                Err(e) => {
-                    warn!(%e, "Open frame JSON parse failed");
-                    return;
-                }
-            },
-            Ok(Ok(f)) => {
-                warn!(kind = f.kind, "first frame is not Open");
+    let open: proto::Open = match tokio::time::timeout(HANDSHAKE_TIMEOUT, link.recv()).await {
+        Ok(Ok(f)) if f.kind == proto::OPEN => match f.parse() {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(%e, "Open frame JSON parse failed");
                 return;
             }
-            Ok(Err(e)) => {
-                warn!(%e, "read Open frame failed");
-                return;
-            }
-            Err(_) => {
-                warn!("read Open frame timed out");
-                return;
-            }
-        };
+        },
+        Ok(Ok(f)) => {
+            warn!(kind = f.kind, "first frame is not Open");
+            return;
+        }
+        Ok(Err(e)) => {
+            warn!(%e, "read Open frame failed");
+            return;
+        }
+        Err(_) => {
+            warn!("read Open frame timed out");
+            return;
+        }
+    };
     let peer = open
         .peer_ip
         .as_deref()
@@ -148,7 +151,12 @@ async fn handle_conn(mgr: SessionManager, link: Link) {
     let session = match mgr.create(peer, open.cols, open.rows, caps).await {
         Ok(s) => s,
         Err(e) => {
-            let f = proto::Frame::json(proto::CLOSED, &proto::Closed { reason: e.to_string() });
+            let f = proto::Frame::json(
+                proto::CLOSED,
+                &proto::Closed {
+                    reason: e.to_string(),
+                },
+            );
             let _ = link.send(&f).await;
             return;
         }
@@ -157,11 +165,14 @@ async fn handle_conn(mgr: SessionManager, link: Link) {
     // 初始尺寸已由 Open 帧经 SessionManager::create 在 openpty 时生效,
     // 这里无需再推一遍(刷新接回时的新尺寸由 web 侧推送)。
 
-    let f = proto::Frame::json(proto::OPENED, &proto::Opened {
-        session_id: session.id.clone(),
-        attach_token: String::new(), // 已废弃: 恢复机制只在 web 层
-        attached: false,
-    });
+    let f = proto::Frame::json(
+        proto::OPENED,
+        &proto::Opened {
+            session_id: session.id.clone(),
+            attach_token: String::new(), // 已废弃: 恢复机制只在 web 层
+            attached: false,
+        },
+    );
     if link.send(&f).await.is_err() {
         return; // session 随本函数退出被 drop => 会话立即回收
     }
@@ -215,7 +226,11 @@ mod tests {
     #[test]
     fn caps_whitelist_filter() {
         // 已知值保留, 未知值丢弃(顺序保留)
-        let caps = vec!["img-iterm2".to_string(), "evil; rm -rf".to_string(), "IMG_ITERM2".to_string()];
+        let caps = vec![
+            "img-iterm2".to_string(),
+            "evil; rm -rf".to_string(),
+            "IMG_ITERM2".to_string(),
+        ];
         assert_eq!(filter_caps(&caps), vec!["img-iterm2".to_string()]);
         assert!(filter_caps(&[]).is_empty());
         assert!(filter_caps(&["img-sixel".to_string()]).is_empty());

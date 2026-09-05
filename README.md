@@ -14,6 +14,11 @@ SEO 产物(sitemap/atom/canonical)构建期生成。
   写一行即可投稿。评论 attachment 由内容配置显式列出；同目录文章共享一个 FIFO，
   空目录也可独立启用评论。`alice: #1: 内容`（或 guest 的 `#1: 内容`）可回复同目录的
   已公开评论；数据库全局 ID 不进入公开 API 或 guest 快照。
+- **termblog-statd**(root, 统计单写者): 用 root-only SQLite 持久化 target/article 计数，
+  通过 Unix socket 接收有界批次。终端侧以 FreeBSD kqueue `NOTE_READ` 对每会话、
+  每文章最多计一次，Web 侧在 canonical HTML `GET 200/304` 后异步入队；访客数是
+  两种来源的加盐 IP HMAC 并集，原始 IP 与哈希均不公开。jaild 在 guest fork 前
+  根 scope 生成 `/proc/stat`，其他 scope 生成 `/proc/<scope>/stat`；文件均为 `root:wheel 0444` 的会话快照。
 - **termblog-web / termblog-ssh**(降权 www): 浏览器(WS)/ SSH 两个接入网关,
   经 SEQPACKET Unix socket 连 jaild, 零协议转换。
 - **content-build**: 把 `jailtpl/content/` 可见目录中的全部 `.md` 一次解析成两个投影 ——
@@ -38,8 +43,8 @@ SEO 产物(sitemap/atom/canonical)构建期生成。
 ```
 crates/
   config/        # termblog-config: TOML 配置(servers 与 content-build 共用)
-  servers/       # proto(线协议) core(会话运行时) web ssh jaild commentd
-  content-model/ # content/HOME 路径、公开 route、评论 attachment 的共享模型
+  servers/       # proto(线协议) core(会话运行时) web ssh jaild commentd statd
+  content-model/ # content/HOME 路径、公开 route、评论/统计 scope 的共享模型
   tools/         # content-build(内容编译器) jailbin(jail 内命令)
 deploy-scripts/  # build-template.sh(模板构建/零停机换面) deploy.sh(全量部署)
 tests/           # verify 脚本与无 blog 目录的 content path 端到端验收
@@ -62,15 +67,15 @@ frontend/        # xterm.js 前端(vite)
 部署目标内嵌 sudo, 直接 `make tpl` / `make deploy` / `make content` 即可
 (会提示输入密码)。部署脚本不依赖 Makefile; Makefile 只是薄入口。
 
-> **模板功能升级注意**: 新 jailbin、评论 FIFO/清单、`help.md` 和图片产物只存在于
+> **模板功能升级注意**: 新 jailbin、评论 FIFO/scope 清单、jail-root `/proc` 目录树、文章机器索引、`help.md` 和图片产物只存在于
 > 重建后的模板数据集里。升级已有安装时先零停机换模板，再部署守护进程：
 > `sudo sh deploy-scripts/build-template.sh --replace && sudo sh deploy-scripts/deploy.sh`。
-> `deploy.sh` 会拒绝启动缺少评论清单的旧模板，避免新 jaild 交付不了会话。
+> `deploy.sh` 会拒绝启动缺少 scope 清单、文章索引或 `/proc` 目录的旧模板，避免新 jaild 交付不了会话。
 > 后续只改文章仍走 `make content`(内部已含 `--replace`)。
 
 配置: `/usr/local/etc/termblog.toml`(仓库 `etc/termblog.toml` 为样例)。
 部署后务必设 `web.site_url`(不设则不产 sitemap/atom/canonical);
-`web.site_title` 用于镜像页标题 / og:site_name / atom 标题。
+`web.site_title` 用于镜像页标题 / og:site_name / atom 标题。`[stats]` 配置统计 socket、root-only 数据目录和非关键请求超时；首次全量部署会显式执行 `termblog-statd --init`，已有目录缺文件或 schema 损坏时拒绝自动修复。
 
 ## 验收
 
@@ -80,7 +85,9 @@ frontend/        # xterm.js 前端(vite)
   初始会话快照
 - `TERMBLOG_PW=1 node tests/e2e-comments-playwright.mjs`: mock API 下的回复线性顺序与注入回归
 - `node tests/e2e-reconnect.mjs`: 断线重连协议
-- `node tests/e2e-content-paths.mjs`: 通用 content/HOME 路径、清理与冲突回归
+- `node tests/e2e-content-paths.mjs`: 通用 content/HOME 路径、scope 到 `comment` 与 jail-root `/proc` 的映射、清理与冲突回归
+- `sh tests/verify-stats.sh`(root；可传 `TERMBLOG_VERIFY_JAIL_ROOT`): statd socket/数据权限与当前会话所有 `/proc/.../stat` 的格式、权限和内容冻结
+- `cargo test -p termblog-statd -p termblog-jaild -p termblog-web -p content-build`: SQLite 事务/持久化、访客并集、FreeBSD `NOTE_READ`、快照格式与 Web canonical 请求分类
 
 ## 开发
 

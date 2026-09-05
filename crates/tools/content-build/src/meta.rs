@@ -162,9 +162,11 @@ pub fn build_index(arts: &[Article]) -> String {
 }
 
 pub fn build_machine_index(arts: &[Article]) -> termblog_content_model::ArticleIndex {
+    let mut sorted: Vec<_> = arts.iter().collect();
+    sorted.sort_by(|a, b| a.path.key.cmp(&b.path.key));
     termblog_content_model::ArticleIndex {
         version: 1,
-        articles: arts
+        articles: sorted
             .iter()
             .map(|article| termblog_content_model::ArticleIndexEntry {
                 date10: article.date10.clone(),
@@ -275,6 +277,21 @@ mod tests {
         // 标题里 Tab 已被替换(标题提取保证, 这里直接构造含 Tab 的标题验证 build_index 不额外处理)
         let d = article("t", "2026-08-01", "2026-08-01T00:00:00+08:00", "含\tTab");
         assert_eq!(build_index(&[d]), "2026-08-01\tt\t含\tTab\n");
+    }
+
+    #[test]
+    fn machine_index_is_sorted_by_article_key() {
+        let z = article("z-last", "2026-09-05", "2026-09-05T12:00:00Z", "Z");
+        let a = article("a-first", "2026-09-04", "2026-09-04T12:00:00Z", "A");
+        let index = build_machine_index(&[z, a]);
+        assert_eq!(
+            index
+                .articles
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-first", "z-last"]
+        );
     }
 
     #[test]

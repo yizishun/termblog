@@ -18,7 +18,7 @@
 //! 后续想换 libjail-rs / rctl crate 对外界无感。`jail_attach(2)` 在 fork 后的
 //! 子进程里直接 syscall, PTY 从端、uid 切换、attach 的顺序完全可控。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -33,32 +33,44 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::{openpty, Winsize};
-use nix::unistd::{fork, ForkResult};
+use nix::unistd::{chown, fork, ForkResult, Gid, Uid};
 use tracing::{error, info, warn};
 
 use termblog_commentd::{
     protocol::PRIVATE_SYNC, visible_comments, Client as CommentClient, Comment, VisibleReply,
 };
-use termblog_config::{CommentsConfig, JailConfig};
+use termblog_config::{CommentsConfig, JailConfig, StatsConfig};
+use termblog_content_model::{ArticleIndex, ArticlePath, ContentScope};
+use termblog_statd::{
+    Client as StatsClient, SnapshotRequest, SnapshotResponse, SnapshotTargetRequest,
+    TargetSnapshot, MAX_SNAPSHOT_ARTICLES, MAX_SNAPSHOT_TARGETS,
+};
 
 use crate::pty::{CommentFifo, ShellChild};
+use crate::watcher::{ArticleReadFile, PreparedArticleReads};
 
 #[derive(Clone)]
 pub struct JailBackend {
     cfg: JailConfig,
     comments_cfg: CommentsConfig,
     comments: CommentClient,
+    stats: StatsClient,
     /// kern.osreldate(如 1500000 = 15.0): 处理跨版本参数差异
     osreldate: u32,
 }
 
 impl JailBackend {
-    pub fn new(cfg: JailConfig, comments_cfg: CommentsConfig) -> Self {
+    pub fn new(cfg: JailConfig, comments_cfg: CommentsConfig, stats_cfg: StatsConfig) -> Self {
         let comments = CommentClient::new(comments_cfg.private_socket.clone());
+        let stats = StatsClient::new(
+            stats_cfg.socket.clone(),
+            std::time::Duration::from_millis(stats_cfg.request_timeout_ms),
+        );
         Self {
             cfg,
             comments_cfg,
             comments,
+            stats,
             osreldate: sysctl_osreldate().unwrap_or(0),
         }
     }
@@ -119,8 +131,10 @@ impl JailBackend {
             .await
             .context("first-time comments sync")?;
         let snapshot = snapshot_bytes(&approved)?;
+        let comment_counts = approved_counts(&approved)?;
         let cfg = self.cfg.clone();
         let comments_cfg = self.comments_cfg.clone();
+        let stats = self.stats.clone();
         let sid = sid.to_string();
         let caps = caps.to_vec();
         let osreldate = self.osreldate;
@@ -128,7 +142,9 @@ impl JailBackend {
             spawn_sync(
                 &cfg,
                 &comments_cfg,
+                &stats,
                 &snapshot,
+                &comment_counts,
                 &sid,
                 cols,
                 rows,
@@ -142,6 +158,10 @@ impl JailBackend {
 
     pub fn comment_client(&self) -> CommentClient {
         self.comments.clone()
+    }
+
+    pub fn stats_client(&self) -> StatsClient {
+        self.stats.clone()
     }
 
     pub fn comment_drain_timeout(&self) -> std::time::Duration {
@@ -162,7 +182,9 @@ impl JailBackend {
 fn spawn_sync(
     cfg: &JailConfig,
     comments_cfg: &CommentsConfig,
+    stats: &StatsClient,
     snapshot: &[u8],
+    comment_counts: &HashMap<String, u64>,
     sid: &str,
     cols: u16,
     rows: u16,
@@ -177,7 +199,9 @@ fn spawn_sync(
     let res = spawn_inner(
         cfg,
         comments_cfg,
+        stats,
         snapshot,
+        comment_counts,
         sid,
         cols,
         rows,
@@ -200,7 +224,9 @@ fn spawn_sync(
 fn spawn_inner(
     cfg: &JailConfig,
     comments_cfg: &CommentsConfig,
+    stats: &StatsClient,
     snapshot: &[u8],
+    comment_counts: &HashMap<String, u64>,
     sid: &str,
     cols: u16,
     rows: u16,
@@ -286,19 +312,86 @@ fn spawn_inner(
     // 5. guest 账号(从 jail 内的 passwd 解析 uid/gid/home)
     let (uid, gid, home) = guest_ids(path, &cfg.guest_user)?;
 
-    // 6. shell 启动前固定打开全部 FIFO；随后写完 root-owned 初始快照。
+    // 6. Before the guest fork, validate both trusted manifests, pin every
+    // rendered article inode, register NOTE_READ, and write all immutable
+    // per-scope snapshots.  Nothing after fork resolves these guest paths.
     let targets_rel = comments_cfg
         .targets_file
         .strip_prefix("/")
         .context("comments.targets_file must be an absolute path")?;
-    let targets = read_targets(&Path::new(path).join(targets_rel))?;
+    let scopes = read_targets(&Path::new(path).join(targets_rel))?;
+    let index_path = comments_cfg
+        .targets_file
+        .with_file_name("article-index.json")
+        .strip_prefix("/")
+        .context("article index path must be absolute")?
+        .to_path_buf();
+    let index = read_article_index(&Path::new(path).join(index_path))?;
     let home_root = format!("{path}{home}");
-    let comment_fifos = targets
+    let articles_by_target = articles_by_target(&index, &scopes)?;
+    let article_reads = match articles_by_target
         .iter()
-        .map(|(rel, target)| {
+        .flat_map(|(target, articles)| {
+            articles.iter().map(|article| {
+                Ok(ArticleReadFile {
+                    fd: open_rendered_article_at(Path::new(&home_root), article)?,
+                    target: target.clone(),
+                    article: article.clone(),
+                })
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(article_files) if article_files.is_empty() => None,
+        Ok(article_files) => match PreparedArticleReads::new(article_files) {
+            Ok(reads) => Some(reads),
+            Err(error) => {
+                warn!(sid, %error, "failed to register article NOTE_READ watchers; statistics disabled for this session");
+                None
+            }
+        },
+        Err(error) => {
+            warn!(sid, %error, "failed to pin rendered articles; terminal statistics disabled for this session");
+            None
+        }
+    };
+    let snapshot_request = build_snapshot_request(&scopes, &articles_by_target);
+    if snapshot_request.is_none() {
+        warn!(
+            sid,
+            "statistics snapshot exceeds protocol limits; writing unavailable status"
+        );
+    }
+    let stats_snapshot = match snapshot_request.as_ref() {
+        Some(request) => match stats.snapshot_blocking(request) {
+            Ok(response) => match validate_stats_response(request, response) {
+                Ok(response) => Some(response),
+                Err(error) => {
+                    warn!(sid, %error, "statd returned an invalid snapshot; writing unavailable status");
+                    None
+                }
+            },
+            Err(error) => {
+                warn!(sid, %error, "statd snapshot unavailable; session will continue");
+                None
+            }
+        },
+        None => None,
+    };
+    write_stats_snapshots(
+        Path::new(path),
+        &scopes,
+        &articles_by_target,
+        comment_counts,
+        stats_snapshot.as_ref(),
+    )?;
+
+    let comment_fifos = scopes
+        .iter()
+        .map(|scope| {
             Ok(CommentFifo {
-                fd: open_fifo_at(Path::new(&home_root), rel)?,
-                target: target.clone(),
+                fd: open_fifo_at(Path::new(&home_root), &scope.comment_rel)?,
+                target: scope.target.clone(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -345,6 +438,7 @@ fn spawn_inner(
                 master,
                 pid: child,
                 comment_fifos,
+                article_reads,
             })
         }
         ForkResult::Child => unsafe {
@@ -412,58 +506,336 @@ fn snapshot_bytes(comments: &[Comment]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn read_targets(path: &Path) -> Result<Vec<(String, String)>> {
+fn approved_counts(comments: &[Comment]) -> Result<HashMap<String, u64>> {
+    // Reuse the public projection's global-ID/reply validation before trusting
+    // target values for either snapshot.
+    visible_comments(comments).map_err(anyhow::Error::msg)?;
+    let mut counts = HashMap::new();
+    for comment in comments {
+        let count = counts.entry(comment.target.clone()).or_insert(0u64);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("approved comment count overflow"))?;
+    }
+    Ok(counts)
+}
+
+fn read_targets(path: &Path) -> Result<Vec<ContentScope>> {
     let md = std::fs::symlink_metadata(path)
-        .with_context(|| format!("read comments target manifest {}", path.display()))?;
+        .with_context(|| format!("read scope target manifest {}", path.display()))?;
     if !md.file_type().is_file()
         || md.file_type().is_symlink()
         || md.uid() != 0
         || md.mode() & 0o022 != 0
     {
-        bail!("comments target manifest must be a root-owned, group/other non-writable regular file");
+        bail!("scope target manifest must be a root-owned, group/other non-writable regular file");
     }
     parse_targets(&std::fs::read_to_string(path)?)
 }
 
-fn parse_targets(text: &str) -> Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    let mut paths = HashSet::new();
-    let mut targets = HashSet::new();
-    for (idx, line) in text.lines().enumerate() {
-        let (rel, target) = line
-            .split_once('\t')
-            .ok_or_else(|| anyhow::anyhow!("target manifest line {} missing Tab", idx + 1))?;
-        if target.contains('\t')
-            || rel.is_empty()
-            || rel.starts_with('/')
-            || rel
-                .split('/')
-                .any(|p| p.is_empty() || p == "." || p == "..")
-        {
-            bail!("target manifest line {} invalid relative path", idx + 1);
-        }
-        let derived = target_for_fifo(rel)
-            .ok_or_else(|| anyhow::anyhow!("target manifest line {} path is not a comment device", idx + 1))?;
-        if derived != target || !termblog_commentd::valid_target(target) {
-            bail!("target manifest line {} mapping inconsistent", idx + 1);
-        }
-        if !paths.insert(rel.to_string()) || !targets.insert(target.to_string()) {
-            bail!("target manifest line {} duplicate", idx + 1);
-        }
-        out.push((rel.to_string(), target.to_string()));
-    }
-    Ok(out)
+fn parse_targets(text: &str) -> Result<Vec<ContentScope>> {
+    termblog_content_model::parse_scope_manifest(text).map_err(anyhow::Error::msg)
 }
 
-fn target_for_fifo(rel: &str) -> Option<String> {
-    let directory = if rel == "comment" {
-        ""
-    } else {
-        rel.strip_suffix("/comment")?
+fn read_article_index(path: &Path) -> Result<ArticleIndex> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("read article index {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!("article index must be a root-owned, group/other non-writable regular file");
+    }
+    let index: ArticleIndex = serde_json::from_slice(&std::fs::read(path)?)
+        .with_context(|| format!("parse article index {}", path.display()))?;
+    index.validate().map_err(anyhow::Error::msg)?;
+    Ok(index)
+}
+
+fn articles_by_target(
+    index: &ArticleIndex,
+    scopes: &[ContentScope],
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let by_directory: HashMap<&str, &ContentScope> = scopes
+        .iter()
+        .map(|scope| (scope.directory_rel.as_str(), scope))
+        .collect();
+    let mut output: BTreeMap<String, Vec<String>> = scopes
+        .iter()
+        .map(|scope| (scope.target.clone(), Vec::new()))
+        .collect();
+    for entry in &index.articles {
+        let article = ArticlePath::parse(&entry.source_rel).map_err(anyhow::Error::msg)?;
+        if let Some(scope) = by_directory.get(article.directory_rel.as_str()) {
+            output
+                .get_mut(&scope.target)
+                .expect("scope target initialized")
+                .push(article.key);
+        }
+    }
+    for articles in output.values_mut() {
+        articles.sort();
+    }
+    Ok(output)
+}
+
+fn build_snapshot_request(
+    scopes: &[ContentScope],
+    articles_by_target: &BTreeMap<String, Vec<String>>,
+) -> Option<SnapshotRequest> {
+    let article_count: usize = articles_by_target.values().map(Vec::len).sum();
+    if scopes.len() > MAX_SNAPSHOT_TARGETS || article_count > MAX_SNAPSHOT_ARTICLES {
+        return None;
+    }
+    Some(SnapshotRequest {
+        targets: scopes
+            .iter()
+            .map(|scope| SnapshotTargetRequest {
+                target: scope.target.clone(),
+                articles: articles_by_target
+                    .get(&scope.target)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect(),
+    })
+}
+
+fn open_rendered_article_at(home: &Path, article: &str) -> Result<OwnedFd> {
+    let parsed = ArticlePath::parse(&format!("{article}.md")).map_err(anyhow::Error::msg)?;
+    if parsed.key != article {
+        bail!("invalid rendered article key {article}");
+    }
+    let home_c = CString::new(home.as_os_str().as_bytes())?;
+    let raw = unsafe {
+        libc::open(
+            home_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
     };
-    let attachment =
-        termblog_content_model::CommentAttachment::from_directory_rel(directory).ok()?;
-    (attachment.fifo_rel == rel).then_some(attachment.target)
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("open guest home for rendered article");
+    }
+    let mut dir = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut components = std::iter::once(".rendered")
+        .chain(article.split('/'))
+        .peekable();
+    while let Some(component) = components.next() {
+        let component_c = CString::new(component)?;
+        let last = components.peek().is_none();
+        let flags = if last {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let raw = unsafe { libc::openat(dir.as_raw_fd(), component_c.as_ptr(), flags) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("open rendered article {article}"));
+        }
+        let opened = unsafe { OwnedFd::from_raw_fd(raw) };
+        if last {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            if unsafe { libc::fstat(opened.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("fstat rendered article");
+            }
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                bail!("rendered article {article} is not a regular file");
+            }
+            return Ok(opened);
+        }
+        dir = opened;
+    }
+    bail!("empty rendered article path")
+}
+
+fn validate_stats_response(
+    request: &SnapshotRequest,
+    response: SnapshotResponse,
+) -> Result<SnapshotResponse> {
+    if !response.ok || response.error.is_some() {
+        bail!("statd returned an unsuccessful snapshot");
+    }
+    chrono::DateTime::parse_from_rfc3339(&response.snapshot_at)
+        .context("statd snapshot_at is not RFC3339")?;
+    let expected: BTreeMap<&str, BTreeSet<&str>> = request
+        .targets
+        .iter()
+        .map(|target| {
+            (
+                target.target.as_str(),
+                target.articles.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    if expected.len() != request.targets.len() || response.targets.len() != expected.len() {
+        bail!("statd snapshot target set differs from request");
+    }
+    let mut seen = BTreeSet::new();
+    for target in &response.targets {
+        let Some(expected_articles) = expected.get(target.target.as_str()) else {
+            bail!(
+                "statd snapshot contains unexpected target {}",
+                target.target
+            );
+        };
+        if !seen.insert(target.target.as_str()) {
+            bail!("statd snapshot contains duplicate target {}", target.target);
+        }
+        let actual_articles: BTreeSet<&str> = target
+            .articles
+            .iter()
+            .map(|article| article.article.as_str())
+            .collect();
+        if actual_articles.len() != target.articles.len() || &actual_articles != expected_articles {
+            bail!(
+                "statd snapshot article set differs for target {}",
+                target.target
+            );
+        }
+    }
+    Ok(response)
+}
+
+fn write_stats_snapshots(
+    jail_root: &Path,
+    scopes: &[ContentScope],
+    articles_by_target: &BTreeMap<String, Vec<String>>,
+    comment_counts: &HashMap<String, u64>,
+    stats: Option<&SnapshotResponse>,
+) -> Result<()> {
+    let fallback_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    for scope in scopes {
+        let articles = articles_by_target
+            .get(&scope.target)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let target_stats = stats.and_then(|snapshot| {
+            snapshot
+                .targets
+                .iter()
+                .find(|target| target.target == scope.target)
+        });
+        let snapshot_at = stats
+            .map(|snapshot| snapshot.snapshot_at.as_str())
+            .unwrap_or(&fallback_time);
+        let bytes = stat_snapshot_bytes(
+            scope,
+            articles,
+            *comment_counts.get(&scope.target).unwrap_or(&0),
+            snapshot_at,
+            target_stats,
+        );
+        write_scope_stat(jail_root, scope, &bytes)?;
+    }
+    Ok(())
+}
+
+fn stat_snapshot_bytes(
+    scope: &ContentScope,
+    articles: &[String],
+    comments_approved: u64,
+    snapshot_at: &str,
+    stats: Option<&TargetSnapshot>,
+) -> Vec<u8> {
+    let mut output = format!(
+        "version 1\ntarget {}\nsnapshot_at {}\nstats_status {}\n",
+        scope.target,
+        snapshot_at,
+        if stats.is_some() { "ok" } else { "unavailable" }
+    );
+    if let Some(stats) = stats {
+        output.push_str(&format!(
+            "terminal_read_sessions_total {}\nstatic_requests_total {}\nunique_visitors_approx {}\n",
+            stats.terminal_read_sessions_total,
+            stats.static_requests_total,
+            stats.unique_visitors_approx
+        ));
+    }
+    output.push_str(&format!("comments_approved {comments_approved}\n"));
+    if let Some(stats) = stats {
+        let by_article: HashMap<&str, _> = stats
+            .articles
+            .iter()
+            .map(|article| (article.article.as_str(), article))
+            .collect();
+        for key in articles {
+            let article = by_article
+                .get(key.as_str())
+                .expect("validated statd article response");
+            output.push_str(&format!(
+                "article {key} terminal_read_sessions={} static_requests={}\n",
+                article.terminal_read_sessions, article.static_requests
+            ));
+        }
+    }
+    output.into_bytes()
+}
+
+fn write_scope_stat(jail_root: &Path, scope: &ContentScope, bytes: &[u8]) -> Result<()> {
+    let directory = jail_root.join(&scope.proc_rel);
+    let metadata = std::fs::symlink_metadata(&directory)
+        .with_context(|| format!("validate scope proc directory {}", directory.display()))?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.mode() & 0o7777 != 0o555
+    {
+        bail!(
+            "{} must be a root:wheel 0555 real directory",
+            directory.display()
+        );
+    }
+    let final_path = directory.join("stat");
+    match std::fs::symlink_metadata(&final_path) {
+        Ok(metadata)
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != 0
+                || metadata.gid() != 0
+                || metadata.mode() & 0o7777 != 0o444 =>
+        {
+            bail!(
+                "{} must be a root:wheel 0444 regular file",
+                final_path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect scope stat {}", final_path.display()));
+        }
+    }
+    let sequence = SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(".stat.tmp.{}.{}", std::process::id(), sequence));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o444))?;
+        chown(&temporary, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))?;
+        // Flush both the contents and final ownership/mode before publishing
+        // the directory entry. The directory fsync below makes the rename
+        // durable as well.
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &final_path)?;
+        File::open(&directory)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// 以 guest home fd 为锚逐级 openat；每层都 O_NOFOLLOW，最终再次 fstat FIFO。
@@ -771,10 +1143,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            rows[2],
-            ("projects/demo/comment".into(), "/projects/demo/".into())
-        );
+        assert_eq!(rows[2].comment_rel, "projects/demo/comment");
+        assert_eq!(rows[2].target, "/projects/demo/");
 
         for bad in [
             "/comment\t/\n",
@@ -785,5 +1155,69 @@ mod tests {
         ] {
             assert!(parse_targets(bad).is_err(), "应拒绝: {bad:?}");
         }
+    }
+
+    #[test]
+    fn snapshot_protocol_overflow_degrades_without_rejecting_the_session() {
+        let scope = ContentScope::from_directory_rel("").unwrap();
+        let mut articles = BTreeMap::from([(scope.target.clone(), Vec::new())]);
+        assert!(build_snapshot_request(std::slice::from_ref(&scope), &articles).is_some());
+
+        articles.insert(
+            scope.target.clone(),
+            vec!["help".to_string(); MAX_SNAPSHOT_ARTICLES + 1],
+        );
+        assert!(build_snapshot_request(std::slice::from_ref(&scope), &articles).is_none());
+
+        let too_many_scopes = vec![scope; MAX_SNAPSHOT_TARGETS + 1];
+        assert!(build_snapshot_request(&too_many_scopes, &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn stat_snapshot_is_stable_sorted_and_does_not_fake_unavailable_zeroes() {
+        let scope = ContentScope::from_directory_rel("tests").unwrap();
+        let articles = vec!["tests/a".to_string(), "tests/b".to_string()];
+        let stats = TargetSnapshot {
+            target: "/tests/".into(),
+            terminal_read_sessions_total: 3,
+            static_requests_total: 8,
+            unique_visitors_approx: 5,
+            articles: vec![
+                termblog_statd::ArticleSnapshot {
+                    article: "tests/a".into(),
+                    terminal_read_sessions: 1,
+                    static_requests: 2,
+                },
+                termblog_statd::ArticleSnapshot {
+                    article: "tests/b".into(),
+                    terminal_read_sessions: 2,
+                    static_requests: 6,
+                },
+            ],
+        };
+        let text = String::from_utf8(stat_snapshot_bytes(
+            &scope,
+            &articles,
+            4,
+            "2026-09-05T12:34:56Z",
+            Some(&stats),
+        ))
+        .unwrap();
+        assert_eq!(
+            text,
+            "version 1\ntarget /tests/\nsnapshot_at 2026-09-05T12:34:56Z\nstats_status ok\nterminal_read_sessions_total 3\nstatic_requests_total 8\nunique_visitors_approx 5\ncomments_approved 4\narticle tests/a terminal_read_sessions=1 static_requests=2\narticle tests/b terminal_read_sessions=2 static_requests=6\n"
+        );
+
+        let unavailable = String::from_utf8(stat_snapshot_bytes(
+            &scope,
+            &articles,
+            4,
+            "2026-09-05T12:34:56Z",
+            None,
+        ))
+        .unwrap();
+        assert!(unavailable.contains("stats_status unavailable\ncomments_approved 4\n"));
+        assert!(!unavailable.contains("static_requests_total"));
+        assert!(!unavailable.contains("terminal_read_sessions="));
     }
 }

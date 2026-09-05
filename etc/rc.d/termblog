@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # PROVIDE: termblog
-# REQUIRE: LOGIN jaild
+# REQUIRE: LOGIN jaild termblog_statd
 # KEYWORD: shutdown
 
 # termblog 接入层(降权 www): 同时拉起 termblog-web(axum) 与

@@ -8,7 +8,7 @@
 # 全量做的事: 检查/写入 racct(loader tunable, 首次需要重启机器) ->
 # 检查 jail 模板已存在(不存在则提示先跑 build-template.sh) ->
 # 以 yzs 身份编译(避免 target/ 被 root 污染) -> 安装二进制/前端/配置 ->
-# 发布静态镜像 -> 拉起 jaild[root] 与 termblog-web/termblog-ssh[www](幂等)。
+# 发布静态镜像 -> 拉起 commentd/statd/jaild[root] 与 termblog-web/termblog-ssh[www](幂等)。
 #
 # --static-only: 只编译内容 + 发布静态镜像。纯文件替换, 零进程重启、
 # 零会话中断; jail 侧(模板内文章)将在下次模板重建时跟进。
@@ -54,6 +54,7 @@ if [ "${1:-}" = "--static-only" ]; then
     echo ">> 2/2 Publishing static mirror (pure file replacement, seamless, no restart)"
     install -d /usr/local/share/termblog
     install -m 444 "$REPO/jailtpl/content/.comment-targets.tsv" /usr/local/share/termblog/comment-targets.tsv
+    install -m 444 "$REPO/jailtpl/content/.rendered/.index.json" /usr/local/share/termblog/article-index.json
     publish_static
     echo ">> Done (mirror only). Jail side will be updated on next template rebuild."
     exit 0
@@ -81,11 +82,38 @@ if ! zfs list -H -o name zroot/jails/template@release >/dev/null 2>&1; then
     exit 1
 fi
 echo ">> jail template is ready: zroot/jails/template@release"
-if [ ! -f /jails/template/usr/local/share/termblog/comment-targets.tsv ]; then
-    echo "!! Current jail template does not contain comment targets manifest"
-    echo "!! Please run first: sh $REPO/deploy-scripts/build-template.sh --replace"
-    exit 1
-fi
+for manifest in comment-targets.tsv article-index.json; do
+    if [ ! -f "/jails/template/usr/local/share/termblog/$manifest" ]; then
+        echo "!! Current jail template does not contain $manifest"
+        echo "!! Please run first: sh $REPO/deploy-scripts/build-template.sh --replace"
+        exit 1
+    fi
+done
+while IFS="$(printf '\t')" read -r rel target; do
+    case "$rel" in
+        comment) scope_dir=""; expected="/" ;;
+        */comment)
+            scope_dir=${rel%/comment}
+            case "$scope_dir" in ""|/*|*/|*//*|*[!a-z0-9/-]*) echo "!! invalid scope path $rel"; exit 1 ;; esac
+            expected="/$scope_dir/"
+            ;;
+        *) echo "!! invalid scope path $rel"; exit 1 ;;
+    esac
+    [ "$target" = "$expected" ] || { echo "!! scope target mismatch: $rel -> $target"; exit 1; }
+    proc="/jails/template/proc"
+    [ -z "$scope_dir" ] || proc="$proc/$scope_dir"
+    if [ ! -d "$proc" ] || [ -L "$proc" ]; then
+        echo "!! Current jail template is missing root-owned scope directory $proc"
+        echo "!! Please run first: sh $REPO/deploy-scripts/build-template.sh --replace"
+        exit 1
+    fi
+    proc_metadata=$(stat -f "%u:%g:%Lp" "$proc")
+    if [ "$proc_metadata" != "0:0:555" ]; then
+        echo "!! $proc must be root:wheel 0555 (got $proc_metadata)"
+        echo "!! Please run first: sh $REPO/deploy-scripts/build-template.sh --replace"
+        exit 1
+    fi
+done < /jails/template/usr/local/share/termblog/comment-targets.tsv
 
 # ── 3. 编译(以 yzs 跑: HOME/PATH 正确, 且不污染仓库属主) ──
 # 全 workspace(web/ssh/jaild/jailbin/content-build)+ 前端 + 内容产物;
@@ -102,8 +130,10 @@ install -m 555 "$REPO/target/release/termblog-web" /usr/local/sbin/termblog-web
 install -m 555 "$REPO/target/release/termblog-ssh" /usr/local/sbin/termblog-ssh
 install -m 555 "$REPO/target/release/termblog-jaild" /usr/local/sbin/jaild
 install -m 555 "$REPO/target/release/commentd" /usr/local/sbin/commentd
+install -m 555 "$REPO/target/release/termblog-statd" /usr/local/sbin/termblog-statd
 ln -sf commentd /usr/local/sbin/commentctl
 install -m 444 "$REPO/jailtpl/content/.comment-targets.tsv" /usr/local/share/termblog/comment-targets.tsv
+install -m 444 "$REPO/jailtpl/content/.rendered/.index.json" /usr/local/share/termblog/article-index.json
 install -m 644 "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml.sample
 if [ -f /usr/local/etc/termblog.toml ] && ! cmp -s "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml; then
     cp /usr/local/etc/termblog.toml /usr/local/etc/termblog.toml.old
@@ -112,11 +142,11 @@ if [ -f /usr/local/etc/termblog.toml ] && ! cmp -s "$REPO/etc/termblog.toml" /us
 elif [ ! -f /usr/local/etc/termblog.toml ]; then
     cp /usr/local/etc/termblog.toml.sample /usr/local/etc/termblog.toml
 fi
-install -m 555 "$REPO/etc/rc.d/commentd" "$REPO/etc/rc.d/jaild" "$REPO/etc/rc.d/termblog" /usr/local/etc/rc.d/
+install -m 555 "$REPO/etc/rc.d/commentd" "$REPO/etc/rc.d/termblog-statd" "$REPO/etc/rc.d/jaild" "$REPO/etc/rc.d/termblog" /usr/local/etc/rc.d/
 install -d /usr/local/etc/newsyslog.conf.d
 install -m 644 "$REPO/etc/newsyslog.conf.d/termblog.conf" /usr/local/etc/newsyslog.conf.d/
-sysrc commentd_enable=YES jaild_enable=YES termblog_enable=YES >/dev/null
-echo ">> Enabled startup on boot: commentd_enable=YES jaild_enable=YES termblog_enable=YES"
+sysrc commentd_enable=YES termblog_statd_enable=YES jaild_enable=YES termblog_enable=YES >/dev/null
+echo ">> Enabled startup on boot: commentd_enable=YES termblog_statd_enable=YES jaild_enable=YES termblog_enable=YES"
 
 # ── 5. 发布完整静态树（同父目录 staging 后整体换名，可回滚） ──
 publish_static
@@ -139,13 +169,33 @@ else
     done
 fi
 
-# ── 7. 运行时目录(降权 www 需要写的部分) ──
+# ── 7. statd 独立 root-only 数据目录；只初始化本次新建的空目录 ──
+STATS_DATA=/var/db/termblog-statd
+stats_data_new=0
+if [ ! -e "$STATS_DATA" ]; then
+    install -d -m 700 -o root -g wheel "$STATS_DATA"
+    stats_data_new=1
+elif [ ! -d "$STATS_DATA" ] || [ -L "$STATS_DATA" ]; then
+    echo "!! $STATS_DATA must be a real directory"; exit 1
+fi
+if [ "$stats_data_new" -eq 1 ]; then
+    /usr/local/sbin/termblog-statd --init
+else
+    for f in stats.sqlite3 secret; do
+        [ -f "$STATS_DATA/$f" ] || { echo "!! existing statistics directory missing $f, refusing automatic fix"; exit 1; }
+    done
+fi
+
+# ── 8. 运行时目录与日志 ──
 mkdir -p /var/db/termblog /var/log
 chown www /var/db/termblog
-touch /var/log/commentd.log /var/log/jaild.log /var/log/termblog-web.log /var/log/termblog-ssh.log
-chown www /var/log/termblog-web.log /var/log/termblog-ssh.log
+touch /var/log/commentd.log /var/log/termblog-statd.log /var/log/jaild.log /var/log/termblog-web.log /var/log/termblog-ssh.log
+chown root:wheel /var/log/commentd.log /var/log/termblog-statd.log /var/log/jaild.log
+chmod 640 /var/log/commentd.log /var/log/termblog-statd.log /var/log/jaild.log
+chown www:wheel /var/log/termblog-web.log /var/log/termblog-ssh.log
+chmod 640 /var/log/termblog-web.log /var/log/termblog-ssh.log
 
-# ── 8. 拉起/重启服务(先停旧进程再起新二进制, 部署即滚动重启) ──
+# ── 9. 拉起/重启服务(先停旧进程再起新二进制, 部署即滚动重启) ──
 start_daemon() { # $1=服务名 $2=用户(可空) $3=二进制
     pidf="/var/run/$1.pid"
     if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
@@ -161,16 +211,17 @@ start_daemon() { # $1=服务名 $2=用户(可空) $3=二进制
     fi
     echo ">> $1 started/restarted"
 }
-start_daemon commentd    ""    /usr/local/sbin/commentd
-start_daemon jaild       ""    /usr/local/sbin/jaild
-start_daemon termblog-web www /usr/local/sbin/termblog-web
-start_daemon termblog-ssh www /usr/local/sbin/termblog-ssh
+start_daemon commentd         ""  /usr/local/sbin/commentd
+start_daemon termblog-statd  ""  /usr/local/sbin/termblog-statd
+start_daemon jaild            ""  /usr/local/sbin/jaild
+start_daemon termblog-web     www /usr/local/sbin/termblog-web
+start_daemon termblog-ssh     www /usr/local/sbin/termblog-ssh
 
 sleep 1
 echo ""
 echo "== Deployment complete, current status =="
-ls -l /var/run/commentd-public.sock /var/run/commentd-private.sock /var/run/termblog.sock
+ls -l /var/run/commentd-public.sock /var/run/commentd-private.sock /var/run/termblog-statd.sock /var/run/termblog.sock
 ps -axo user,pid,comm | grep -E "commentd|jaild|termblog-" | grep -v grep
 echo ""
 echo ">> Web: http://$(hostname):8080   ssh: ssh -p 2222 blog@$(hostname)"
-echo ">> Verification: sh $REPO/tests/verify-m3.sh (root), sh $REPO/tests/verify-m5.sh, sh $REPO/tests/verify-comments.sh"
+echo ">> Verification: sh $REPO/tests/verify-m3.sh (root), sh $REPO/tests/verify-m5.sh, sh $REPO/tests/verify-comments.sh, sh $REPO/tests/verify-stats.sh"

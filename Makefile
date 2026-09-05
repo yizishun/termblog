@@ -32,7 +32,7 @@ URL_WEB := http://$(HOSTNAME):8080
 URL_SSH := ssh://0.0.0.0:2222
 
 .PHONY: all build build-frontend build-content \
-        tpl deploy content verify-comments verify-content-paths \
+        tpl deploy content verify-comments verify-stats verify-content-paths \
         run run-ssh \
         start start-ssh stop stop-ssh restart restart-ssh \
         status status-ssh logs logs-ssh clean
@@ -151,6 +151,9 @@ clean:
 
 verify-comments:
 	sudo sh tests/verify-comments.sh
+
+verify-stats:
+	sudo sh tests/verify-stats.sh
 
 verify-content-paths:
 	cargo build -p content-build

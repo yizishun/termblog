@@ -11,6 +11,7 @@
 //! 「浏览器刷新不丢会话」的持有/宽限/scrollback 回放逻辑在 sessions.rs。
 
 mod sessions;
+mod stats;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -18,6 +19,7 @@ use std::path::Path;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Json;
@@ -66,11 +68,13 @@ async fn main() -> anyhow::Result<()> {
         sessions: SessionStore::new(SessionClient::new(&cfg.jail.socket)),
         comments: CommentClient::new(cfg.comments.public_socket.clone()),
     };
+    let stats = stats::Recorder::start(&cfg.stats, &cfg.comments.targets_file);
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/comments", get(comments_handler))
         .fallback_service(ServeDir::new(&cfg.web.static_dir)) // 前端构建产物; 开发可用 vite dev 代理
+        .layer(middleware::from_fn_with_state(stats, stats::track_request))
         .with_state(state);
 
     // 默认 0.0.0.0:8080(生产直连), TERMBLOG_LISTEN 可覆盖
