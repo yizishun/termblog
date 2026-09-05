@@ -105,7 +105,7 @@ check $? "ssh: 退出 less 后 OSC 复位 /"
 # OSC8 的 ]8;; 是可打印 ASCII, 原始字节流里直接可匹配
 if [ -n "$IMAGE_MANIFEST" ]; then
     out=$( (sleep 2; printf 'blog %s\n' "$IMAGE_KEY"; sleep 3) | timeout 15 $SSH 2>&1 )
-    printf '%s\n' "$out" | grep -qF '┌─ 图片'
+    printf '%s\n' "$out" | grep -qF '┌─ image'
     check $? "ssh: 带图文章显示图片占位框"
     printf '%s\n' "$out" | grep -qF ']8;;'
     check $? "ssh: 占位框 URL 带 OSC8 超链接"

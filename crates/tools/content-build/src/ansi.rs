@@ -437,7 +437,7 @@ fn parse_inline(
                 } else {
                     alt
                 };
-                push_seg_link(segs, style | DIM, format!("[图: {alt}]"), Some(url));
+                push_seg_link(segs, style | DIM, format!("[image: {alt}]"), Some(url));
             }
             Event::Text(t) => {
                 push_seg(segs, style, t.as_ref());
@@ -584,8 +584,8 @@ fn render_block(
             //   └────……
             let start = lines.len(); // 锚点: 最终渲染行号(含折行的 alt/URL 续行)
             let w = ind.width;
-            let head = "┌─ 图片 "; // 显示宽 8(┌ ─ ␣ 图 片 ␣ = 1+1+1+2+2+1)
-            let top = format!("{}{}", head, "─".repeat(w.saturating_sub(8)));
+            let head = "┌─ image "; // 显示宽 9(┌ ─ ␣ i m a g e ␣ = 1+1+1+5+1)
+            let top = format!("{}{}", head, "─".repeat(w.saturating_sub(9)));
             lines.push(format!("{}\x1b[2m{}\x1b[22m", ind.first, top));
             let content_w = w.saturating_sub(3); // "│ " 前缀 2 列 + 1 列余量
             let alt_segs = [Seg {
@@ -980,7 +980,7 @@ mod tests {
         let out = render("正文\n\n![架构图](post/arch.png)\n");
         let lines = plain(&out);
         assert!(
-            lines.iter().any(|l| l.starts_with("┌─ 图片 ─")),
+            lines.iter().any(|l| l.starts_with("┌─ image ─")),
             "应有顶边: {lines:?}"
         );
         assert!(
@@ -1058,11 +1058,11 @@ mod tests {
 
     #[test]
     fn inline_image_marker_with_link() {
-        // 行内图(段落中夹图) → [图: alt] + OSC8 link
+        // 行内图(段落中夹图) → [image: alt] + OSC8 link
         let out = render("前文 ![截图](post/s.png) 后文\n");
         assert!(
-            out.contains("[图: 截图]"),
-            "行内图应为 [图: alt] 标记: {out:?}"
+            out.contains("[image: 截图]"),
+            "行内图应为 [image: alt] 标记: {out:?}"
         );
         assert!(
             out.contains("\x1b]8;;/post/s.png\x1b\\"),
@@ -1071,7 +1071,7 @@ mod tests {
         // 空 alt 行内图 → 文件名
         let out = render("前文 ![](post/s.png) 后文\n");
         assert!(
-            out.contains("[图: s.png]"),
+            out.contains("[image: s.png]"),
             "空 alt 行内图应用文件名: {out:?}"
         );
         // 外链行内图: URL 原样
@@ -1088,14 +1088,14 @@ mod tests {
         let out = render("> ![q](post/q.png)\n");
         let lines = plain(&out);
         assert!(
-            lines.iter().any(|l| l.starts_with("> ┌─ 图片")),
+            lines.iter().any(|l| l.starts_with("> ┌─ image")),
             "引用内占位框带 > 前缀: {lines:?}"
         );
         // 紧凑列表项内的独占图
         let out = render("- ![l](post/l.png)\n");
         let lines = plain(&out);
         assert!(
-            lines.iter().any(|l| l.contains("┌─ 图片")),
+            lines.iter().any(|l| l.contains("┌─ image")),
             "列表内占位框: {lines:?}"
         );
     }
@@ -1140,7 +1140,7 @@ mod tests {
         let top = strip_sgr(&lines[a.block_start]);
         let bottom = strip_sgr(&lines[a.block_end - 1]);
         assert!(
-            top.starts_with("┌─ 图片"),
+            top.starts_with("┌─ image"),
             "block_start 应为占位框首行: {top:?}"
         );
         assert!(

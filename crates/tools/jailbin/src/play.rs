@@ -59,16 +59,16 @@ pub fn parse_cast(text: &str) -> Result<Cast, String> {
         .lines()
         .enumerate()
         .filter(|(_, l)| !l.trim().is_empty());
-    let (ln, first) = lines.next().ok_or_else(|| "空文件".to_string())?;
+    let (ln, first) = lines.next().ok_or_else(|| "empty file".to_string())?;
     let header: Value = serde_json::from_str(first)
-        .map_err(|e| format!("第 {} 行: 不是合法的 header JSON: {e}", ln + 1))?;
+        .map_err(|e| format!("line {}: invalid header JSON: {e}", ln + 1))?;
     let version = header
         .get("version")
         .and_then(Value::as_u64)
-        .ok_or("header 缺 version")?;
+        .ok_or("header missing version")?;
     let cast = match version {
         2 | 3 => parse_v23(version, &header)?,
-        v => return Err(format!("不支持的 asciicast 版本: v{v} (支持 v1/v2/v3)")),
+        v => return Err(format!("unsupported asciicast version: v{v} (supports v1/v2/v3)")),
     };
 
     let mut events = cast.events;
@@ -79,7 +79,7 @@ pub fn parse_cast(text: &str) -> Result<Cast, String> {
             continue; // v3 允许注释行
         }
         let ev: (f64, String, String) = serde_json::from_str(line)
-            .map_err(|e| format!("第 {} 行: 不是合法事件 [时间, 类型, 数据]: {e}", ln + 1))?;
+            .map_err(|e| format!("line {}: invalid event [time, type, data]: {e}", ln + 1))?;
         // 时间语义: v2 绝对秒; v3 相对上一事件的增量(累加成绝对时间)。
         // 只回放输出, i/r/m/x 等忽略。
         let t = if version == 3 {
@@ -104,12 +104,12 @@ fn parse_v1(doc: &Value) -> Result<Cast, String> {
     let stdout = doc
         .get("stdout")
         .and_then(Value::as_array)
-        .ok_or("v1: 缺 stdout 数组")?;
+        .ok_or("v1: missing stdout array")?;
     let mut events = Vec::with_capacity(stdout.len());
     let mut acc = 0.0f64;
     for (i, item) in stdout.iter().enumerate() {
         let pair: (f64, String) = serde_json::from_value(item.clone())
-            .map_err(|_| format!("stdout[{i}]: 不是 [延迟, 数据] 二元组"))?;
+            .map_err(|_| format!("stdout[{i}]: not a [delay, data] pair"))?;
         acc += pair.0.max(0.0); // v1 是相对延迟, 累加成绝对时间
         events.push(OutEvent {
             t: acc,
@@ -131,7 +131,7 @@ fn parse_v23(version: u64, header: &Value) -> Result<Cast, String> {
     let (cols, rows) = if version == 2 {
         (get_u16(header, "width")?, get_u16(header, "height")?)
     } else {
-        let term = header.get("term").ok_or("v3: 缺 term 对象")?;
+        let term = header.get("term").ok_or("v3: missing term object")?;
         (get_u16(term, "cols")?, get_u16(term, "rows")?)
     };
     Ok(Cast {
@@ -151,7 +151,7 @@ fn get_u16(v: &Value, key: &str) -> Result<u16, String> {
     v.get(key)
         .and_then(Value::as_u64)
         .and_then(|n| u16::try_from(n).ok())
-        .ok_or_else(|| format!("header 缺 {key} 或不是正整数"))
+        .ok_or_else(|| format!("header missing {key} or not a positive integer"))
 }
 
 // ── 时间轴变换(纯函数, 可单测) ──
@@ -352,7 +352,7 @@ pub fn run(args: &[String]) -> i32 {
                 match args.get(i).and_then(|s| s.parse::<f64>().ok()) {
                     Some(v) if v > 0.0 && v.is_finite() => speed = v,
                     _ => {
-                        eprintln!("play: --speed 需要一个正数");
+                        eprintln!("play: --speed requires a positive number");
                         return 2;
                     }
                 }
@@ -362,7 +362,7 @@ pub fn run(args: &[String]) -> i32 {
                 match args.get(i).and_then(|s| s.parse::<f64>().ok()) {
                     Some(v) if v > 0.0 && v.is_finite() => idle_override = Some(v),
                     _ => {
-                        eprintln!("play: --idle-limit 需要一个正数(秒)");
+                        eprintln!("play: --idle-limit requires a positive number (seconds)");
                         return 2;
                     }
                 }
@@ -371,7 +371,7 @@ pub fn run(args: &[String]) -> i32 {
                 match s["--speed=".len()..].parse::<f64>() {
                     Ok(v) if v > 0.0 && v.is_finite() => speed = v,
                     _ => {
-                        eprintln!("play: --speed 需要一个正数");
+                        eprintln!("play: --speed requires a positive number");
                         return 2;
                     }
                 }
@@ -380,18 +380,18 @@ pub fn run(args: &[String]) -> i32 {
                 match s["--idle-limit=".len()..].parse::<f64>() {
                     Ok(v) if v > 0.0 && v.is_finite() => idle_override = Some(v),
                     _ => {
-                        eprintln!("play: --idle-limit 需要一个正数(秒)");
+                        eprintln!("play: --idle-limit requires a positive number (seconds)");
                         return 2;
                     }
                 }
             }
             s if !end_options && s.starts_with('-') && s.len() > 1 => {
-                eprintln!("play: 未知选项 {s} (-h 看用法)");
+                eprintln!("play: unknown option {s} (run with -h for help)");
                 return 2;
             }
             _ => {
                 if file.is_some() {
-                    eprintln!("play: 只支持一个录像文件");
+                    eprintln!("play: only one cast file is supported");
                     return 2;
                 }
                 file = Some(args[i].clone());
@@ -405,32 +405,32 @@ pub fn run(args: &[String]) -> i32 {
     };
 
     let Some(path) = resolve(&arg) else {
-        eprintln!("play: 找不到录像: {arg} (敲 play 看列表; .cast 后缀可省)");
+        eprintln!("play: cast not found: {arg} (run play to list; .cast extension optional)");
         return 1;
     };
 
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("play: 读不了 {}: {e}", path.display());
+            eprintln!("play: cannot read {}: {e}", path.display());
             return 1;
         }
     };
     if bytes.starts_with(&ZSTD_MAGIC) {
-        eprintln!("play: 这个录像是 zstd 压缩的, 暂不支持; 先用 asciinema convert 转成明文 .cast");
+        eprintln!("play: this cast is compressed with zstd, which is currently unsupported; convert to plain .cast with 'asciinema convert' first");
         return 1;
     }
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
         Err(_) => {
-            eprintln!("play: 文件不是 UTF-8 文本, 不像 asciicast");
+            eprintln!("play: file is not valid UTF-8 text, does not look like asciicast");
             return 1;
         }
     };
     let mut cast = match parse_cast(&text) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("play: 解析失败 ({}): {e}", path.display());
+            eprintln!("play: failed to parse ({}): {e}", path.display());
             return 1;
         }
     };
@@ -474,20 +474,20 @@ fn resolve_in_home(arg: &str, home: &Path) -> Option<PathBuf> {
 /// 裸 play: 递归列出 HOME 下非隐藏的 .cast（相对路径，去后缀）。
 fn list_casts() -> i32 {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        eprintln!("play: HOME 未设置");
+        eprintln!("play: HOME not set");
         return 1;
     };
     let mut found: Vec<String> = vec![];
     walk_casts(&home, &home, &mut found);
     if found.is_empty() {
-        println!("还没有录像(.cast)。把录像放进 HOME 的非隐藏目录后再敲 play。");
+        println!("No casts found (.cast). Place casts into any visible directory under HOME and run play again.");
     } else {
         found.sort();
-        println!("可播录像（HOME 相对路径）:");
+        println!("Available casts (HOME-relative paths):");
         for f in &found {
             println!("  {f}");
         }
-        println!("播放: play <名字>  (如 play {})", found[0]);
+        println!("Play: play <name>  (e.g. play {})", found[0]);
     }
     0
 }
@@ -521,20 +521,20 @@ fn walk_casts(root: &Path, dir: &Path, out: &mut Vec<String>) {
 }
 
 const USAGE: &str = "\
-用法: play [选项] <录像>
+Usage: play [options] <cast>
 
-播放 asciicast 终端录像(v1/v2/v3)。录像可放在 HOME 任意可见目录，
-例如 ~/demos/boot.cast → play demos/boot。
+Play asciicast terminal recordings (v1/v2/v3). Casts can be placed in any visible directory under HOME,
+for example ~/demos/boot.cast → play demos/boot.
 
-查找顺序: 原样路径(相对 cwd / 绝对) → ~/<录像> → ~/<录像>.cast
-不带参数时递归列出 HOME 下全部可播录像；隐藏路径和符号链接不参与发现。
+Lookup order: verbatim path (relative to cwd / absolute) → ~/<cast> → ~/<cast>.cast
+When run without arguments, recursively lists all playable casts under HOME; hidden paths and symlinks are ignored.
 
-选项:
-  -s, --speed N        倍速播放 (默认 1.0)
-  -i, --idle-limit N   空闲上限秒数, 长停顿压缩 (默认用录像头部值)
-  -h, --help           本帮助
+Options:
+  -s, --speed N        Playback speed multiplier (default 1.0)
+  -i, --idle-limit N   Idle time limit in seconds, compresses long pauses (defaults to cast header value)
+  -h, --help           Show this help
 
-键位: 空格 暂停/继续    . 逐帧(暂停时)    q / Ctrl-C 退出
+Keybindings: Space pause/resume    . step frame (when paused)    q / Ctrl-C quit
 ";
 
 #[cfg(test)]

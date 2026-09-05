@@ -59,12 +59,12 @@ function ensureLinkDialog(): HTMLDialogElement {
   dialog.setAttribute("aria-labelledby", "link-confirm-title");
   dialog.innerHTML = `
     <form method="dialog">
-      <h2 id="link-confirm-title">打开这个链接？</h2>
-      <p>链接将在新标签页中打开：</p>
+      <h2 id="link-confirm-title">Open this link?</h2>
+      <p>Link will open in a new tab:</p>
       <code class="link-confirm-url"></code>
       <div class="link-confirm-actions">
-        <button value="cancel">取消</button>
-        <button type="button" class="link-confirm-open">打开</button>
+        <button value="cancel">Cancel</button>
+        <button type="button" class="link-confirm-open">Open</button>
       </div>
       <p class="link-confirm-error" role="alert" hidden></p>
     </form>`;
@@ -77,7 +77,7 @@ function ensureLinkDialog(): HTMLDialogElement {
     const newWindow = window.open();
     if (!newWindow) {
       const error = dialog.querySelector<HTMLElement>(".link-confirm-error")!;
-      error.textContent = "无法打开，请复制上方链接。";
+      error.textContent = "Unable to open link. Please copy the URL above.";
       error.hidden = false;
       return;
     }
@@ -235,7 +235,7 @@ function connect() {
         term.reset();
         sessionStorage.setItem(TOKEN_KEY, opened.attach_token);
         // 横幅只在普通页面打(仅首页会 attach)
-        if (opened.attached && !onMirror) term.write("\x1b[90m[已恢复原会话]\x1b[0m\r\n");
+        if (opened.attached && !onMirror) term.write("\x1b[90m[Previous session restored]\x1b[0m\r\n");
         sendResize(); // attach 后服务端 winsize 可能还是旧值, 主动同步一次
         // 镜像页 fresh=1 必然是新会话: 发送推迟到首帧 T_DATA 之后(见上),
         // 避免回显抢在提示符之前。
@@ -248,7 +248,7 @@ function connect() {
         try {
           reason = JSON.parse(reason).reason;
         } catch { /* 非 JSON 就直接显示 */ }
-        term.write(`\r\n\x1b[31m[会话结束: ${reason}]\x1b[0m\r\n`);
+        term.write(`\r\n\x1b[31m[Session closed: ${reason}]\x1b[0m\r\n`);
         sessionStorage.removeItem(TOKEN_KEY);
         if (onMirror && !takeoverDone) revealStaticFallback();
         break;
@@ -257,7 +257,7 @@ function connect() {
   };
 
   socket.onclose = () => {
-    term.write("\r\n\x1b[90m[连接已断开, 刷新页面重连]\x1b[0m\r\n");
+    term.write("\r\n\x1b[90m[Connection closed, refresh page to reconnect]\x1b[0m\r\n");
     if (onMirror && !takeoverDone) revealStaticFallback();
   };
 }

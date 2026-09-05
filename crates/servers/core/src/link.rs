@@ -58,7 +58,7 @@ impl Link {
             let n = self.sock.send(&wire[sent..]).await?;
             if n == 0 {
                 // 对端已关闭写方向: 续发无意义, 如实报错
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "send 未发完"));
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "send incomplete"));
             }
             sent += n;
         }
@@ -88,21 +88,21 @@ impl Link {
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }
             if info.truncated() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "帧超长被内核截断"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "frame truncated by kernel due to excessive length"));
             }
             acc.extend_from_slice(&buf[..n]);
             if acc.len() >= 5 {
-                let len = u32::from_be_bytes(acc[1..5].try_into().expect("5 字节头")) as usize;
+                let len = u32::from_be_bytes(acc[1..5].try_into().expect("5-byte header")) as usize;
                 if len > proto::MAX_FRAME as usize {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "帧声明长度超限"));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "frame declared length exceeds limit"));
                 }
                 if acc.len() >= 5 + len {
                     if acc.len() > 5 + len {
                         // 一次 recv 不该跨越两条记录(SEQPACKET), 出现即协议错乱
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "一次 recv 跨两条记录"));
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "single recv spanned across two records"));
                     }
                     return proto::decode_one(&acc).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "非法帧(超长或残缺)")
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid frame (too long or incomplete)")
                     });
                 }
                 // 否则: 记录碎片, 继续收

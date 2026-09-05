@@ -129,7 +129,7 @@ async fn pump(
     let fifos = match prepare_fifos(comment_fifos) {
         Ok(f) => f,
         Err(e) => {
-            tracing::error!(sid, %e, "评论 FIFO 注册失败");
+            tracing::error!(sid, %e, "failed to register comment FIFO");
             let _ = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGHUP);
             reap(pid).await;
             let _ = inner.backend.cleanup(&sid).await;
@@ -168,20 +168,20 @@ async fn pump(
         tokio::select! {
             data = input.recv() => match data {
                 Some(b) => { let _ = write_all(&master, &b).await; }
-                None => { why = "input 通道关闭(接入层断开)"; break; }
+                None => { why = "input channel closed (access layer disconnected)"; break; }
             },
             c = ctrl.recv() => match c {
                 Some(Control::Resize { cols, rows }) => {
                     let _ = crate::pty::set_winsize(master.get_ref(), cols, rows);
                     let _ = kill(pid, Signal::SIGWINCH);
                 }
-                None => { why = "control 通道关闭(接入层断开)"; break; }
+                None => { why = "control channel closed (access layer disconnected)"; break; }
             },
             ack = ack_rx.recv(), if ack_open => match ack {
                 Some(bytes) => {
                     // ack 只进已有输出队列；绝不写 PTY master（否则等价于模拟键盘）。
                     if out.send(bytes).await.is_err() {
-                        why = "输出通道关闭(接入层断开)";
+                        why = "output channel closed (access layer disconnected)";
                         break;
                     }
                     // zsh 可能已在异步 ack 之前画好下一个 prompt。用默认为
@@ -192,23 +192,23 @@ async fn pump(
                 None => ack_open = false,
             },
             ready = master.readable() => {
-                let mut g = match ready { Ok(g) => g, Err(_) => { why = "master readable 错误"; break; } };
+                let mut g = match ready { Ok(g) => g, Err(_) => { why = "master readable error"; break; } };
                 match nix::unistd::read(master.as_raw_fd(), &mut buf) {
-                    Ok(0) => { why = "PTY EOF(shell 退出)"; break; }
+                    Ok(0) => { why = "PTY EOF (shell exited)"; break; }
                     Ok(n) => {
                         if out.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                            why = "输出通道关闭(接入层断开)";
+                            why = "output channel closed (access layer disconnected)";
                             break;
                         }
                     }
                     Err(nix::errno::Errno::EAGAIN) => g.clear_ready(),
-                    Err(_) => { why = "PTY 读错误"; break; }
+                    Err(_) => { why = "PTY read error"; break; }
                 }
             },
         }
     }
 
-    tracing::info!(sid, why, "pump 退出，停止投稿并做最终 drain");
+    tracing::info!(sid, why, "pump exited, stopping submissions and performing final drain");
     // 先停 writer，再让每个已打开 FIFO 读到 EAGAIN；路径从不重开。
     let _ = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGHUP);
     let _ = shutdown_tx.send(true);
@@ -242,7 +242,7 @@ async fn pump(
             }
             result = &mut worker, if !worker_done => {
                 if let Err(e) = result {
-                    tracing::warn!(sid, %e, "评论 worker 异常结束");
+                    tracing::warn!(sid, %e, "comment worker exited abnormally");
                 }
                 worker_done = true;
             }
@@ -266,7 +266,7 @@ async fn pump(
     }
 
     reap(pid).await;
-    tracing::info!(sid, "shell 已收尸, backend 清理开始");
+    tracing::info!(sid, "shell reaped, backend cleanup started");
     let _ = inner.backend.cleanup(&sid).await;
     inner.table.lock().unwrap().remove(&sid);
 }
@@ -337,7 +337,7 @@ async fn consume_fifo_bytes(
             let text = match String::from_utf8(raw) {
                 Ok(s) => s,
                 Err(_) => {
-                    send_ack(ack, "评论未提交：输入不是合法 UTF-8").await;
+                    send_ack(ack, "Comment not submitted: input is not valid UTF-8").await;
                     continue;
                 }
             };
@@ -345,7 +345,7 @@ async fn consume_fifo_bytes(
                 (n < MAX_SESSION_COMMENTS).then_some(n + 1)
             });
             if slot.is_err() {
-                send_ack(ack, "评论未提交：每个会话最多 8 条").await;
+                send_ack(ack, "Comment not submitted: maximum 8 comments per session").await;
                 continue;
             }
             if tx
@@ -361,7 +361,7 @@ async fn consume_fifo_bytes(
         } else if line.len() == MAX_COMMENT_LINE {
             line.clear();
             *discard = true;
-            send_ack(ack, "评论未提交：单行超过 512 字节").await;
+            send_ack(ack, "Comment not submitted: line exceeds 512 bytes").await;
         } else {
             line.push(byte);
         }
@@ -384,7 +384,7 @@ async fn comment_worker(
             .await
         {
             Ok(res) => res.notice,
-            Err(_) => "评论未提交：评论服务暂不可用".into(),
+            Err(_) => "Comment not submitted: comments service temporarily unavailable".into(),
         };
         send_ack(&ack, &notice).await;
     }

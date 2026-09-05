@@ -336,7 +336,7 @@ async fn forward_output(
                                 tracing::warn!(
                                     sid = %sid,
                                     conn = s.id,
-                                    "slow consumer: 输出队列满, 关闭 WS 连接"
+                                    "slow consumer: output queue full, closing WS connection"
                                 );
                                 let _ = s.close.send(CloseReason::SlowConsumer);
                             }

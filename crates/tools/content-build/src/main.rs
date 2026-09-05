@@ -64,7 +64,7 @@ struct Cli {
 
 fn next_val(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
     args.next()
-        .ok_or_else(|| anyhow::anyhow!("参数 {name} 需要一个值"))
+        .ok_or_else(|| anyhow::anyhow!("argument {name} requires a value"))
 }
 
 fn parse_cli() -> Result<Cli> {
@@ -83,7 +83,7 @@ fn parse_cli() -> Result<Cli> {
             "--config" => cli.config = Some(PathBuf::from(next_val(&mut args, "--config")?)),
             "--site-url" => cli.site_url_arg = Some(next_val(&mut args, "--site-url")?),
             "--site-title" => cli.site_title = Some(next_val(&mut args, "--site-title")?),
-            other => bail!("未知参数: {other}"),
+            other => bail!("unknown argument: {other}"),
         }
     }
     Ok(cli)
@@ -100,7 +100,7 @@ fn scan_content(
     warns: &mut Vec<String>,
 ) -> Result<()> {
     let mut entries = std::fs::read_dir(dir)
-        .with_context(|| format!("扫描目录 {}", dir.display()))?
+        .with_context(|| format!("scan directory {}", dir.display()))?
         .collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
@@ -108,9 +108,9 @@ fn scan_content(
         let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
         let rel_str = rel.to_string_lossy();
         let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("读取目录项元数据 {}", path.display()))?;
+            .with_context(|| format!("read directory entry metadata {}", path.display()))?;
         if metadata.file_type().is_symlink() {
-            path_errors.push(format!("{}: content 不支持符号链接", rel.display()));
+            path_errors.push(format!("{}: content does not support symlinks", rel.display()));
             continue;
         }
         if termblog_content_model::has_hidden_component(&rel_str) {
@@ -124,7 +124,7 @@ fn scan_content(
                         | ".web-outputs.tsv"
                 )
             {
-                warns.push(format!("跳过未知隐藏内容: {}", rel.display()));
+                warns.push(format!("skipping unknown hidden content: {}", rel.display()));
             }
             continue;
         }
@@ -148,7 +148,7 @@ fn scan_content(
                 // 已知类型(asciicast 录像): 静默
             } else {
                 warns.push(format!(
-                    "普通 HOME 内容（不生成 Web 页面）: {}",
+                    "ordinary HOME content (no Web page generated): {}",
                     rel.display()
                 ));
             }
@@ -175,28 +175,28 @@ fn load_comment_attachments(content: &Path) -> Result<Vec<CommentAttachment>> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("读取内容配置 {}", config_path.display()))?;
+        .with_context(|| format!("read content config {}", config_path.display()))?;
     let config: ContentConfig =
-        toml::from_str(&text).with_context(|| format!("解析内容配置 {}", config_path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parse content config {}", config_path.display()))?;
     let mut seen = BTreeSet::new();
     let mut attachments = Vec::new();
     for directory in config.comments.directories {
         if !seen.insert(directory.clone()) {
             bail!(
-                "{}: comments.directories 重复项 {:?}",
+                "{}: comments.directories duplicate entry {:?}",
                 config_path.display(),
                 directory
             );
         }
         let attachment = CommentAttachment::from_directory_rel(&directory).map_err(|e| {
-            anyhow::anyhow!("{}: 评论目录 {:?}: {e}", config_path.display(), directory)
+            anyhow::anyhow!("{}: comment directory {:?}: {e}", config_path.display(), directory)
         })?;
         let directory_path = content.join(&attachment.directory_rel);
         let metadata = std::fs::symlink_metadata(&directory_path)
-            .with_context(|| format!("配置的评论目录不存在: {}", directory_path.display()))?;
+            .with_context(|| format!("configured comment directory does not exist: {}", directory_path.display()))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             bail!(
-                "配置的评论目录必须是真实目录: {} ({:?})",
+                "configured comment directory must be a real directory: {} ({:?})",
                 directory_path.display(),
                 directory
             );
@@ -205,7 +205,7 @@ fn load_comment_attachments(content: &Path) -> Result<Vec<CommentAttachment>> {
         match std::fs::symlink_metadata(&reserved) {
             Ok(_) => {
                 bail!(
-                    "评论目录 {:?} 启用后保留路径 {}，但该路径已被源内容占用",
+                    "comment directory {:?} reserves path {} once enabled, but path is already taken by source content",
                     directory,
                     reserved.display()
                 );
@@ -213,7 +213,7 @@ fn load_comment_attachments(content: &Path) -> Result<Vec<CommentAttachment>> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("检查评论保留路径 {}", reserved.display()));
+                    .with_context(|| format!("check comment reserved path {}", reserved.display()));
             }
         }
         attachments.push(attachment);
@@ -234,13 +234,13 @@ fn collect_image_dests(events: &[Event<'static>]) -> Vec<String> {
 
 fn validate_output_rel(rel: &str) -> Result<()> {
     if rel.is_empty() || rel.starts_with('/') || rel.ends_with('/') || rel.contains('\\') {
-        bail!("Web 产物清单路径不是规范相对路径: {rel:?}");
+        bail!("Web output manifest path is not a normalized relative path: {rel:?}");
     }
     if rel
         .split('/')
         .any(|part| part.is_empty() || matches!(part, "." | ".."))
     {
-        bail!("Web 产物清单路径含非法组件: {rel:?}");
+        bail!("Web output manifest path contains invalid components: {rel:?}");
     }
     Ok(())
 }
@@ -254,10 +254,10 @@ fn read_web_manifest(content: &Path) -> Result<(BTreeMap<String, String>, bool)>
     for (index, line) in std::fs::read_to_string(&path)?.lines().enumerate() {
         let (rel, owner) = line
             .split_once('\t')
-            .ok_or_else(|| anyhow::anyhow!("{} 第 {} 行缺 Tab", path.display(), index + 1))?;
+            .ok_or_else(|| anyhow::anyhow!("{} line {} missing Tab", path.display(), index + 1))?;
         validate_output_rel(rel)?;
         if owner.is_empty() || outputs.insert(rel.to_owned(), owner.to_owned()).is_some() {
-            bail!("{} 第 {} 行为空或重复", path.display(), index + 1);
+            bail!("{} line {} is empty or duplicated", path.display(), index + 1);
         }
     }
     Ok((outputs, true))
@@ -276,7 +276,7 @@ fn validate_control_paths(content: &Path) -> Result<()> {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(error).with_context(|| format!("读取控制路径 {}", path.display()));
+                return Err(error).with_context(|| format!("read control path {}", path.display()));
             }
         };
         if metadata.file_type().is_symlink()
@@ -284,12 +284,12 @@ fn validate_control_paths(content: &Path) -> Result<()> {
             || (!want_directory && !metadata.is_file())
         {
             bail!(
-                "内容控制路径类型错误: {} 必须是{}且不能是符号链接",
+                "content control path type error: {} must be {} and cannot be a symlink",
                 path.display(),
                 if want_directory {
-                    "目录"
+                    "directory"
                 } else {
-                    "普通文件"
+                    "regular file"
                 }
             );
         }
@@ -307,7 +307,7 @@ fn walk_regular_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            bail!("Web 静态树不允许符号链接: {}", path.display());
+            bail!("Web static tree does not allow symlinks: {}", path.display());
         }
         if metadata.is_dir() {
             walk_regular_files(root, &path, out)?;
@@ -330,7 +330,7 @@ fn walk_output_nodes(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            bail!("Web 静态树不允许符号链接: {}", path.display());
+            bail!("Web static tree does not allow symlinks: {}", path.display());
         }
         let rel = path.strip_prefix(root)?.to_string_lossy();
         if metadata.is_dir() {
@@ -355,7 +355,7 @@ fn claim_output(
             || rel.starts_with(&format!("{claimed}/"))
         {
             errors.push(format!(
-                "Web 输出冲突: {rel}\n  已占用: {claimed_owner} ({claimed})\n  新占用: {owner}"
+                "Web output conflict: {rel}\n  already claimed by: {claimed_owner} ({claimed})\n  new claim by: {owner}"
             ));
         }
     }
@@ -366,15 +366,15 @@ fn claim_output(
 
 fn reserved_route_owner(key: &str) -> Option<&'static str> {
     if key == "blog" {
-        Some("系统文章列表 /blog/")
+        Some("system article list /blog/")
     } else if key == "ws" {
-        Some("WebSocket 系统路由 /ws")
+        Some("WebSocket system route /ws")
     } else if key == "api" || key.starts_with("api/") {
-        Some("HTTP API 前缀 /api/")
+        Some("HTTP API prefix /api/")
     } else if key == "assets" || key.starts_with("assets/") {
-        Some("Vite 静态资源前缀 /assets/")
+        Some("Vite static asset prefix /assets/")
     } else if key == "fonts" || key.starts_with("fonts/") {
-        Some("字体资源前缀 /fonts/")
+        Some("font asset prefix /fonts/")
     } else {
         None
     }
@@ -390,7 +390,7 @@ fn claim_desired(
     claim_output(claims, &rel, &owner, errors);
     if let Some(first) = desired.insert(rel.clone(), owner.clone()) {
         errors.push(format!(
-            "Web 输出冲突: {rel}\n  已占用: {first}\n  新占用: {owner}"
+            "Web output conflict: {rel}\n  already claimed by: {first}\n  new claim by: {owner}"
         ));
     }
 }
@@ -414,7 +414,7 @@ fn build_web_claims(
         claim_output(
             &mut claims,
             &rel,
-            &format!("Vite/public 静态文件 {rel}"),
+            &format!("Vite/public static file {rel}"),
             &mut errors,
         );
     }
@@ -424,14 +424,14 @@ fn build_web_claims(
         &mut claims,
         &mut desired,
         GLOBAL_LIST_OUTPUT.into(),
-        "系统文章列表 /blog/".into(),
+        "system article list /blog/".into(),
         &mut errors,
     );
     claim_desired(
         &mut claims,
         &mut desired,
         "robots.txt".into(),
-        "系统 feed 产物 robots.txt".into(),
+        "system feed artifact robots.txt".into(),
         &mut errors,
     );
     if site_url.is_some() {
@@ -439,21 +439,21 @@ fn build_web_claims(
             &mut claims,
             &mut desired,
             "sitemap.xml".into(),
-            "系统 feed 产物 sitemap.xml".into(),
+            "system feed artifact sitemap.xml".into(),
             &mut errors,
         );
         claim_desired(
             &mut claims,
             &mut desired,
             "atom.xml".into(),
-            "系统 feed 产物 atom.xml".into(),
+            "system feed artifact atom.xml".into(),
             &mut errors,
         );
     }
     for article in arts {
         if let Some(system) = reserved_route_owner(&article.path.key) {
             errors.push(format!(
-                "Web 路径冲突: {}\n  系统占用: {system}\n  内容占用: {}",
+                "Web path conflict: {}\n  system reservation: {system}\n  content claim: {}",
                 article.path.route,
                 article.path.source_rel.display()
             ));
@@ -462,7 +462,7 @@ fn build_web_claims(
             &mut claims,
             &mut desired,
             format!("{}/index.html", article.path.key),
-            format!("文章 {}", article.path.source_rel.display()),
+            format!("article {}", article.path.source_rel.display()),
             &mut errors,
         );
     }
@@ -470,7 +470,7 @@ fn build_web_claims(
         if let Some(first) = rel.split('/').next() {
             if matches!(first, "assets" | "fonts" | "api") {
                 errors.push(format!(
-                    "Web 路径冲突: /{rel}\n  系统占用: /{first}/ 前缀\n  内容占用: 图片 {source}"
+                    "Web path conflict: /{rel}\n  system reservation: /{first}/ prefix\n  content claim: image {source}"
                 ));
             }
         }
@@ -478,7 +478,7 @@ fn build_web_claims(
             &mut claims,
             &mut desired,
             rel.clone(),
-            format!("文章图片 {source}"),
+            format!("article image {source}"),
             &mut errors,
         );
     }
@@ -487,7 +487,7 @@ fn build_web_claims(
         for error in &errors {
             eprintln!("{error}");
         }
-        bail!("Web 路径/输出冲突: {} 处", errors.len());
+        bail!("Web path/output conflicts: {} issue(s)", errors.len());
     }
     Ok(desired)
 }
@@ -498,7 +498,7 @@ fn write_stage(stage: &Path, rel: &str, bytes: impl AsRef<[u8]>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, bytes).with_context(|| format!("写 staging 产物 {}", path.display()))
+    std::fs::write(&path, bytes).with_context(|| format!("write staging artifact {}", path.display()))
 }
 
 fn remove_empty_parents(mut path: PathBuf, stop: &Path) {
@@ -522,7 +522,7 @@ fn commit_web_outputs(
         let legacy = dist.join(GLOBAL_LIST_DIRECTORY);
         if legacy.exists() {
             std::fs::remove_dir_all(&legacy)
-                .with_context(|| format!("清理旧版内容目录 {}", legacy.display()))?;
+                .with_context(|| format!("clean up legacy content directory {}", legacy.display()))?;
         }
     }
     for rel in old_outputs.keys() {
@@ -541,12 +541,12 @@ fn commit_web_outputs(
     for rel in staged {
         let source = stage.join(&rel);
         let target = dist.join(&rel);
-        let parent = target.parent().context("Web 产物缺父目录")?;
+        let parent = target.parent().context("Web artifact missing parent directory")?;
         std::fs::create_dir_all(parent)?;
         let file_name = target
             .file_name()
             .and_then(|v| v.to_str())
-            .context("Web 产物文件名非法")?;
+            .context("invalid Web artifact filename")?;
         let temp = parent.join(format!(".{file_name}.content-build-{}", std::process::id()));
         std::fs::copy(&source, &temp)?;
         std::fs::rename(&temp, &target)?;
@@ -558,10 +558,10 @@ fn replace_tree(staged: &Path, destination: &Path) -> Result<()> {
     let name = destination
         .file_name()
         .and_then(|value| value.to_str())
-        .context("生成目录名非法")?;
+        .context("invalid generated directory name")?;
     let backup = destination.with_file_name(format!(".{name}.old-{}", std::process::id()));
     if backup.exists() {
-        bail!("临时备份路径已存在: {}", backup.display());
+        bail!("temporary backup path already exists: {}", backup.display());
     }
     if destination.exists() {
         std::fs::rename(destination, &backup)?;
@@ -570,7 +570,7 @@ fn replace_tree(staged: &Path, destination: &Path) -> Result<()> {
         if backup.exists() {
             let _ = std::fs::rename(&backup, destination);
         }
-        return Err(error).with_context(|| format!("替换 {}", destination.display()));
+        return Err(error).with_context(|| format!("replace {}", destination.display()));
     }
     if backup.exists() {
         std::fs::remove_dir_all(backup)?;
@@ -579,11 +579,11 @@ fn replace_tree(staged: &Path, destination: &Path) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
-    let parent = path.parent().context("原子写入路径缺父目录")?;
+    let parent = path.parent().context("atomic write path missing parent directory")?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .context("文件名非法")?;
+        .context("invalid filename")?;
     let temp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
     std::fs::write(&temp, bytes)?;
     std::fs::rename(temp, path)?;
@@ -610,9 +610,9 @@ fn main() -> Result<()> {
 
     // content 是唯一扫描根；blog/ 只是其中一个普通目录。
     let content_metadata = std::fs::symlink_metadata(&cli.content)
-        .with_context(|| format!("读取 content 根 {}", cli.content.display()))?;
+        .with_context(|| format!("read content root {}", cli.content.display()))?;
     if !content_metadata.is_dir() || content_metadata.file_type().is_symlink() {
-        bail!("content 根不存在或不是目录: {}", cli.content.display());
+        bail!("content root does not exist or is not a directory: {}", cli.content.display());
     }
     validate_control_paths(&cli.content)?;
     let mut article_paths: Vec<ArticlePath> = Vec::new();
@@ -628,13 +628,13 @@ fn main() -> Result<()> {
         &mut warns,
     )?;
     if article_paths.is_empty() {
-        warns.push(format!("{} 下没有文章", cli.content.display()));
+        warns.push(format!("no articles under {}", cli.content.display()));
     }
     if !path_errors.is_empty() {
         for error in &path_errors {
-            eprintln!("内容路径违规: {error}");
+            eprintln!("content path violation: {error}");
         }
-        bail!("内容路径校验失败: {} 处问题", path_errors.len());
+        bail!("content path validation failed: {} issue(s)", path_errors.len());
     }
     article_paths.sort_by(|a, b| a.key.cmp(&b.key));
     let attachments = load_comment_attachments(&cli.content)?;
@@ -656,9 +656,9 @@ fn main() -> Result<()> {
     let mut total_bytes = 0usize;
     for article_path in &article_paths {
         let path = cli.content.join(&article_path.source_rel);
-        let src = std::fs::read(&path).with_context(|| format!("读文章 {}", path.display()))?;
+        let src = std::fs::read(&path).with_context(|| format!("read article {}", path.display()))?;
         let mut text = String::from_utf8(src)
-            .with_context(|| format!("文章不是 UTF-8: {}", path.display()))?;
+            .with_context(|| format!("article is not UTF-8: {}", path.display()))?;
         if let Some(stripped) = text.strip_prefix('\u{feff}') {
             text = stripped.to_string();
         }
@@ -678,7 +678,7 @@ fn main() -> Result<()> {
         let (date10, date_rfc3339, date_warned) = meta::article_date(&path);
         if date_warned {
             warns.push(format!(
-                "「{}」无 git 历史, 日期回退到文件 mtime",
+                "\"{}\" has no git history, date fell back to file mtime",
                 article_path.source_rel.display()
             ));
         }
@@ -691,26 +691,26 @@ fn main() -> Result<()> {
         for dest in collect_image_dests(&events) {
             let (rel_path, suffix) = match img::resolve_image_url(&source_rel, &dest) {
                 Err(e) => {
-                    image_errors.push(format!("「{key}」图片 {dest}: {e}"));
+                    image_errors.push(format!("\"{key}\" image {dest}: {e}"));
                     continue;
                 }
                 Ok(img::ResolvedImage::External(_)) => {
                     if dest.starts_with('/') {
-                        warns.push(format!("「{key}」站点绝对路径图片不受管线管理: {dest}"));
+                        warns.push(format!("\"{key}\" site-absolute image is not managed by pipeline: {dest}"));
                     }
                     continue;
                 }
                 Ok(img::ResolvedImage::Local(_)) => {
                     // resolve 成功则 normalize 必然成功
                     let (rel_path, suffix) = img::normalize_local_path(&source_rel, &dest)
-                        .expect("已 resolve 的本地图")
-                        .expect("已 resolve 的本地图");
+                        .expect("resolved local image")
+                        .expect("resolved local image");
                     (rel_path, suffix)
                 }
             };
             let img_path = cli.content.join(&rel_path);
             if !img_path.is_file() {
-                image_errors.push(format!("「{key}」引用的图片不存在: {rel_path}"));
+                image_errors.push(format!("image referenced by \"{key}\" does not exist: {rel_path}"));
                 continue;
             }
             match img::process_image(&img_path, &rel_path, key) {
@@ -719,7 +719,7 @@ fn main() -> Result<()> {
                     article_bytes += p.bytes.len();
                     if article_bytes > img::MAX_ARTICLE_BYTES {
                         image_errors.push(format!(
-                            "「{key}」图片总量超过单篇预算: 已累计 {} KiB(上限 {} KiB, 超出来自 {rel_path}); 请压缩/减少图片",
+                            "total image size for \"{key}\" exceeds per-article budget: accumulated {} KiB (limit {} KiB, excess from {rel_path}); please compress/reduce images",
                             article_bytes / 1024,
                             img::MAX_ARTICLE_BYTES / 1024
                         ));
@@ -728,7 +728,7 @@ fn main() -> Result<()> {
                     if let Some(first) = asset_owners.insert(p.dist_rel.clone(), rel_path.clone()) {
                         if first != rel_path {
                             image_errors.push(format!(
-                                "Web 输出冲突: {} 同时由 {} 与 {} 生成",
+                                "Web output conflict: {} generated simultaneously by {} and {}",
                                 p.dist_rel, first, rel_path
                             ));
                             continue;
@@ -764,15 +764,15 @@ fn main() -> Result<()> {
     }
     if !image_errors.is_empty() {
         for e in &image_errors {
-            eprintln!("图片错误: {e}");
+            eprintln!("image error: {e}");
         }
-        bail!("图片处理失败: {} 处问题, 请修复后重跑", image_errors.len());
+        bail!("image processing failed: {} issue(s), please fix and re-run", image_errors.len());
     }
     // 未被引用的资源仅告警(不处理不复制, 如 demo.cast 的先例)
     for a in &assets {
         let rel_str = a.to_string_lossy().to_string();
         if !referenced.contains(&rel_str) {
-            warns.push(format!("未被引用的图片资源(不复制): {rel_str}"));
+            warns.push(format!("unreferenced image asset (not copied): {rel_str}"));
         }
     }
     // 排序: 日期倒序, 同日 article key 字典序升序
@@ -792,7 +792,7 @@ fn main() -> Result<()> {
         let mut found: Vec<String> = vec![];
         if assets.is_dir() {
             for e in
-                std::fs::read_dir(&assets).with_context(|| format!("扫描 {}", assets.display()))?
+                std::fs::read_dir(&assets).with_context(|| format!("scan {}", assets.display()))?
             {
                 let name = e?.file_name().to_string_lossy().to_string();
                 if name.starts_with("index-") && name.ends_with(".js") {
@@ -803,10 +803,10 @@ fn main() -> Result<()> {
         match found.len() {
             1 => Some(found.pop().unwrap()),
             0 => bail!(
-                "找不到前端入口 JS ({}), 请先 make build-frontend(vite build 先于 content-build)",
+                "cannot find frontend entry JS ({}), please run make build-frontend first (vite build before content-build)",
                 assets.display()
             ),
-            n => bail!("找到 {n} 个前端入口 JS, 无法确定用哪个: {found:?}"),
+            n => bail!("found {n} frontend entry JS files, cannot determine which to use: {found:?}"),
         }
     };
     let entry_css = if arts.is_empty() {
@@ -816,7 +816,7 @@ fn main() -> Result<()> {
         let mut found: Vec<String> = vec![];
         if assets.is_dir() {
             for e in
-                std::fs::read_dir(&assets).with_context(|| format!("扫描 {}", assets.display()))?
+                std::fs::read_dir(&assets).with_context(|| format!("scan {}", assets.display()))?
             {
                 let name = e?.file_name().to_string_lossy().to_string();
                 if name.starts_with("index-") && name.ends_with(".css") {
@@ -827,10 +827,10 @@ fn main() -> Result<()> {
         match found.len() {
             1 => Some(found.pop().unwrap()),
             0 => bail!(
-                "找不到前端入口 CSS ({}), 请先 make build-frontend(vite build 先于 content-build)",
+                "cannot find frontend entry CSS ({}), please run make build-frontend first (vite build before content-build)",
                 assets.display()
             ),
-            n => bail!("找到 {n} 个前端入口 CSS, 无法确定用哪个: {found:?}"),
+            n => bail!("found {n} frontend entry CSS files, cannot determine which to use: {found:?}"),
         }
     };
 
@@ -848,8 +848,8 @@ fn main() -> Result<()> {
         }
         match found.len() {
             1 => found.pop().unwrap(),
-            0 => bail!("找不到独立 comments 前端入口，请先 make build-frontend"),
-            n => bail!("找到 {n} 个 comments 前端入口，无法确定: {found:?}"),
+            0 => bail!("cannot find standalone comments frontend entry, please run make build-frontend first"),
+            n => bail!("found {n} comments frontend entries, cannot determine: {found:?}"),
         }
     };
 
@@ -892,15 +892,15 @@ fn main() -> Result<()> {
         let p = stage_web.join(rel_path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建 {}", parent.display()))?;
+                .with_context(|| format!("create {}", parent.display()))?;
         }
-        std::fs::write(&p, bytes).with_context(|| format!("写图片 {}", p.display()))?;
+        std::fs::write(&p, bytes).with_context(|| format!("write image {}", p.display()))?;
         let q = rendered_assets.join(rel_path);
         if let Some(parent) = q.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建 {}", parent.display()))?;
+                .with_context(|| format!("create {}", parent.display()))?;
         }
-        std::fs::write(&q, bytes).with_context(|| format!("写处理后图片 {}", q.display()))?;
+        std::fs::write(&q, bytes).with_context(|| format!("write processed image {}", q.display()))?;
     }
 
     // ANSI 占位框里 URL 的基址: 有 site_url 拼完整 URL(SSH 用户可直接复制进浏览器),
@@ -929,15 +929,15 @@ fn main() -> Result<()> {
         let rp = rendered.join(&a.path.key);
         if let Some(parent) = rp.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建 {}", parent.display()))?;
+                .with_context(|| format!("create {}", parent.display()))?;
         }
-        std::fs::write(&rp, ansi_out).with_context(|| format!("写 {}", rp.display()))?;
+        std::fs::write(&rp, ansi_out).with_context(|| format!("write {}", rp.display()))?;
         // 有图才写 manifest(无图文章不写文件, reader 据此快速判断无图)
         if !anchors.is_empty() {
             let mp = rendered.join(format!("{}.images.json", a.path.key));
             if let Some(parent) = mp.parent() {
                 std::fs::create_dir_all(parent)
-                    .with_context(|| format!("创建 {}", parent.display()))?;
+                    .with_context(|| format!("create {}", parent.display()))?;
             }
             std::fs::write(
                 &mp,
@@ -947,7 +947,7 @@ fn main() -> Result<()> {
                 }
                 .to_json(),
             )
-            .with_context(|| format!("写 {}", mp.display()))?;
+            .with_context(|| format!("write {}", mp.display()))?;
         }
 
         let page = html::render_mirror_page(
@@ -962,26 +962,26 @@ fn main() -> Result<()> {
         let hp = stage_web.join(&a.path.key).join("index.html");
         if let Some(parent) = hp.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建 {}", parent.display()))?;
+                .with_context(|| format!("create {}", parent.display()))?;
         }
-        std::fs::write(&hp, page).with_context(|| format!("写 {}", hp.display()))?;
+        std::fs::write(&hp, page).with_context(|| format!("write {}", hp.display()))?;
     }
 
     // 列表数据 + 列表页
     std::fs::write(rendered.join(".index"), meta::build_index(&arts))
-        .with_context(|| format!("写 {}", rendered.join(".index").display()))?;
+        .with_context(|| format!("write {}", rendered.join(".index").display()))?;
     let machine_index = meta::build_machine_index(&arts);
     machine_index.validate().map_err(anyhow::Error::msg)?;
     std::fs::write(
         rendered.join(".index.json"),
         serde_json::to_vec_pretty(&machine_index)?,
     )
-    .with_context(|| format!("写 {}", rendered.join(".index.json").display()))?;
-    std::fs::create_dir_all(&dist_blog).with_context(|| format!("创建 {}", dist_blog.display()))?;
+    .with_context(|| format!("write {}", rendered.join(".index.json").display()))?;
+    std::fs::create_dir_all(&dist_blog).with_context(|| format!("create {}", dist_blog.display()))?;
     let entry_js_str = entry_js.as_deref().unwrap_or_default();
     let list = html::render_list_page(&arts, site_url.as_deref(), &site_title, entry_js_str);
     std::fs::write(dist_blog.join("index.html"), list)
-        .with_context(|| format!("写 {}", dist_blog.join("index.html").display()))?;
+        .with_context(|| format!("write {}", dist_blog.join("index.html").display()))?;
 
     // sitemap / atom(有 site_url 时)与 robots.txt(总是)
     if let Some(u) = &site_url {
@@ -997,7 +997,7 @@ fn main() -> Result<()> {
         )?;
     } else {
         warns
-            .push("未设置 site_url, 跳过 sitemap.xml / atom.xml(镜像页无 canonical/OG:url)".into());
+            .push("site_url not set, skipping sitemap.xml / atom.xml (mirror pages lack canonical/OG:url)".into());
     }
     write_stage(&stage_web, "robots.txt", feed::robots(site_url.as_deref()))?;
 
@@ -1008,7 +1008,7 @@ fn main() -> Result<()> {
     let desired_set: BTreeSet<String> = desired_outputs.keys().cloned().collect();
     if staged_set != desired_set {
         bail!(
-            "内部错误: staging 与 Web claim 不一致: staging={staged_set:?}, claims={desired_set:?}"
+            "internal error: staging does not match Web claims: staging={staged_set:?}, claims={desired_set:?}"
         );
     }
 
@@ -1029,25 +1029,25 @@ fn main() -> Result<()> {
     )?;
 
     // 摘要
-    println!("content-build: {} 篇文章", arts.len());
+    println!("content-build: {} article(s)", arts.len());
     println!(
-        "  镜像页:   {}/<article-key>/index.html",
+        "  mirror pages:   {}/<article-key>/index.html",
         cli.dist.display()
     );
     println!(
-        "  全站列表(固定 URL /blog/): {}/blog/index.html",
+        "  global list (fixed URL /blog/): {}/blog/index.html",
         cli.dist.display()
     );
-    println!("  ANSI 预渲染: {}/.rendered/", cli.content.display());
+    println!("  ANSI pre-rendered: {}/.rendered/", cli.content.display());
     println!(
-        "  图片: {} 张, 共 {} KiB(预算 {} KiB/篇)",
+        "  images: {} file(s), total {} KiB (budget {} KiB/article)",
         total_imgs,
         total_bytes / 1024,
         img::MAX_ARTICLE_BYTES / 1024
     );
-    println!("  处理后图片: {}/.rendered-assets/", cli.content.display());
+    println!("  processed images: {}/.rendered-assets/", cli.content.display());
     for w in &warns {
-        println!("警告: {w}");
+        println!("warning: {w}");
     }
     Ok(())
 }
@@ -1090,15 +1090,15 @@ mod tests {
         // 目录以尾 / 登记: 与目录内新文件不冲突(文章可以在既有目录下建页面)。
         let mut claims = BTreeMap::new();
         let mut errors = Vec::new();
-        claim_output(&mut claims, "help/", "已有目录 help/", &mut errors);
-        claim_output(&mut claims, "help/index.html", "文章 help.md", &mut errors);
+        claim_output(&mut claims, "help/", "existing directory help/", &mut errors);
+        claim_output(&mut claims, "help/index.html", "article help.md", &mut errors);
         assert!(errors.is_empty(), "目录与子文件不应冲突: {errors:?}");
 
         // 同一输出的第二个 owner → 精确冲突。
         claim_output(
             &mut claims,
             "help/index.html",
-            "另一来源 help/index.html",
+            "another source help/index.html",
             &mut errors,
         );
         assert_eq!(errors.len(), 1, "同路径双 owner 应恰一处冲突: {errors:?}");
@@ -1109,10 +1109,10 @@ mod tests {
         claim_output(
             &mut claims,
             "new/index.html/",
-            "已有目录 new/index.html/",
+            "existing directory new/index.html/",
             &mut errors,
         );
-        claim_output(&mut claims, "new/index.html", "文章 new.md", &mut errors);
+        claim_output(&mut claims, "new/index.html", "article new.md", &mut errors);
         assert_eq!(errors.len(), 1, "文件与同名目录应冲突: {errors:?}");
     }
 }

@@ -10,7 +10,7 @@ use termblog_config::Config;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
     if !Uid::effective().is_root() {
-        bail!("commentd/commentctl 只能以 root 运行");
+        bail!("commentd/commentctl can only be run as root");
     }
     let argv0 = std::env::args().next().unwrap_or_else(|| "commentd".into());
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -30,18 +30,18 @@ async fn main() -> Result<()> {
     }
     if args.as_slice() == ["--init"] {
         Store::init(&cfg.comments.data_dir)?;
-        println!("已初始化 {}", cfg.comments.data_dir.display());
+        println!("Initialized {}", cfg.comments.data_dir.display());
         return Ok(());
     }
     if !args.is_empty() {
-        bail!("用法: commentd [--config FILE] [--init]");
+        bail!("Usage: commentd [--config FILE] [--init]");
     }
     server::run(cfg.comments).await
 }
 
 async fn ctl(cfg: &Config, args: &[String]) -> Result<()> {
     let Some(cmd) = args.first().map(String::as_str) else {
-        bail!("用法: commentctl queue [--after-id N] [--limit N] | approve <id…>|--all | reject <id…>");
+        bail!("Usage: commentctl queue [--after-id N] [--limit N] | approve <id…>|--all | reject <id…>");
     };
     let client = Client::new(&cfg.comments.private_socket);
     match cmd {
@@ -49,7 +49,7 @@ async fn ctl(cfg: &Config, args: &[String]) -> Result<()> {
         "approve" => {
             let ids = if args.get(1).map(String::as_str) == Some("--all") {
                 if args.len() != 2 {
-                    bail!("--all 不能与 ID 混用");
+                    bail!("--all cannot be combined with IDs");
                 }
                 client
                     .all(PRIVATE_QUEUE)
@@ -73,7 +73,7 @@ async fn ctl(cfg: &Config, args: &[String]) -> Result<()> {
                 .await?;
             print_moderate(res)
         }
-        _ => bail!("未知 commentctl 命令: {cmd}"),
+        _ => bail!("unknown commentctl command: {cmd}"),
     }
 }
 
@@ -81,16 +81,16 @@ async fn queue(client: &Client, args: &[String]) -> Result<()> {
     const MAX_STALE_RETRIES: usize = 5;
     let mut args = args.to_vec();
     let after = take_option(&mut args, "--after-id")?
-        .map(|s| s.parse::<u64>().context("--after-id 必须是整数"))
+        .map(|s| s.parse::<u64>().context("--after-id must be an integer"))
         .transpose()?
         .unwrap_or(0);
     let limit = take_option(&mut args, "--limit")?
-        .map(|s| s.parse::<u16>().context("--limit 必须是整数"))
+        .map(|s| s.parse::<u16>().context("--limit must be an integer"))
         .transpose()?
         .unwrap_or(DEFAULT_LIMIT);
     page_limit(Some(limit)).map_err(anyhow::Error::msg)?;
     if !args.is_empty() {
-        bail!("queue 参数非法: {args:?}");
+        bail!("invalid queue arguments: {args:?}");
     }
     let mut cursor = after;
     let mut revision = if after > 0 {
@@ -115,7 +115,7 @@ async fn queue(client: &Client, args: &[String]) -> Result<()> {
             if res.error.as_deref() == Some("stale_revision") {
                 stale_retries += 1;
                 if stale_retries >= MAX_STALE_RETRIES {
-                    bail!("commentd 数据持续变化，无法取得一致 queue");
+                    bail!("commentd data continuously changing, unable to acquire consistent queue");
                 }
                 rows.clear();
                 cursor = after;
@@ -126,7 +126,7 @@ async fn queue(client: &Client, args: &[String]) -> Result<()> {
                 };
                 continue;
             }
-            bail!("queue 失败: {}", res.error.unwrap_or_default());
+            bail!("queue failed: {}", res.error.unwrap_or_default());
         }
         revision.get_or_insert(res.revision.clone());
         rows.extend(res.comments);
@@ -142,7 +142,7 @@ async fn queue(client: &Client, args: &[String]) -> Result<()> {
             }
             break;
         }
-        cursor = res.next_after_id.context("has_more 缺 next_after_id")?;
+        cursor = res.next_after_id.context("has_more missing next_after_id")?;
     }
     Ok(())
 }
@@ -160,24 +160,24 @@ async fn queue_revision(client: &Client) -> Result<String> {
         .await?;
     if !res.ok {
         bail!(
-            "queue 失败: {}",
-            res.error.unwrap_or_else(|| "未知错误".into())
+            "queue failed: {}",
+            res.error.unwrap_or_else(|| "unknown error".into())
         );
     }
     Ok(res.revision)
 }
 fn parse_ids(args: &[String]) -> Result<Vec<u64>> {
     if args.is_empty() {
-        bail!("至少需要一个评论 ID");
+        bail!("at least one comment ID required");
     }
     args.iter()
-        .map(|s| s.parse::<u64>().with_context(|| format!("非法 ID: {s}")))
+        .map(|s| s.parse::<u64>().with_context(|| format!("invalid ID: {s}")))
         .collect()
 }
 
 fn print_moderate(res: ModerateResponse) -> Result<()> {
     if !res.ok {
-        bail!("审核失败: {}", res.error.unwrap_or_default());
+        bail!("moderation failed: {}", res.error.unwrap_or_default());
     }
     println!("changed={}", res.changed);
     Ok(())
@@ -188,7 +188,7 @@ fn take_option(args: &mut Vec<String>, name: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     if pos + 1 >= args.len() {
-        bail!("{name} 缺少值");
+        bail!("{name} missing value");
     }
     let value = args.remove(pos + 1);
     args.remove(pos);

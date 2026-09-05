@@ -152,7 +152,7 @@ try {
   const stableManifest = readFileSync(join(content, ".web-outputs.tsv"), "utf8");
   write(join(content, "assets.md"), "# Reserved route\n");
   const conflict = build(false);
-  check(conflict.includes("Web 路径冲突"), "系统路由冲突在提交前失败");
+  check(conflict.includes("Web path conflict"), "系统路由冲突在提交前失败");
   check(readFileSync(join(dist, "help/index.html"), "utf8") === stableHtml, "冲突失败保留旧 Web 页面");
   check(
     readFileSync(join(content, ".web-outputs.tsv"), "utf8") === stableManifest,
@@ -162,9 +162,9 @@ try {
 
   // 其余系统保留路由同样在提交前失败, 旧产物保持不动(D14: blog.md 与全站列表冲突)。
   for (const [file, marker] of [
-    ["blog.md", "系统文章列表 /blog/"],
-    ["ws.md", "WebSocket 系统路由 /ws"],
-    ["api/comments.md", "HTTP API 前缀 /api/"],
+    ["blog.md", "system article list /blog/"],
+    ["ws.md", "WebSocket system route /ws"],
+    ["api/comments.md", "HTTP API prefix /api/"],
   ]) {
     write(join(content, file), "# Reserved route\n");
     const reserved = build(false);
@@ -180,7 +180,7 @@ try {
   write(join(content, "new.md"), "# File-directory collision\n");
   mkdirSync(join(dist, "new/index.html"), { recursive: true });
   const structuralConflict = build(false);
-  check(structuralConflict.includes("Web 输出冲突"), "文件与已有空目录的结构冲突被拒绝");
+  check(structuralConflict.includes("Web output conflict"), "文件与已有空目录的结构冲突被拒绝");
   check(readFileSync(join(dist, "help/index.html"), "utf8") === stableHtml, "结构冲突失败保留旧页面");
   rmSync(join(content, "new.md"));
   rmSync(join(dist, "new"), { recursive: true });
@@ -195,7 +195,7 @@ try {
   write(join(content, "clash.md"), "# WebP collision\n\n![w](pix/a.webp)\n\n![p](pix/a.png)\n");
   const webpClash = build(false);
   check(
-    webpClash.includes("Web 输出冲突") && webpClash.includes("pix/a.png"),
+    webpClash.includes("Web output conflict") && webpClash.includes("pix/a.png"),
     "webp 转 png 与已有 png 目标冲突在提交前失败",
   );
   check(
@@ -207,13 +207,13 @@ try {
 
   symlinkSync(join(content, "help.md"), join(content, "linked.md"));
   const symlinkFailure = build(false);
-  check(symlinkFailure.includes("不支持符号链接"), "content 符号链接被拒绝");
+  check(symlinkFailure.includes("content does not support symlinks"), "content 符号链接被拒绝");
   rmSync(join(content, "linked.md"));
 
   rmSync(join(content, ".comment-targets.tsv"));
   mkdirSync(join(content, ".comment-targets.tsv"));
   const controlPathFailure = build(false);
-  check(controlPathFailure.includes("内容控制路径类型错误"), "隐藏控制路径类型错误在提交前失败");
+  check(controlPathFailure.includes("content control path type error"), "隐藏控制路径类型错误在提交前失败");
 
   console.log("\ncontent path e2e: 全部通过");
 } finally {

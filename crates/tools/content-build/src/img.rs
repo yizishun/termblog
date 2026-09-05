@@ -71,7 +71,7 @@ pub fn normalize_local_path(source_rel: &str, dest: &str) -> Result<Option<(Stri
     }
     let (path_part, suffix) = split_suffix(dest);
     if path_part.contains('%') {
-        bail!("图片路径含 '%'(请改用 [a-z0-9/._-] 字符集的文件名): {dest}");
+        bail!("image path contains '%'(please use [a-z0-9/._-] filename charset): {dest}");
     }
     // base = Markdown 源文件的直属目录（相对 content/HOME）。
     let base = match source_rel.rfind('/') {
@@ -90,14 +90,14 @@ pub fn normalize_local_path(source_rel: &str, dest: &str) -> Result<Option<(Stri
             "" | "." => {}
             ".." => {
                 if stack.pop().is_none() {
-                    bail!("图片路径逃逸 content 根: {dest}");
+                    bail!("image path escapes content root: {dest}");
                 }
             }
             s => stack.push(s),
         }
     }
     if stack.is_empty() {
-        bail!("图片路径不指向任何文件: {dest}");
+        bail!("image path does not point to any file: {dest}");
     }
     Ok(Some((stack.join("/"), suffix.to_string())))
 }
@@ -130,7 +130,7 @@ pub struct ProcessedImage {
 /// 所有预算违规 bail, 报错含文章 key / 文件路径 / 实际大小 / 建议。
 pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<ProcessedImage> {
     use image::ImageEncoder;
-    let raw = std::fs::read(path).with_context(|| format!("读图片 {}", path.display()))?;
+    let raw = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -141,13 +141,13 @@ pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<Proces
         // gif: 原样采用, 不缩放(会丢动画); 先查预算再解码首帧拿 (w, h)
         if raw.len() > MAX_GIF_BYTES {
             bail!(
-                "「{article_key}」的图片 {rel} 为 {} KiB, 超过 gif 预算 {} KiB; 请自行压缩/缩小",
+                "image {rel} of \"{article_key}\" is {} KiB, exceeds gif budget {} KiB; please compress/scale it down",
                 raw.len() / 1024,
                 MAX_GIF_BYTES / 1024
             );
         }
         let img = image::load_from_memory_with_format(&raw, image::ImageFormat::Gif)
-            .with_context(|| format!("「{article_key}」的 gif 无法解码: {rel}"))?;
+            .with_context(|| format!("failed to decode gif of \"{article_key}\": {rel}"))?;
         return Ok(ProcessedImage {
             bytes: raw,
             width: img.width(),
@@ -157,7 +157,7 @@ pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<Proces
     }
 
     let img = image::load_from_memory(&raw)
-        .with_context(|| format!("「{article_key}」的图片无法解码: {rel}"))?;
+        .with_context(|| format!("failed to decode image of \"{article_key}\": {rel}"))?;
     let (w, h) = (img.width(), img.height());
 
     let (mut bytes, mut fw, mut fh) = if w > MAX_WIDTH {
@@ -165,7 +165,7 @@ pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<Proces
         let resized =
             image::imageops::resize(&img, MAX_WIDTH, nh, image::imageops::FilterType::Triangle);
         let encoded = reencode(&resized, &ext)
-            .with_context(|| format!("「{article_key}」的图片重编码失败: {rel}"))?;
+            .with_context(|| format!("failed to re-encode image of \"{article_key}\": {rel}"))?;
         if encoded.len() > raw.len() {
             // 重编码后更大(如 WebP 只有 lossless): 回退用原字节, 尺寸按原图
             (raw, w, h)
@@ -181,7 +181,7 @@ pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<Proces
     // 再编码 PNG, 尺寸从 PNG 解码结果取(与 reader 读到的字节同源)。
     let dist_rel = if ext == "webp" {
         let img = image::load_from_memory(&bytes)
-            .with_context(|| format!("「{article_key}」的 webp 产物无法解码(转 png 前): {rel}"))?;
+            .with_context(|| format!("failed to decode webp artifact of \"{article_key}\" (before png conversion): {rel}"))?;
         let rgba = img.to_rgba8();
         let mut png_buf: Vec<u8> = vec![];
         image::codecs::png::PngEncoder::new(&mut png_buf).write_image(
@@ -200,7 +200,7 @@ pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<Proces
 
     if bytes.len() > MAX_BITMAP_BYTES {
         bail!(
-            "「{article_key}」的图片 {rel} 处理后为 {} KiB, 超过单张预算 {} KiB; 请自行压缩/缩小",
+            "image {rel} of \"{article_key}\" is {} KiB after processing, exceeds per-image budget {} KiB; please compress/scale it down",
             bytes.len() / 1024,
             MAX_BITMAP_BYTES / 1024
         );

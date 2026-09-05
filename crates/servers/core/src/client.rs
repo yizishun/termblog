@@ -55,7 +55,7 @@ impl SessionClient {
     ) -> Result<SessionHandle> {
         let link = Link::connect(&self.socket)
             .await
-            .with_context(|| format!("连接 jaild {}", self.socket.display()))?;
+            .with_context(|| format!("connect jaild {}", self.socket.display()))?;
         Self::open_on(link, peer, cols, rows, attach_token, caps).await
     }
 
@@ -76,14 +76,14 @@ impl SessionClient {
             peer_ip: Some(peer.to_string()),
             caps,
         };
-        link.send(&proto::Frame::json(proto::OPEN, &open)).await.context("发送 Open")?;
+        link.send(&proto::Frame::json(proto::OPEN, &open)).await.context("send Open")?;
 
         // 第一条回帧: Opened(成功) 或 Closed(配额拒绝等原因)
-        let first = link.recv().await.context("读取 Opened")?;
+        let first = link.recv().await.context("read Opened")?;
         let session_id = match first.kind {
             proto::OPENED => first.parse::<proto::Opened>()?.session_id,
             proto::CLOSED => bail!("{}", first.parse::<proto::Closed>()?.reason),
-            other => bail!("意外的首帧 0x{other:02x}"),
+            other => bail!("unexpected first frame 0x{other:02x}"),
         };
 
         let (input_tx, input_rx) = mpsc::channel(64);
@@ -111,16 +111,16 @@ async fn pump(
         tokio::select! {
             data = input.recv() => match data {
                 Some(b) => {
-                    if link.send(&proto::Frame::data(b)).await.is_err() { why = "send 输入"; break; }
+                    if link.send(&proto::Frame::data(b)).await.is_err() { why = "send input"; break; }
                 }
-                None => { why = "input 关闭"; break; } // 接入层断开(SessionHandle 被 drop)
+                None => { why = "input closed"; break; } // 接入层断开(SessionHandle 被 drop)
             },
             c = ctrl.recv() => match c {
                 Some(Control::Resize { cols, rows }) => {
                     let f = proto::Frame::json(proto::RESIZE, &proto::Resize { cols, rows });
                     if link.send(&f).await.is_err() { why = "send resize"; break; }
                 }
-                None => { why = "ctrl 关闭"; break; }
+                None => { why = "ctrl closed"; break; }
             },
             r = link.recv() => match r {
                 Ok(f) => match f.kind {
@@ -129,14 +129,14 @@ async fn pump(
                         // socket 不读, jaild 侧的写最终阻塞, 一路传导到
                         // 子进程 write(2)。绝不丢字节。
                         if out.send(f.payload).await.is_err() {
-                            why = "输出通道关闭";
+                            why = "output channel closed";
                             break; // 接入层断开
                         }
                     }
                     proto::CLOSED => { why = "jaild Closed"; break; } // jaild 宣布会话终结
                     _ => {}
                 },
-                Err(_) => { why = "链路 EOF"; break; } // EOF / 协议错误: jaild 已退出或拒绝
+                Err(_) => { why = "link EOF"; break; } // EOF / 协议错误: jaild 已退出或拒绝
             },
         }
     }

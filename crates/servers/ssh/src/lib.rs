@@ -163,7 +163,7 @@ impl Handler for SshHandler {
         // SSH 访客固定走 v1 占位框降级。
         match self.client.open(self.peer, cols, rows, None, vec![]).await {
             Ok(s) => {
-                tracing::info!(peer = %self.peer, sid = %s.id, "会话创建成功");
+                tracing::info!(peer = %self.peer, sid = %s.id, "session created successfully");
                 let termblog_core::SessionHandle {
                     input,
                     mut output,
@@ -199,14 +199,14 @@ impl Handler for SshHandler {
                 // 客户端就会看到 "shell request failed" 而实际会话已建好。
                 // 这里只记日志: 连接既已半死, Active 随 handler 被 drop 自然回收。
                 if let Err(e) = session.channel_success(channel) {
-                    tracing::warn!(%e, "channel_success 写失败(连接可能已断)");
+                    tracing::warn!(%e, "channel_success write failed (connection might be broken)");
                 }
             }
             Err(e) => {
                 // 配额超限等: 告知原因, 拒绝 shell 请求(单一事实来源在 jaild)
-                tracing::warn!(peer = %self.peer, error = %e, "会话创建失败, 拒绝 shell 请求");
+                tracing::warn!(peer = %self.peer, error = %e, "session creation failed, rejecting shell request");
                 let handle = session.handle();
-                let msg = format!("\x1b[31m[无法创建会话: {e}]\x1b[0m\r\n");
+                let msg = format!("\x1b[31m[cannot create session: {e}]\x1b[0m\r\n");
                 let _ = handle.data(channel, Bytes::from(msg)).await;
                 session.channel_failure(channel)?;
             }

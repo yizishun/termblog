@@ -78,43 +78,43 @@ run-ssh: build
 # ── 后台服务: web/ssh 各持独立 pid+log(幂等) ──
 start: build
 	@if [ -f $(PID_WEB) ] && kill -0 $$(cat $(PID_WEB)) 2>/dev/null; then \
-		echo "termblog-web 已在运行 (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
+		echo "termblog-web is already running (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
 	else \
 		nohup ./$(BIN_WEB) > $(LOG_WEB) 2>&1 & echo $$! > $(PID_WEB); \
 		sleep 0.5; \
 		if kill -0 $$(cat $(PID_WEB)) 2>/dev/null; then \
-			echo "termblog-web 已启动 (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
+			echo "termblog-web started (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
 		else \
-			echo "termblog-web 启动失败, 日志:"; tail -20 $(LOG_WEB); exit 1; \
+			echo "termblog-web startup failed, logs:"; tail -20 $(LOG_WEB); exit 1; \
 		fi; \
 	fi
 
 start-ssh: build
 	@if [ -f $(PID_SSH) ] && kill -0 $$(cat $(PID_SSH)) 2>/dev/null; then \
-		echo "termblog-ssh 已在运行 (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
+		echo "termblog-ssh is already running (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
 	else \
 		nohup ./$(BIN_SSH) > $(LOG_SSH) 2>&1 & echo $$! > $(PID_SSH); \
 		sleep 0.5; \
 		if kill -0 $$(cat $(PID_SSH)) 2>/dev/null; then \
-			echo "termblog-ssh 已启动 (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
+			echo "termblog-ssh started (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
 		else \
-			echo "termblog-ssh 启动失败, 日志:"; tail -20 $(LOG_SSH); exit 1; \
+			echo "termblog-ssh startup failed, logs:"; tail -20 $(LOG_SSH); exit 1; \
 		fi; \
 	fi
 
 stop:
 	@if [ -f $(PID_WEB) ] && kill -0 $$(cat $(PID_WEB)) 2>/dev/null; then \
-		kill $$(cat $(PID_WEB)) && echo "已停止 termblog-web (pid $$(cat $(PID_WEB)))"; \
+		kill $$(cat $(PID_WEB)) && echo "stopped termblog-web (pid $$(cat $(PID_WEB)))"; \
 	else \
-		echo "termblog-web 未在运行"; \
+		echo "termblog-web is not running"; \
 	fi; \
 	rm -f $(PID_WEB)
 
 stop-ssh:
 	@if [ -f $(PID_SSH) ] && kill -0 $$(cat $(PID_SSH)) 2>/dev/null; then \
-		kill $$(cat $(PID_SSH)) && echo "已停止 termblog-ssh (pid $$(cat $(PID_SSH)))"; \
+		kill $$(cat $(PID_SSH)) && echo "stopped termblog-ssh (pid $$(cat $(PID_SSH)))"; \
 	else \
-		echo "termblog-ssh 未在运行"; \
+		echo "termblog-ssh is not running"; \
 	fi; \
 	rm -f $(PID_SSH)
 
@@ -124,16 +124,16 @@ restart-ssh: stop-ssh start-ssh
 
 status:
 	@if [ -f $(PID_WEB) ] && kill -0 $$(cat $(PID_WEB)) 2>/dev/null; then \
-		echo "termblog-web 运行中 (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
+		echo "termblog-web running (pid $$(cat $(PID_WEB)))  $(URL_WEB)"; \
 	else \
-		echo "termblog-web 未在运行"; \
+		echo "termblog-web is not running"; \
 	fi
 
 status-ssh:
 	@if [ -f $(PID_SSH) ] && kill -0 $$(cat $(PID_SSH)) 2>/dev/null; then \
-		echo "termblog-ssh 运行中 (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
+		echo "termblog-ssh running (pid $$(cat $(PID_SSH)))  $(URL_SSH)"; \
 	else \
-		echo "termblog-ssh 未在运行"; \
+		echo "termblog-ssh is not running"; \
 	fi
 
 logs:

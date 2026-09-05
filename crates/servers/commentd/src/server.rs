@@ -32,7 +32,7 @@ pub async fn run(cfg: CommentsConfig) -> Result<()> {
         .with_context(|| format!("bind {}", cfg.private_socket.display()))?;
     set_socket_mode(&cfg.public_socket, 0o660, "www")?;
     set_socket_mode(&cfg.private_socket, 0o600, "wheel")?;
-    info!(public = %cfg.public_socket.display(), private = %cfg.private_socket.display(), "commentd 已就绪");
+    info!(public = %cfg.public_socket.display(), private = %cfg.private_socket.display(), "commentd ready");
 
     let public_store = store.clone();
     let public_loop = async move {
@@ -42,7 +42,7 @@ pub async fn run(cfg: CommentsConfig) -> Result<()> {
                     let store = public_store.clone();
                     tokio::spawn(async move { handle(link, Side::Public, store).await });
                 }
-                Err(e) => error!(%e, "public accept 失败"),
+                Err(e) => error!(%e, "public accept failed"),
             }
         }
     };
@@ -53,7 +53,7 @@ pub async fn run(cfg: CommentsConfig) -> Result<()> {
                     let store = store.clone();
                     tokio::spawn(async move { handle(link, Side::Private, store).await });
                 }
-                Err(e) => error!(%e, "private accept 失败"),
+                Err(e) => error!(%e, "private accept failed"),
             }
         }
     };
@@ -65,7 +65,7 @@ async fn handle(link: Link, side: Side, store: Arc<Mutex<Store>>) {
     let frame = match link.recv().await {
         Ok(f) => f,
         Err(e) => {
-            warn!(%e, "commentd 收帧失败");
+            warn!(%e, "commentd receive frame failed");
             return;
         }
     };
@@ -75,12 +75,12 @@ async fn handle(link: Link, side: Side, store: Arc<Mutex<Store>>) {
             Ok(req) => serde_json::to_value(store.lock().unwrap().public_query(req)),
             Err(e) => serde_json::to_value(ErrorResponse {
                 ok: false,
-                error: format!("请求 JSON 非法: {e}"),
+                error: format!("invalid request JSON: {e}"),
             }),
         },
         Side::Public => serde_json::to_value(ErrorResponse {
             ok: false,
-            error: "public socket 只允许 approved query".into(),
+            error: "public socket only allows approved query".into(),
         }),
         Side::Private => match kind {
             PRIVATE_SUBMIT => match frame.parse::<SubmitRequest>() {
@@ -89,14 +89,14 @@ async fn handle(link: Link, side: Side, store: Arc<Mutex<Store>>) {
                         SubmitResponse {
                             ok: false,
                             id: None,
-                            notice: "评论服务持久化失败".into(),
+                            notice: "Comment service persistence failed".into(),
                             error: Some(e.to_string()),
                         }
                     }))
                 }
                 Err(e) => serde_json::to_value(ErrorResponse {
                     ok: false,
-                    error: format!("请求 JSON 非法: {e}"),
+                    error: format!("invalid request JSON: {e}"),
                 }),
             },
             PRIVATE_SYNC | PRIVATE_QUEUE => match frame.parse::<PageRequest>() {
@@ -105,7 +105,7 @@ async fn handle(link: Link, side: Side, store: Arc<Mutex<Store>>) {
                 }
                 Err(e) => serde_json::to_value(ErrorResponse {
                     ok: false,
-                    error: format!("请求 JSON 非法: {e}"),
+                    error: format!("invalid request JSON: {e}"),
                 }),
             },
             PRIVATE_APPROVE | PRIVATE_REJECT => match frame.parse::<ModerateRequest>() {
@@ -122,12 +122,12 @@ async fn handle(link: Link, side: Side, store: Arc<Mutex<Store>>) {
                 ),
                 Err(e) => serde_json::to_value(ErrorResponse {
                     ok: false,
-                    error: format!("请求 JSON 非法: {e}"),
+                    error: format!("invalid request JSON: {e}"),
                 }),
             },
             _ => serde_json::to_value(ErrorResponse {
                 ok: false,
-                error: "private socket kind 非法".into(),
+                error: "invalid private socket kind".into(),
             }),
         },
     };
@@ -135,7 +135,7 @@ async fn handle(link: Link, side: Side, store: Arc<Mutex<Store>>) {
         response.unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e.to_string()}));
     let _ = link.send(&Frame::json(kind, &value)).await;
     if store.lock().unwrap().is_poisoned() {
-        error!("目录 fsync 失败，commentd fail-stop");
+        error!("directory fsync failed, commentd fail-stop");
         std::process::exit(1);
     }
     // 一连接一请求：发送一帧后直接 drop link。
@@ -144,9 +144,9 @@ async fn handle(link: Link, side: Side, store: Arc<Mutex<Store>>) {
 fn prepare_socket(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(md) if md.file_type().is_socket() => {
-            std::fs::remove_file(path).with_context(|| format!("删除旧 socket {}", path.display()))
+            std::fs::remove_file(path).with_context(|| format!("remove old socket {}", path.display()))
         }
-        Ok(_) => bail!("{} 已存在且不是 socket，拒绝覆盖", path.display()),
+        Ok(_) => bail!("{} exists and is not a socket, refusing to overwrite", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -156,8 +156,8 @@ fn set_socket_mode(path: &Path, mode: u32, group: &str) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     match Group::from_name(group) {
         Ok(Some(g)) => chown(path, None, Some(g.gid.as_raw()))?,
-        Ok(None) => warn!(group, "系统组不存在，socket 保持当前属组"),
-        Err(e) => warn!(%e, group, "查询系统组失败"),
+        Ok(None) => warn!(group, "system group does not exist, keeping current socket group"),
+        Err(e) => warn!(%e, group, "failed to query system group"),
     }
     Ok(())
 }

@@ -106,7 +106,7 @@ let prevEnd = 0;
 for (const img of manifest.images) {
   const top = renderedLines[img.block_start] ?? "";
   const bottom = renderedLines[img.block_end - 1] ?? "";
-  check(top.startsWith("┌─ 图片"), `block_start=${img.block_start} 行以 ┌ 开头`, top);
+  check(top.startsWith("┌─ image"), `block_start=${img.block_start} 行以 ┌ 开头`, top);
   check(bottom.startsWith("└"), `block_end-1=${img.block_end - 1} 行以 └ 开头`, bottom);
   check(img.block_start >= prevEnd, `区间递增不重叠(${img.block_start} >= ${prevEnd})`);
   prevEnd = img.block_end;

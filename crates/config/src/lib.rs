@@ -28,8 +28,8 @@ impl Config {
         };
         let cfg = if p.exists() {
             let s =
-                std::fs::read_to_string(&p).with_context(|| format!("读配置 {}", p.display()))?;
-            toml::from_str(&s).with_context(|| format!("解析配置 {}", p.display()))
+                std::fs::read_to_string(&p).with_context(|| format!("read config {}", p.display()))?;
+            toml::from_str(&s).with_context(|| format!("parse config {}", p.display()))
         } else {
             Ok(Config::default())
         }?;
@@ -44,16 +44,16 @@ impl Config {
             || !c.data_dir.is_absolute()
             || !c.targets_file.is_absolute()
         {
-            anyhow::bail!("comments 的 socket、data_dir 与 targets_file 必须是绝对路径");
+            anyhow::bail!("comments socket, data_dir, and targets_file must be absolute paths");
         }
         if c.public_socket == c.private_socket {
-            anyhow::bail!("comments public/private socket 不能相同");
+            anyhow::bail!("comments public and private sockets cannot be identical");
         }
         if c.public_socket == self.jail.socket || c.private_socket == self.jail.socket {
-            anyhow::bail!("comments socket 不能与 jail socket 相同");
+            anyhow::bail!("comments socket cannot be identical to jail socket");
         }
         if c.session_drain_ms == 0 {
-            anyhow::bail!("comments drain 超时必须大于 0");
+            anyhow::bail!("comments drain timeout must be greater than 0");
         }
         Ok(())
     }

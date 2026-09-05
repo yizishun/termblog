@@ -31,13 +31,13 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 REPO=$(dirname "$SCRIPT_DIR")
 BUILD_USER=yzs
 
-[ "$(id -u)" -eq 0 ] || { echo "需要 root (zfs/mount/pw)"; exit 1; }
-command -v zfs >/dev/null || { echo "需要 ZFS"; exit 1; }
+[ "$(id -u)" -eq 0 ] || { echo "root required (zfs/mount/pw)"; exit 1; }
+command -v zfs >/dev/null || { echo "ZFS required"; exit 1; }
 
 # 0. 自包含前置(以 yzs 编译, 不依赖 Makefile): 模板要装的 jailbin 与内容
 #    产物(.rendered)必须存在; content-build 还要读 frontend/dist 的入口资产。
 #    cargo/npm 增量构建, 输入已新时近乎秒回。
-echo ">> 准备构建输入(以 $BUILD_USER: content-build + jailbin + 内容产物)"
+echo ">> Preparing build inputs (as $BUILD_USER: content-build + jailbin + content artifacts)"
 su -l "$BUILD_USER" -c "set -e; cd $REPO; \
     cargo build --release -p content-build -p termblog-jailbin; \
     ( cd frontend; [ -d node_modules ] || npm install; npm run build ); \
@@ -50,7 +50,7 @@ if [ "$REPLACE" -eq 1 ]; then
     BUILD_MOUNT="$MOUNT.new"
 else
     if zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
-        echo "模板数据集已存在: $DATASET (先 zfs destroy -r $DATASET 或加 --replace)"; exit 1
+        echo "template dataset already exists: $DATASET (zfs destroy -r $DATASET first or add --replace)"; exit 1
     fi
     BUILD_DS="$DATASET"
     BUILD_MOUNT="$MOUNT"
@@ -60,10 +60,10 @@ zfs create -o mountpoint="$BUILD_MOUNT" "$BUILD_DS"
 
 # 2. base.txz(FreeBSD base 全量; /boot 对 jail 无用, 解完删掉)
 if [ ! -f /tmp/termblog-base.txz ]; then
-    echo ">> 下载 base.txz: $BASE_TXZ_URL"
+    echo ">> Downloading base.txz: $BASE_TXZ_URL"
     fetch -o /tmp/termblog-base.txz "$BASE_TXZ_URL"
 fi
-echo ">> 解压 base.txz -> $BUILD_MOUNT"
+echo ">> Extracting base.txz -> $BUILD_MOUNT"
 tar -xf /tmp/termblog-base.txz -C "$BUILD_MOUNT"
 rm -rf "$BUILD_MOUNT/boot"
 
@@ -74,7 +74,7 @@ mount -t devfs devfs "$BUILD_MOUNT/dev"
 cp /etc/resolv.conf "$BUILD_MOUNT/etc/resolv.conf"
 
 # 5. pkg + 软件(zsh 是登录 shell; less/tree 是访客常用工具; less 供 blog 分页)
-echo ">> 安装 zsh 与常用工具"
+echo ">> Installing zsh and common tools"
 pkg -c "$BUILD_MOUNT" bootstrap -y
 pkg -c "$BUILD_MOUNT" install -y zsh less tree
 
@@ -102,17 +102,17 @@ TRAPURG() {
     [[ -o zle ]] && zle -I
     return 0
 }
-echo '帮助: blog ~/help.md    博客: blog 看列表, blog <article-key> 读文章'
-echo '录像: play 看列表, play <cast-key> 播放 (空格暂停, q 退出)'
+echo 'Help: blog ~/help.md    Blog: blog for list, blog <article-key> to read'
+echo 'Casts: play for list, play <cast-key> to watch (space to pause, q to quit)'
 EOF
 
 # 8. content 是 guest HOME 的唯一蓝图。复制全部非隐藏路径，系统生成的
 #    .rendered 与 .rendered-assets 再按白名单单独安装。
 CONTENT="$REPO/jailtpl/content"
 HOME_DIR="$BUILD_MOUNT/home/$GUEST"
-[ -d "$CONTENT" ] && [ ! -L "$CONTENT" ] || { echo "content 根必须是真实目录: $CONTENT"; exit 1; }
+[ -d "$CONTENT" ] && [ ! -L "$CONTENT" ] || { echo "content root must be a real directory: $CONTENT"; exit 1; }
 bad_link=$(find "$CONTENT" -type l -print -quit)
-[ -z "$bad_link" ] || { echo "content 不支持符号链接: $bad_link"; exit 1; }
+[ -z "$bad_link" ] || { echo "content does not support symlinks: $bad_link"; exit 1; }
 mkdir -p "$HOME_DIR/.rendered" "$HOME_DIR/.rendered-assets"
 (
     cd "$CONTENT"
@@ -129,26 +129,26 @@ chown -R 1001:1001 "$BUILD_MOUNT/home/$GUEST"
 
 # 评论设备：只按 content-build 从 .termblog.toml 生成的可信清单创建。
 TARGETS="$REPO/jailtpl/content/.comment-targets.tsv"
-[ -f "$TARGETS" ] || { echo "缺少评论 target 清单: $TARGETS"; exit 1; }
+[ -f "$TARGETS" ] || { echo "missing comment targets manifest: $TARGETS"; exit 1; }
 install -d -m 755 "$BUILD_MOUNT/usr/local/share/termblog"
 install -m 444 "$TARGETS" "$BUILD_MOUNT/usr/local/share/termblog/comment-targets.tsv"
 while IFS="$(printf '\t')" read -r rel target; do
-    [ -n "$rel" ] && [ -n "$target" ] || { echo "非法空 target 行"; exit 1; }
+    [ -n "$rel" ] && [ -n "$target" ] || { echo "invalid empty target line"; exit 1; }
     case "$rel" in
-        /*|*//*|.|..|../*|*/../*|*/..) echo "非法评论设备路径: $rel"; exit 1 ;;
+        /*|*//*|.|..|../*|*/../*|*/..) echo "invalid comment device path: $rel"; exit 1 ;;
     esac
     case "$rel" in
         comment) expected="/" ;;
         */comment)
             dir=${rel%/comment}
-            case "$dir" in ""|/*|*/|*//*|*[!a-z0-9/-]*) echo "非法评论目录: $dir"; exit 1 ;; esac
+            case "$dir" in ""|/*|*/|*//*|*[!a-z0-9/-]*) echo "invalid comment directory: $dir"; exit 1 ;; esac
             expected="/$dir/"
             ;;
-        *) echo "非法评论设备路径: $rel"; exit 1 ;;
+        *) echo "invalid comment device path: $rel"; exit 1 ;;
     esac
-    [ "$target" = "$expected" ] || { echo "评论 target 不匹配: $rel -> $target"; exit 1; }
+    [ "$target" = "$expected" ] || { echo "comment target mismatch: $rel -> $target"; exit 1; }
     fifo="$BUILD_MOUNT/home/$GUEST/$rel"
-    [ ! -e "$fifo" ] || { echo "评论设备路径已存在: $fifo"; exit 1; }
+    [ ! -e "$fifo" ] || { echo "comment device path already exists: $fifo"; exit 1; }
     parent=$(dirname "$fifo")
     install -d -m 755 -o 1001 -g 1001 "$parent"
     mkfifo -m 600 "$fifo"
@@ -159,7 +159,7 @@ done < "$TARGETS"
 install -d -m 755 "$BUILD_MOUNT/var/run/termblog"
 
 # 9. jailbin 命令(0555, 只读): blog / play / webctl 是指向 jailbin 的符号链接(busybox 式)
-echo ">> 安装 jailbin 命令(blog / play / webctl → jailbin)"
+echo ">> Installing jailbin commands (blog / play / webctl → jailbin)"
 install -m 555 "$REPO/target/release/jailbin" "$BUILD_MOUNT/usr/local/bin/jailbin"
 ln -s jailbin "$BUILD_MOUNT/usr/local/bin/blog"
 ln -s jailbin "$BUILD_MOUNT/usr/local/bin/play"
@@ -191,7 +191,7 @@ if [ "$REPLACE" -eq 1 ]; then
     for old in $(zfs list -H -o name -r zroot/jails 2>/dev/null | grep -E '^zroot/jails/template\.old(-[0-9]+)?$' || true); do
         zfs destroy -r "$old" 2>/dev/null || true
     done
-    echo "完成: $DATASET@release 已零停机换新(旧会话继续用旧模板, 全部退出后回收 template.old*)"
+    echo "Done: $DATASET@release replaced with zero downtime (old sessions continue using old template; template.old* reclaimed after all exit)"
 else
-    echo "完成: $DATASET@release (只读模板, jaild 可 clone)"
+    echo "Done: $DATASET@release (read-only template, jaild can clone)"
 fi

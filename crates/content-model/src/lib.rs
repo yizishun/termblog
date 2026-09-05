@@ -42,17 +42,17 @@ pub struct ArticlePath {
 
 impl ArticlePath {
     pub fn from_source_rel(path: &Path) -> Result<Self, PathModelError> {
-        let source = path.to_str().ok_or_else(|| err("文章路径不是 UTF-8"))?;
+        let source = path.to_str().ok_or_else(|| err("article path is not UTF-8"))?;
         Self::parse(source)
     }
 
     pub fn parse(source: &str) -> Result<Self, PathModelError> {
-        validate_relative(source, false, validate_article_source_segment, "文章路径")?;
+        validate_relative(source, false, validate_article_source_segment, "article path")?;
         let key = source
             .strip_suffix(".md")
-            .ok_or_else(|| err("文章扩展名必须精确为小写 .md"))?;
+            .ok_or_else(|| err("article extension must be exactly lowercase .md"))?;
         if key.is_empty() || key.ends_with('/') {
-            return Err(err("文章文件名为空"));
+            return Err(err("article file name is empty"));
         }
         for segment in key.split('/') {
             validate_article_segment(segment)?;
@@ -78,7 +78,7 @@ pub struct CommentAttachment {
 impl CommentAttachment {
     pub fn from_directory_rel(directory: &str) -> Result<Self, PathModelError> {
         if !directory.is_empty() {
-            validate_relative(directory, false, validate_article_segment, "评论目录")?;
+            validate_relative(directory, false, validate_article_segment, "comment directory")?;
         }
         let target = if directory.is_empty() {
             "/".to_owned()
@@ -119,7 +119,7 @@ pub struct ArticleIndexEntry {
 impl ArticleIndex {
     pub fn validate(&self) -> Result<(), PathModelError> {
         if self.version != 1 {
-            return Err(err(format!("不支持的文章索引版本: {}", self.version)));
+            return Err(err(format!("unsupported article index version: {}", self.version)));
         }
         let mut sources = BTreeSet::new();
         let mut keys = BTreeSet::new();
@@ -128,7 +128,7 @@ impl ArticleIndex {
             let path = ArticlePath::parse(&entry.source_rel)?;
             if path.key != entry.key || path.route != entry.route {
                 return Err(err(format!(
-                    "文章索引映射不一致: {} 应为 key={} route={}",
+                    "article index mapping inconsistent: {} expected key={} route={}",
                     entry.source_rel, path.key, path.route
                 )));
             }
@@ -141,16 +141,16 @@ impl ArticleIndex {
                     }
                 })
             {
-                return Err(err(format!("文章索引日期不合法: {}", entry.date10)));
+                return Err(err(format!("article index date invalid: {}", entry.date10)));
             }
             if entry.title.chars().any(char::is_control) {
-                return Err(err(format!("文章索引标题含控制字符: {}", entry.source_rel)));
+                return Err(err(format!("article index title contains control characters: {}", entry.source_rel)));
             }
             if !sources.insert(&entry.source_rel)
                 || !keys.insert(&entry.key)
                 || !routes.insert(&entry.route)
             {
-                return Err(err(format!("文章索引含重复映射: {}", entry.source_rel)));
+                return Err(err(format!("article index contains duplicate mapping: {}", entry.source_rel)));
             }
         }
         Ok(())
@@ -168,18 +168,18 @@ pub fn validate_target(target: &str) -> Result<(), PathModelError> {
         return Ok(());
     }
     if target.len() > MAX_TARGET_LEN {
-        return Err(err("评论 target 过长"));
+        return Err(err("comment target too long"));
     }
     let inner = target
         .strip_prefix('/')
         .and_then(|s| s.strip_suffix('/'))
-        .ok_or_else(|| err("评论 target 必须以 / 开头并以 / 结尾"))?;
-    validate_relative(inner, false, validate_article_segment, "评论 target")
+        .ok_or_else(|| err("comment target must start and end with /"))?;
+    validate_relative(inner, false, validate_article_segment, "comment target")
 }
 
 /// Validate a visible HOME-relative resource path.
 pub fn validate_resource_rel(path: &str) -> Result<(), PathModelError> {
-    validate_relative(path, false, validate_resource_segment, "资源路径")
+    validate_relative(path, false, validate_resource_segment, "resource path")
 }
 
 fn validate_relative(
@@ -192,24 +192,24 @@ fn validate_relative(
         return if allow_empty {
             Ok(())
         } else {
-            Err(err(format!("{kind}为空")))
+            Err(err(format!("{kind} is empty")))
         };
     }
     if path.starts_with('/') || path.ends_with('/') {
-        return Err(err(format!("{kind}必须是无首尾斜杠的相对路径")));
+        return Err(err(format!("{kind} must be a relative path without leading or trailing slashes")));
     }
     if path.contains('\\') {
-        return Err(err(format!("{kind}不能含反斜杠")));
+        return Err(err(format!("{kind} must not contain backslashes")));
     }
     for segment in path.split('/') {
         if segment.is_empty() {
-            return Err(err(format!("{kind}含空组件")));
+            return Err(err(format!("{kind} contains empty segment")));
         }
         if matches!(segment, "." | "..") {
-            return Err(err(format!("{kind}不能含 {segment} 组件")));
+            return Err(err(format!("{kind} must not contain {segment} segment")));
         }
         if segment.starts_with('.') {
-            return Err(err(format!("{kind}不能含隐藏组件 {segment}")));
+            return Err(err(format!("{kind} must not contain hidden segment {segment}")));
         }
         segment_validator(segment)?;
     }
@@ -226,13 +226,13 @@ fn validate_article_source_segment(segment: &str) -> Result<(), PathModelError> 
 
 fn validate_article_segment(segment: &str) -> Result<(), PathModelError> {
     if segment.is_empty() {
-        return Err(err("路径组件为空"));
+        return Err(err("path segment is empty"));
     }
     if let Some(ch) = segment
         .chars()
         .find(|ch| !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || *ch == '-'))
     {
-        return Err(err(format!("含非法字符 '{ch}'（仅允许 [a-z0-9-]）")));
+        return Err(err(format!("invalid character '{ch}' (only [a-z0-9-] allowed)")));
     }
     Ok(())
 }
@@ -241,7 +241,7 @@ fn validate_resource_segment(segment: &str) -> Result<(), PathModelError> {
     if let Some(ch) = segment.chars().find(|ch| {
         !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
     }) {
-        return Err(err(format!("含非法字符 '{ch}'（仅允许 [a-z0-9._-]）")));
+        return Err(err(format!("invalid character '{ch}' (only [a-z0-9._-] allowed)")));
     }
     Ok(())
 }

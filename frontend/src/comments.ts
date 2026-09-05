@@ -19,8 +19,8 @@ type CommentsResponse = {
 };
 
 function emptyHint(target: string, fifo: string): string {
-  const noun = target === "/" ? "留言" : "评论";
-  return `暂无${noun} —— echo 'alice: 好文' > ${fifo} 写第一条`;
+  const noun = target === "/" ? "messages" : "comments";
+  return `No ${noun} yet — write the first one with: echo 'alice: Great post' > ${fifo}`;
 }
 
 function renderComment(item: CommentItem): HTMLLIElement {
@@ -67,7 +67,7 @@ async function loadSection(section: HTMLElement): Promise<void> {
   const status = section.querySelector<HTMLElement>(".comments-status");
   const list = section.querySelector<HTMLOListElement>(".comment-list");
   if (!target || !fifo || !status || !list) return;
-  status.textContent = "正在加载…";
+  status.textContent = "Loading…";
   list.replaceChildren();
   try {
     const query = new URLSearchParams({ target, limit: "100" });
@@ -83,12 +83,12 @@ async function loadSection(section: HTMLElement): Promise<void> {
       status.textContent = emptyHint(target, fifo);
       return;
     }
-    status.textContent = data.omitted_earlier > 0 ? `还有 ${data.omitted_earlier} 条更早评论` : "";
+    status.textContent = data.omitted_earlier > 0 ? `${data.omitted_earlier} earlier comments omitted` : "";
     for (const item of data.comments) {
       list.append(renderComment(item));
     }
   } catch {
-    status.textContent = "评论暂不可用";
+    status.textContent = "Comments temporarily unavailable";
   }
 }
 

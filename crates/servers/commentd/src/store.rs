@@ -71,28 +71,28 @@ impl Store {
         match std::fs::symlink_metadata(dir) {
             Ok(md) => {
                 if !md.file_type().is_dir() || md.file_type().is_symlink() {
-                    bail!("数据目录必须是真实目录");
+                    bail!("data directory must be a real directory");
                 }
                 if md.uid() != 0 || md.gid() != 0 {
-                    bail!("数据目录必须是 root:wheel");
+                    bail!("data directory must be root:wheel");
                 }
                 if std::fs::read_dir(dir)?.next().is_some() {
-                    bail!("数据目录 {} 非空，拒绝初始化", dir.display());
+                    bail!("data directory {} is not empty, refusing to initialize", dir.display());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(dir).with_context(|| format!("创建 {}", dir.display()))?;
+                std::fs::create_dir(dir).with_context(|| format!("create {}", dir.display()))?;
             }
-            Err(e) => return Err(e).with_context(|| format!("读取 {}", dir.display())),
+            Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
         }
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         validate_dir(dir)?;
 
         let mut salt = [0u8; SALT_LEN];
         File::open("/dev/urandom")
-            .context("打开 /dev/urandom")?
+            .context("open /dev/urandom")?
             .read_exact(&mut salt)
-            .context("读取随机 salt")?;
+            .context("read random salt")?;
         create_synced(dir, SALT_FILE, &salt)?;
         create_synced(dir, DATA_FILE, b"")?;
         // marker 最后写：缺 marker 的半初始化目录永远不会被当成空库启动。
@@ -103,29 +103,29 @@ impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
         validate_dir(dir)?;
         for name in [SALT_FILE, DATA_FILE, MARKER_FILE] {
-            validate_file(&dir.join(name)).with_context(|| format!("校验 {name}"))?;
+            validate_file(&dir.join(name)).with_context(|| format!("validate {name}"))?;
         }
         let marker = std::fs::read(dir.join(MARKER_FILE))?;
         if marker != MARKER {
-            bail!("initialized 标记非法");
+            bail!("invalid initialized marker");
         }
         let salt_vec = std::fs::read(dir.join(SALT_FILE))?;
         let salt: [u8; SALT_LEN] = salt_vec
             .try_into()
-            .map_err(|_| anyhow!("salt 必须恰为 {SALT_LEN} 字节"))?;
+            .map_err(|_| anyhow!("salt must be exactly {SALT_LEN} bytes"))?;
         let raw = std::fs::read(dir.join(DATA_FILE))?;
-        let text = std::str::from_utf8(&raw).context("comments.jsonl 不是 UTF-8")?;
+        let text = std::str::from_utf8(&raw).context("comments.jsonl is not UTF-8")?;
         let mut comments = Vec::new();
         let mut last_id = 0;
         for (idx, line) in text.lines().enumerate() {
             if line.is_empty() {
-                bail!("comments.jsonl 第 {} 行为空", idx + 1);
+                bail!("comments.jsonl line {} is empty", idx + 1);
             }
             let c: StoredComment = serde_json::from_str(line)
-                .with_context(|| format!("comments.jsonl 第 {} 行 JSON 非法", idx + 1))?;
-            validate_stored(&c).with_context(|| format!("comments.jsonl 第 {} 行", idx + 1))?;
+                .with_context(|| format!("comments.jsonl line {} invalid JSON", idx + 1))?;
+            validate_stored(&c).with_context(|| format!("comments.jsonl line {}", idx + 1))?;
             if c.id <= last_id {
-                bail!("comments.jsonl 第 {} 行 ID 未严格递增", idx + 1);
+                bail!("comments.jsonl line {} ID not strictly increasing", idx + 1);
             }
             last_id = c.id;
             comments.push(c);
@@ -147,26 +147,26 @@ impl Store {
 
     pub fn submit(&mut self, req: SubmitRequest) -> Result<SubmitResponse> {
         if self.poisoned {
-            bail!("存储已进入 fail-stop 状态");
+            bail!("storage has entered fail-stop state");
         }
         let reject = |msg: &str| SubmitResponse {
             ok: false,
             id: None,
-            notice: format!("评论未提交：{msg}"),
+            notice: format!("Comment not submitted: {msg}"),
             error: Some(msg.to_string()),
         };
         if !valid_target(&req.target) {
-            return Ok(reject("target 非法"));
+            return Ok(reject("invalid target"));
         }
         if req.line.len() > 512 {
-            return Ok(reject("单行超过 512 字节"));
+            return Ok(reject("line exceeds 512 bytes"));
         }
         if req.ip.parse::<std::net::IpAddr>().is_err() {
-            return Ok(reject("IP 非法"));
+            return Ok(reject("invalid IP"));
         }
         let parsed = match normalize_line(&req.line) {
             Ok(Some(parsed)) => parsed,
-            Ok(None) => return Ok(reject("清洗后正文为空")),
+            Ok(None) => return Ok(reject("cleaned body is empty")),
             Err(message) => return Ok(reject(message)),
         };
         let ParsedLine {
@@ -175,15 +175,15 @@ impl Store {
             reply_number,
         } = parsed;
         if author.len() > 32 {
-            return Ok(reject("名字超过 32 字节"));
+            return Ok(reject("author name exceeds 32 bytes"));
         }
         if text.len() > 512 {
-            return Ok(reject("正文超过 512 字节"));
+            return Ok(reject("body exceeds 512 bytes"));
         }
         let reply_to_id = match reply_number {
             Some(number) => match resolve_reply_id(&self.comments, &req.target, number) {
                 Some(id) => Some(id),
-                None => return Ok(reject(&format!("当前目录不存在已公开评论 #{number}"))),
+                None => return Ok(reject(&format!("public comment #{number} does not exist in target"))),
             },
             None => None,
         };
@@ -207,7 +207,7 @@ impl Store {
             .count()
             >= 10
         {
-            return Ok(reject("同一来源每小时最多 10 条"));
+            return Ok(reject("rate limit exceeded: max 10 comments per hour from same source"));
         }
         if self.comments.iter().any(|c| {
             c.ip_hash == ip_hash
@@ -216,14 +216,14 @@ impl Store {
                 && c.reply_to_id == reply_to_id
                 && recent(c, 300)
         }) {
-            return Ok(reject("5 分钟内请勿重复提交相同内容"));
+            return Ok(reject("duplicate content within 5 minutes"));
         }
 
         let id = self
             .comments
             .last()
             .map_or(Some(1), |c| c.id.checked_add(1))
-            .ok_or_else(|| anyhow!("评论 ID 已耗尽"))?;
+            .ok_or_else(|| anyhow!("comment IDs exhausted"))?;
         let mut candidate = self.comments.clone();
         candidate.push(StoredComment {
             id,
@@ -239,7 +239,7 @@ impl Store {
         Ok(SubmitResponse {
             ok: true,
             id: Some(id),
-            notice: "评论已投入待审队列".into(),
+            notice: "Comment submitted to moderation queue".into(),
             error: None,
         })
     }
@@ -256,14 +256,14 @@ impl Store {
             error: Some(message),
         };
         if !valid_target(&req.target) {
-            return err("target 非法".into());
+            return err("invalid target".into());
         }
         let limit = match page_limit(req.limit) {
             Ok(n) => n,
             Err(e) => return err(e.into()),
         };
         if req.after_number.unwrap_or(0) > 0 && req.revision.is_none() {
-            return err("after_number>0 时 revision 必填".into());
+            return err("revision is required when after_number>0".into());
         }
         if let Some(r) = &req.revision {
             if r != &self.revision {
@@ -278,7 +278,7 @@ impl Store {
             .collect();
         let all = match visible_comments(&private) {
             Ok(comments) => comments,
-            Err(_) => return err("评论数据不可用".into()),
+            Err(_) => return err("comment data unavailable".into()),
         };
         let total = all.len();
         if req.after_number.is_none() {
@@ -327,7 +327,7 @@ impl Store {
             Err(e) => return err(e.into()),
         };
         if req.after_id > 0 && req.revision.is_none() {
-            return err("after_id>0 时 revision 必填".into());
+            return err("revision is required when after_id>0".into());
         }
         if let Some(r) = &req.revision {
             if r != &self.revision {
@@ -359,13 +359,13 @@ impl Store {
 
     pub fn moderate(&mut self, ids: &[u64], approve: bool) -> Result<ModerateResponse> {
         if self.poisoned {
-            bail!("存储已进入 fail-stop 状态");
+            bail!("storage has entered fail-stop state");
         }
         if ids.is_empty() {
             return Ok(ModerateResponse {
                 ok: false,
                 changed: 0,
-                error: Some("ids 不能为空".into()),
+                error: Some("ids cannot be empty".into()),
             });
         }
         let ids: HashSet<u64> = ids.iter().copied().collect();
@@ -408,7 +408,7 @@ impl Store {
             match opts.open(&temp) {
                 Ok(f) => break (temp, f),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e).with_context(|| format!("创建 {}", temp.display())),
+                Err(e) => return Err(e).with_context(|| format!("create {}", temp.display())),
             }
         };
         let pre_rename = (|| -> Result<()> {
@@ -424,7 +424,7 @@ impl Store {
         // rename 已发生；目录 fsync 失败后不能继续以旧内存提供服务。
         if let Err(e) = File::open(&self.dir).and_then(|f| f.sync_all()) {
             self.poisoned = true;
-            return Err(anyhow!("目录 fsync 失败，进入 fail-stop: {e}"));
+            return Err(anyhow!("directory fsync failed, entering fail-stop: {e}"));
         }
         self.comments = candidate;
         self.revision = new_revision;
@@ -486,13 +486,13 @@ fn reply_prefix(text: &str) -> Result<Option<(u64, &str)>, &'static str> {
     }
     let number = rest[..digit_len]
         .parse::<u64>()
-        .map_err(|_| "回复编号过大")?;
+        .map_err(|_| "reply number too large")?;
     if number == 0 {
-        return Err("回复编号必须大于 0");
+        return Err("reply number must be greater than 0");
     }
     let body = rest[digit_len + 1..].trim();
     if body.is_empty() {
-        return Err("回复正文为空");
+        return Err("reply body is empty");
     }
     Ok(Some((number, body)))
 }
@@ -518,20 +518,20 @@ fn validate_relations(comments: &[StoredComment]) -> Result<()> {
         if let Some(parent_id) = comment.reply_to_id {
             let Some((parent_target, parent_status)) = seen.get(&parent_id) else {
                 bail!(
-                    "comments.jsonl 第 {line} 行：评论 ID {} 的 reply_to_id {} 不存在或不早于它",
+                    "comments.jsonl line {line}: comment ID {} reply_to_id {} does not exist or is not earlier",
                     comment.id,
                     parent_id
                 );
             };
             if *parent_target != comment.target {
                 bail!(
-                    "comments.jsonl 第 {line} 行：评论 ID {} 的回复跨越 target",
+                    "comments.jsonl line {line}: comment ID {} reply crosses target boundary",
                     comment.id
                 );
             }
             if *parent_status != Status::Approved {
                 bail!(
-                    "comments.jsonl 第 {line} 行：评论 ID {} 回复的父评论未公开",
+                    "comments.jsonl line {line}: parent comment of comment ID {} is not approved",
                     comment.id
                 );
             }
@@ -543,21 +543,21 @@ fn validate_relations(comments: &[StoredComment]) -> Result<()> {
 
 fn validate_stored(c: &StoredComment) -> Result<()> {
     if c.id == 0 {
-        bail!("ID 必须大于 0");
+        bail!("ID must be greater than 0");
     }
     if !valid_target(&c.target) {
-        bail!("target 非法");
+        bail!("invalid target");
     }
     if c.author.is_empty() || c.author.len() > 32 || c.text.is_empty() || c.text.len() > 512 {
-        bail!("author/text 长度非法");
+        bail!("invalid author/text length");
     }
     if normalize_controls(&c.author) != c.author || normalize_controls(&c.text) != c.text {
-        bail!("author/text 含控制字符");
+        bail!("author/text contains control characters");
     }
     if c.ip_hash.len() != 64 || !c.ip_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("ip_hash 非法");
+        bail!("invalid ip_hash");
     }
-    DateTime::parse_from_rfc3339(&c.created_at).context("created_at 非 RFC3339")?;
+    DateTime::parse_from_rfc3339(&c.created_at).context("created_at not RFC3339")?;
     Ok(())
 }
 
@@ -589,15 +589,15 @@ fn hash_ip(salt: &[u8; SALT_LEN], ip: &str) -> String {
 
 fn validate_dir(dir: &Path) -> Result<()> {
     let md = std::fs::symlink_metadata(dir)
-        .with_context(|| format!("读取数据目录 {}", dir.display()))?;
+        .with_context(|| format!("read data directory {}", dir.display()))?;
     if !md.file_type().is_dir() || md.file_type().is_symlink() {
-        bail!("数据目录必须是真实目录");
+        bail!("data directory must be a real directory");
     }
     if md.uid() != 0 || md.gid() != 0 {
-        bail!("数据目录 owner 必须是 root");
+        bail!("data directory owner must be root");
     }
     if md.mode() & 0o022 != 0 {
-        bail!("数据目录 group/other 不得可写");
+        bail!("data directory group/other must not be writable");
     }
     Ok(())
 }
@@ -605,10 +605,10 @@ fn validate_dir(dir: &Path) -> Result<()> {
 fn validate_file(path: &Path) -> Result<()> {
     let md = std::fs::symlink_metadata(path)?;
     if !md.file_type().is_file() || md.file_type().is_symlink() {
-        bail!("必须是普通文件且不能是 symlink");
+        bail!("must be a regular file and not a symlink");
     }
     if md.uid() != 0 || md.gid() != 0 || md.mode() & 0o777 != 0o600 {
-        bail!("owner/mode 必须是 root:wheel 0600");
+        bail!("owner/mode must be root:wheel 0600");
     }
     Ok(())
 }
@@ -685,8 +685,8 @@ mod tests {
             }))
         );
         assert_eq!(normalize_line("\u{7f}\n"), Ok(None));
-        assert_eq!(normalize_line("#0: nope"), Err("回复编号必须大于 0"));
-        assert_eq!(normalize_line("#1:"), Err("回复正文为空"));
+        assert_eq!(normalize_line("#0: nope"), Err("reply number must be greater than 0"));
+        assert_eq!(normalize_line("#1:"), Err("reply body is empty"));
         assert_eq!(
             normalize_line("#rust: ordinary"),
             Ok(Some(ParsedLine {
@@ -709,7 +709,7 @@ mod tests {
             })
             .unwrap();
         assert!(r.ok);
-        assert_eq!(r.notice, "评论已投入待审队列");
+        assert_eq!(r.notice, "Comment submitted to moderation queue");
         assert!(td.path().join(DATA_FILE).is_file());
         assert_eq!(
             s.page(

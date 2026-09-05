@@ -22,7 +22,7 @@ pub fn run(args: &[String]) -> i32 {
     let home = match std::env::var_os("HOME") {
         Some(value) => PathBuf::from(value),
         None => {
-            eprintln!("blog: HOME 未设置");
+            eprintln!("blog: HOME not set");
             return 1;
         }
     };
@@ -39,7 +39,7 @@ pub fn run(args: &[String]) -> i32 {
                 return 1;
             }
         } else {
-            println!("暂无文章（模板里没有 .rendered/.index，请重建模板）");
+            println!("No articles found (missing .rendered/.index in template, please rebuild template)");
         }
         return 0;
     }
@@ -48,19 +48,19 @@ pub fn run(args: &[String]) -> i32 {
         &args[1..]
     } else {
         if args.first().is_some_and(|arg| arg.starts_with('-')) {
-            eprintln!("blog: 未知选项 {}（路径以 - 开头时请先写 --）", args[0]);
+            eprintln!("blog: unknown option {} (use -- before paths starting with -)", args[0]);
             return 2;
         }
         args
     };
     if operands.len() != 1 {
-        eprintln!("用法: blog [--] <HOME 相对文章键或文件路径>");
+        eprintln!("Usage: blog [--] <HOME-relative article key or file path>");
         return 2;
     }
 
     let arg = &operands[0];
     let Some(file) = resolve_file(arg, &home) else {
-        eprintln!("blog: 没有这个文件: {arg}（敲 blog 看列表）");
+        eprintln!("blog: no such file: {arg} (run blog for list)");
         return 1;
     };
     let source_rel = home_relative_file(&file, &home);
@@ -72,7 +72,7 @@ pub fn run(args: &[String]) -> i32 {
 
     if article.is_none() {
         if let Err(error) = &index_result {
-            eprintln!("blog: 文章映射不可用（{error}），按普通文件显示");
+            eprintln!("blog: article index unavailable ({error}), showing as plain file");
         }
         return show_file(&file);
     }
@@ -93,7 +93,7 @@ pub fn run(args: &[String]) -> i32 {
         rendered
     } else {
         eprintln!(
-            "blog: 「{}」无预渲染产物，显示原始 markdown（重建模板后即排版）",
+            "blog: \"{}\" has no pre-rendered output, showing raw markdown (rebuild template for formatting)",
             article.key
         );
         file
@@ -127,12 +127,12 @@ fn home_relative_file(file: &Path, home: &Path) -> Option<String> {
 fn load_machine_index(path: &Path) -> Result<HashMap<String, ArticleIndexEntry>, String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     let index: ArticleIndex =
-        serde_json::from_str(&text).map_err(|error| format!("索引 JSON: {error}"))?;
+        serde_json::from_str(&text).map_err(|error| format!("index JSON: {error}"))?;
     index.validate().map_err(|error| error.to_string())?;
     let mut entries = HashMap::new();
     for entry in index.articles {
         if entries.insert(entry.source_rel.clone(), entry).is_some() {
-            return Err("文章索引含重复 source_rel".into());
+            return Err("article index contains duplicate source_rel".into());
         }
     }
     Ok(entries)
@@ -143,26 +143,26 @@ fn parse_attachments(text: &str) -> Result<HashMap<String, CommentAttachment>, S
     for (index, line) in text.lines().enumerate() {
         let (fifo, target) = line
             .split_once('\t')
-            .ok_or_else(|| format!("评论清单第 {} 行缺 Tab", index + 1))?;
+            .ok_or_else(|| format!("comment manifest line {} missing Tab", index + 1))?;
         if target.contains('\t') {
-            return Err(format!("评论清单第 {} 行字段过多", index + 1));
+            return Err(format!("comment manifest line {} has too many fields", index + 1));
         }
         let directory = if fifo == "comment" {
             ""
         } else {
             fifo.strip_suffix("/comment")
-                .ok_or_else(|| format!("评论清单第 {} 行 FIFO 非法", index + 1))?
+                .ok_or_else(|| format!("comment manifest line {} invalid FIFO", index + 1))?
         };
         let attachment = CommentAttachment::from_directory_rel(directory)
-            .map_err(|error| format!("评论清单第 {} 行: {error}", index + 1))?;
+            .map_err(|error| format!("comment manifest line {}: {error}", index + 1))?;
         if attachment.fifo_rel != fifo || attachment.target != target {
-            return Err(format!("评论清单第 {} 行映射不一致", index + 1));
+            return Err(format!("comment manifest line {} mapping inconsistent", index + 1));
         }
         if attachments
             .insert(attachment.directory_rel.clone(), attachment)
             .is_some()
         {
-            return Err(format!("评论清单第 {} 行目录重复", index + 1));
+            return Err(format!("comment manifest line {} duplicate directory", index + 1));
         }
     }
     Ok(attachments)
@@ -182,14 +182,14 @@ fn render_article_comments(article: &ArticleIndexEntry) {
         return;
     };
     let noun = if attachment.target == "/" {
-        "留言"
+        "messages"
     } else {
-        "评论"
+        "comments"
     };
     comments::render(
         &attachment.target,
         &format!(
-            "暂无{noun} —— echo 'alice: 好文' > ~/{} 写第一条",
+            "No {noun} yet — write the first one with: echo 'alice: Great post' > ~/{}",
             attachment.fifo_rel
         ),
     );

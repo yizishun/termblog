@@ -227,11 +227,11 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
         <h1>{{TITLE}}</h1>
         {{BODY_HTML}}
         <footer class="post-meta">
-          {{DATE}}{{#if ssh_hint}} · 终端里也可以读: ssh -p 2222 blog@{{HOST}} 然后敲 blog {{KEY}}{{/if}}
+          {{DATE}}{{#if ssh_hint}} · Also readable in terminal: ssh -p 2222 blog@{{HOST}} then run blog {{KEY}}{{/if}}
         </footer>
         {{#if comments}}<section class="comments" data-comments-target="{{COMMENT_TARGET}}" data-comments-fifo="~/{{COMMENT_FIFO}}">
-          <h2>评论</h2>
-          <p class="comments-status">正在加载…</p>
+          <h2>Comments</h2>
+          <p class="comments-status">Loading…</p>
           <ol class="comment-list"></ol>
         </section>{{/if}}
       </article>
@@ -239,7 +239,7 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
     <!-- 等待层: JS 用户首屏只看到它(不透明盖住静态正文, 正文不闪现);
          收到 blog 命令的 OSC(内容已在画)后淡出, 露出已就绪的终端 -->
     <div id="mirror-cover">
-      <p class="mirror-status">正在接入真实终端…</p>
+      <p class="mirror-status">Connecting to real terminal…</p>
     </div>
     <!-- 终端层: 与首页同构, 等待层不透明地盖在上面; 需保持正常布局
          (不能 display:none, 否则 FitAddon 量不到尺寸) -->
@@ -322,7 +322,7 @@ const LIST_TEMPLATE: &str = r#"<!doctype html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>文章 — {{SITE_TITLE}}</title>
+  <title>Articles — {{SITE_TITLE}}</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="stylesheet" href="/style.css" />
   <link rel="stylesheet" href="{{BLOG_CSS}}" />
@@ -331,11 +331,11 @@ const LIST_TEMPLATE: &str = r#"<!doctype html>
 
 <body>
   <main id="blog-list">
-    <h1>文章</h1>
+    <h1>Articles</h1>
     <ul>
 {{ITEMS}}
     </ul>
-    <p><a href="/">← 回到终端</a></p>
+    <p><a href="/">← Back to terminal</a></p>
   </main>
 </body>
 
@@ -552,7 +552,7 @@ mod tests {
         assert!(page.contains("ssh -p 2222 blog@blog.example.com"));
         // 等待层 + 无 JS 兜底: 正文留在 DOM, cover 由 noscript 对无 JS 隐藏
         assert!(page.contains("id=\"mirror-cover\""));
-        assert!(page.contains("正在接入真实终端…"));
+        assert!(page.contains("Connecting to real terminal…"));
         assert!(page.contains("noscript") && page.contains("#mirror-cover{display:none}"));
         assert!(page.contains("id=\"static-view\"") && page.contains("<article>"));
         assert!(
@@ -602,7 +602,7 @@ mod tests {
             "~yzs",
             "index-abc123.js",
         );
-        assert!(page.contains("<title>文章 — ~yzs</title>"));
+        assert!(page.contains("<title>Articles — ~yzs</title>"));
         assert!(page.contains("<a href=\"/hello/\">你好, 世界</a>"));
         assert!(page.contains("atom.xml"));
         assert!(

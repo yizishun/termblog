@@ -95,7 +95,7 @@ async fn comments_handler(
     let Some(target) = params.target else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "target 必填"})),
+            Json(serde_json::json!({"error": "target is required"})),
         );
     };
     if !valid_target(&target)
@@ -104,7 +104,7 @@ async fn comments_handler(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "查询参数非法"})),
+            Json(serde_json::json!({"error": "invalid query parameters"})),
         );
     }
     match state
@@ -134,11 +134,11 @@ async fn comments_handler(
         ),
         Ok(res) => (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": res.error.unwrap_or_else(|| "查询失败".into())})),
+            Json(serde_json::json!({"error": res.error.unwrap_or_else(|| "query failed".into())})),
         ),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "评论服务暂不可用"})),
+            Json(serde_json::json!({"error": "comments service temporarily unavailable"})),
         ),
     }
 }

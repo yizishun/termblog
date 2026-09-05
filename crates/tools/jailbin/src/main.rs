@@ -25,7 +25,7 @@ fn main() {
         "play" => play::run(&rest),
         "webctl" => webctl::run(&rest),
         _ => {
-            eprintln!("jailbin: 用法: blog [文件] | play [选项] [录像] | webctl url /path");
+            eprintln!("jailbin: Usage: blog [file] | play [options] [cast] | webctl url /path");
             2
         }
     };

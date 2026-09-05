@@ -25,7 +25,7 @@ async fn main() -> ExitCode {
     let cfg = match load_cfg() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("termblog-ssh 配置加载失败: {e:#}");
+            eprintln!("termblog-ssh configuration load failed: {e:#}");
             return ExitCode::FAILURE;
         }
     };
@@ -33,7 +33,7 @@ async fn main() -> ExitCode {
     let listen = match cfg.ssh.listen.parse() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("ssh.listen {} 不是合法的 host:port: {e}", cfg.ssh.listen);
+            eprintln!("ssh.listen {} is not a valid host:port: {e}", cfg.ssh.listen);
             return ExitCode::FAILURE;
         }
     };
@@ -48,7 +48,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // 独立守护进程: 绑不上(如无权限绑 22)就报错退出, 不吞错误
-            eprintln!("termblog-ssh 启动失败({listen}): {e:#}");
+            eprintln!("termblog-ssh startup failed ({listen}): {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -56,7 +56,7 @@ async fn main() -> ExitCode {
 
 fn load_cfg() -> anyhow::Result<Config> {
     let cfg_path = std::env::var("TERMBLOG_CONFIG").ok();
-    let mut cfg = Config::load(cfg_path.as_deref().map(Path::new)).context("加载配置")?;
+    let mut cfg = Config::load(cfg_path.as_deref().map(Path::new)).context("load config")?;
     if let Ok(v) = std::env::var("TERMBLOG_SSH_LISTEN") {
         cfg.ssh.listen = v;
     }

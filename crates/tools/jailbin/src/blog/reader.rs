@@ -110,7 +110,7 @@ fn preflight(
 ) -> Result<Prepared, String> {
     let raw: Vec<String> = text.lines().map(str::to_string).collect();
     if raw.is_empty() {
-        return Err("预渲染文本为空".into());
+        return Err("pre-rendered text is empty".into());
     }
     let n = raw.len();
     let mut prev_end = 0usize;
@@ -118,24 +118,24 @@ fn preflight(
         // 区间合法: 0 ≤ block_start < block_end ≤ 总行数; 相邻区间递增且不重叠
         if !(a.block_start < a.block_end && a.block_end <= n) {
             return Err(format!(
-                "图像区间越界: {}..{}(总行数 {n})",
+                "image block out of bounds: {}..{} (total lines {n})",
                 a.block_start, a.block_end
             ));
         }
         if a.block_start < prev_end {
             return Err(format!(
-                "图像区间重叠/乱序: {} 与上一块末行 {prev_end} 交叉",
+                "image block overlap/unordered: {} overlaps with previous end {prev_end}",
                 a.block_start
             ));
         }
         prev_end = a.block_end;
         // 尺寸合法: w ≥ 1 且 h ≥ 1; indent_cols ≤ display_cols ≤ 76
         if a.w == 0 || a.h == 0 {
-            return Err(format!("图像尺寸为零: {} ({}×{})", a.asset, a.w, a.h));
+            return Err(format!("image dimensions are zero: {} ({}×{})", a.asset, a.w, a.h));
         }
         if a.indent_cols > a.display_cols || a.display_cols > PRE_COLS {
             return Err(format!(
-                "缩进/内容宽非法: {} (indent {} > display {} 或 > {PRE_COLS})",
+                "invalid indent or display width: {} (indent {} > display {} or > {PRE_COLS})",
                 a.asset, a.indent_cols, a.display_cols
             ));
         }
@@ -159,8 +159,8 @@ fn validate_asset(asset: &str, root: &Path) -> Result<(), String> {
     let p = root.join(asset);
     match std::fs::metadata(&p) {
         Ok(m) if m.is_file() && m.len() > 0 => Ok(()),
-        Ok(_) => Err(format!("asset 缺失或为空: {asset}")),
-        Err(_) => Err(format!("asset 不存在: {asset}")),
+        Ok(_) => Err(format!("asset missing or empty: {asset}")),
+        Err(_) => Err(format!("asset does not exist: {asset}")),
     }
 }
 
@@ -428,9 +428,9 @@ fn load_bytes(caches: &mut Caches, assets_dir: &Path, asset: &str) -> Result<Vec
         return Ok(b.clone());
     }
     if caches.failed.contains(asset) {
-        return Err("asset 已判定降级".into());
+        return Err("asset already marked degraded".into());
     }
-    let b = std::fs::read(assets_dir.join(asset)).map_err(|e| format!("读 asset {asset}: {e}"))?;
+    let b = std::fs::read(assets_dir.join(asset)).map_err(|e| format!("read asset {asset}: {e}"))?;
     caches.bytes.insert(asset.to_string(), b.clone());
     Ok(b)
 }
@@ -443,7 +443,7 @@ fn full_payload(
     wpx: u32,
 ) -> Result<String, String> {
     if caches.failed.contains(&a.asset) {
-        return Err("asset 已判定降级".into());
+        return Err("asset already marked degraded".into());
     }
     if let Some(p) = caches.full.get(&(a.asset.clone(), wpx)) {
         return Ok(p.clone());
@@ -453,7 +453,7 @@ fn full_payload(
     let s = iip::encode(&a.asset, &bytes, wpx, hpx);
     if s.len() > MAX_IIP_PAYLOAD {
         return Err(format!(
-            "完整图 payload {} KiB 超 1 MiB 上限",
+            "full image payload {} KiB exceeds 1 MiB limit",
             s.len() / 1024
         ));
     }
@@ -477,7 +477,7 @@ fn scaled_image(
                 None => {
                     let bytes = load_bytes(caches, assets_dir, &a.asset)?;
                     let img = image::load_from_memory(&bytes)
-                        .map_err(|e| format!("解码 {}: {e}", a.asset))?;
+                        .map_err(|e| format!("decode {}: {e}", a.asset))?;
                     caches.decoded.insert(a.asset.clone(), img.clone());
                     img
                 }
@@ -515,7 +515,7 @@ fn slice_payload(
     let hpx = y1 - y0;
     let s = iip::encode(&a.asset, &encoded, wpx, hpx);
     if s.len() > MAX_IIP_PAYLOAD {
-        return Err(format!("切片 payload {} KiB 超 1 MiB 上限", s.len() / 1024));
+        return Err(format!("slice payload {} KiB exceeds 1 MiB limit", s.len() / 1024));
     }
     caches.slices.insert(key, s.clone());
     Ok(s)
@@ -544,7 +544,7 @@ fn row_payload(
     let s = iip::encode_row(&a.asset, &encoded, wcols as u32, y1 - y0, cell_h);
     if s.len() > MAX_IIP_PAYLOAD {
         return Err(format!(
-            "单行切片 payload {} KiB 超 1 MiB 上限",
+            "single row slice payload {} KiB exceeds 1 MiB limit",
             s.len() / 1024
         ));
     }
@@ -567,7 +567,7 @@ fn reencode_slice(img: &image::DynamicImage, asset: &str) -> Result<Vec<u8>, Str
                     rgb.height(),
                     image::ExtendedColorType::Rgb8,
                 )
-                .map_err(|e| format!("jpeg 重编码: {e}"))?;
+                .map_err(|e| format!("jpeg re-encode: {e}"))?;
         }
         _ => {
             let rgba = img.to_rgba8();
@@ -578,7 +578,7 @@ fn reencode_slice(img: &image::DynamicImage, asset: &str) -> Result<Vec<u8>, Str
                     rgba.height(),
                     image::ExtendedColorType::Rgba8,
                 )
-                .map_err(|e| format!("png 重编码: {e}"))?;
+                .map_err(|e| format!("png re-encode: {e}"))?;
         }
     }
     Ok(buf)
@@ -725,7 +725,7 @@ fn place_image(
             top,
         },
         Err(e) => {
-            eprintln!("blog: 图像块 {} 降级: {e}", a.asset);
+            eprintln!("blog: image block {} degraded: {e}", a.asset);
             caches.failed.insert(a.asset.clone());
             Placement::Degraded
         }
@@ -835,7 +835,7 @@ pub fn try_run(home: &Path, rendered: &Path) -> Option<i32> {
     let guard = match TermGuard::enter() {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("blog: 进入 TUI 失败: {e}");
+            eprintln!("blog: failed to enter TUI: {e}");
             return Some(1);
         }
     };
@@ -873,7 +873,7 @@ pub fn try_run(home: &Path, rendered: &Path) -> Option<i32> {
             Some(0)
         }
         Err(e) => {
-            eprintln!("blog: TUI 阅读器错误: {e}");
+            eprintln!("blog: TUI reader error: {e}");
             Some(1)
         }
     }
@@ -888,11 +888,11 @@ fn run_tui(prep: &Prepared) -> Result<Exit, String> {
     let (cell_h, cell_w) = query_cell_size();
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| format!("初始化终端: {e}"))?;
-    terminal.hide_cursor().map_err(|e| format!("藏光标: {e}"))?;
+    let mut terminal = Terminal::new(backend).map_err(|e| format!("initialize terminal: {e}"))?;
+    terminal.hide_cursor().map_err(|e| format!("hide cursor: {e}"))?;
 
     let (mut cols_now, mut rows_now) =
-        crossterm::terminal::size().map_err(|e| format!("读终端尺寸: {e}"))?;
+        crossterm::terminal::size().map_err(|e| format!("read terminal size: {e}"))?;
     rows_now = rows_now.max(1);
     if cols_now < MIN_COLS {
         return Ok(Exit::Handoff { line: 1 });
@@ -914,7 +914,7 @@ fn run_tui(prep: &Prepared) -> Result<Exit, String> {
     )?;
 
     loop {
-        match crossterm::event::read().map_err(|e| format!("读事件: {e}"))? {
+        match crossterm::event::read().map_err(|e| format!("read event: {e}"))? {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 let max_scroll = model.items.len().saturating_sub(rows_now as usize);
                 let new_scroll = match key_action(k.code, k.modifiers) {
@@ -952,7 +952,7 @@ fn run_tui(prep: &Prepared) -> Result<Exit, String> {
                         Err(IncrementalError::Image { asset, reason }) => {
                             // 预编码发生在物理滚屏前, 可安全把该块降级并用
                             // rendered 行锚重建整帧, 不留下半滚动状态。
-                            eprintln!("blog: 图像块 {asset} 增量切片降级: {reason}");
+                            eprintln!("blog: image block {asset} incremental slice degraded: {reason}");
                             caches.failed.insert(asset);
                             let anchor = anchor_line(&model, prep, new_scroll);
                             model = build_model(prep, cols_now, cell_w, cell_h, &mut caches);
@@ -1140,11 +1140,11 @@ fn draw_incremental_scroll(
     caches: &mut Caches,
 ) -> Result<(), IncrementalError> {
     let (direction, model_row, screen_y) = incremental_target(old_scroll, new_scroll, rows)
-        .ok_or_else(|| IncrementalError::Terminal("增量滚动步长不是一行".into()))?;
+        .ok_or_else(|| IncrementalError::Terminal("incremental scroll step is not one row".into()))?;
     let kind = model
         .items
         .get(model_row)
-        .ok_or_else(|| IncrementalError::Terminal(format!("增量滚动模型行越界: {model_row}")))?;
+        .ok_or_else(|| IncrementalError::Terminal(format!("incremental scroll model row out of bounds: {model_row}")))?;
 
     // 图片编码可能失败, 必须在物理滚屏前完成, 才能安全回退整帧降级。
     let exposed = match kind {
@@ -1170,14 +1170,14 @@ fn draw_incremental_scroll(
     };
 
     let mut sync = SyncUpdate::begin()
-        .map_err(|e| IncrementalError::Terminal(format!("开启同步滚动: {e}")))?;
+        .map_err(|e| IncrementalError::Terminal(format!("begin synchronized scroll: {e}")))?;
     {
         let backend = terminal.backend_mut();
         match direction {
             PhysicalScroll::Up => execute!(backend, ScrollUp(1)),
             PhysicalScroll::Down => execute!(backend, ScrollDown(1)),
         }
-        .map_err(|e| IncrementalError::Terminal(format!("滚动终端行: {e}")))?;
+        .map_err(|e| IncrementalError::Terminal(format!("scroll terminal line: {e}")))?;
 
         match &exposed {
             ExposedRow::Cells(buf) => {
@@ -1186,21 +1186,21 @@ fn draw_incremental_scroll(
                 let blank = Buffer::empty(buf.area);
                 backend
                     .draw(blank.diff_iter(buf))
-                    .map_err(|e| IncrementalError::Terminal(format!("绘制增量文本行: {e}")))?;
+                    .map_err(|e| IncrementalError::Terminal(format!("draw incremental text line: {e}")))?;
             }
             ExposedRow::Image { payload, x } => {
                 execute!(backend, MoveTo(*x, screen_y))
-                    .map_err(|e| IncrementalError::Terminal(format!("移动增量图片光标: {e}")))?;
+                    .map_err(|e| IncrementalError::Terminal(format!("move incremental image cursor: {e}")))?;
                 backend
                     .write_all(payload.as_bytes())
-                    .map_err(|e| IncrementalError::Terminal(format!("写增量图片行: {e}")))?;
+                    .map_err(|e| IncrementalError::Terminal(format!("write incremental image line: {e}")))?;
             }
         }
         Backend::flush(backend)
-            .map_err(|e| IncrementalError::Terminal(format!("提交增量行: {e}")))?;
+            .map_err(|e| IncrementalError::Terminal(format!("flush incremental line: {e}")))?;
     }
     sync.finish()
-        .map_err(|e| IncrementalError::Terminal(format!("提交同步滚动: {e}")))?;
+        .map_err(|e| IncrementalError::Terminal(format!("finish synchronized scroll: {e}")))?;
     Ok(())
 }
 
@@ -1220,7 +1220,7 @@ fn draw_frame(
 ) -> Result<(), String> {
     // xterm.js DEC mode 2026: 保留上一帧, 直到本帧的清屏、文本和图片异步
     // 解码全部处理完才原子显示。SyncUpdate 的 Drop 保证中途报错也会关闭。
-    let mut sync = SyncUpdate::begin().map_err(|e| format!("开启同步绘制: {e}"))?;
+    let mut sync = SyncUpdate::begin().map_err(|e| format!("begin synchronized drawing: {e}"))?;
     // 全清(less -c 风格)。刻意不用 ratatui 的 Terminal::clear(): 它为了
     // 保留后端光标位置会发 CSI 6n DSR 查询并等终端应答 —— 每帧一次往返
     // (延迟 + 依赖终端应答, 裸 pty/个别终端会超时失败)。这里自己发
@@ -1230,7 +1230,7 @@ fn draw_frame(
     terminal.swap_buffers();
     terminal.swap_buffers();
     let mut clr = io::stdout().lock();
-    execute!(clr, Clear(ClearType::All)).map_err(|e| format!("清屏: {e}"))?;
+    execute!(clr, Clear(ClearType::All)).map_err(|e| format!("clear screen: {e}"))?;
     drop(clr);
 
     terminal
@@ -1242,7 +1242,7 @@ fn draw_frame(
                 fill_model_row(buf, prep, kind, y, cols, cell_w, cell_h);
             }
         })
-        .map_err(|e| format!("绘制文本: {e}"))?;
+        .map_err(|e| format!("draw text: {e}"))?;
 
     // IIP: 文本之上放图像。降级块(切片/解码失败)退回占位框原文行。
     let mut out = io::stdout().lock();
@@ -1257,9 +1257,9 @@ fn draw_frame(
                 // 切片帧: 图片顶滚出视口(top < 0)时从屏幕行 0 起画切片
                 let y = top.max(0);
                 if (y as u16) < rows {
-                    execute!(out, MoveTo(x, y as u16)).map_err(|e| format!("移光标: {e}"))?;
+                    execute!(out, MoveTo(x, y as u16)).map_err(|e| format!("move cursor: {e}"))?;
                     out.write_all(payload.as_bytes())
-                        .map_err(|e| format!("写 IIP: {e}"))?;
+                        .map_err(|e| format!("write IIP: {e}"))?;
                 }
             }
             Placement::Degraded => {
@@ -1271,9 +1271,9 @@ fn draw_frame(
                     .min((rows as usize).saturating_sub(top.max(0) as usize));
                 for j in 0..cap {
                     let y = (top + j as i64) as u16;
-                    execute!(out, MoveTo(0, y)).map_err(|e| format!("移光标: {e}"))?;
+                    execute!(out, MoveTo(0, y)).map_err(|e| format!("move cursor: {e}"))?;
                     out.write_all(prep.raw[a.block_start + j].as_bytes())
-                        .map_err(|e| format!("写降级行: {e}"))?;
+                        .map_err(|e| format!("write fallback line: {e}"))?;
                 }
             }
             Placement::Hidden => {}
@@ -1281,7 +1281,7 @@ fn draw_frame(
     }
     out.flush().map_err(|e| format!("flush: {e}"))?;
     drop(out);
-    sync.finish().map_err(|e| format!("提交同步绘制: {e}"))?;
+    sync.finish().map_err(|e| format!("finish synchronized drawing: {e}"))?;
     Ok(())
 }
 
@@ -1337,17 +1337,17 @@ fn truncate_columns(s: &str, cols: usize) -> String {
 /// 供 Node e2e 断言 IIP 字节。cell 尺寸用默认值(20×9, 与常量一致)。
 pub fn dump_frame(home: &Path, key: &str, rows: u16, cols: u16, row: usize) -> Result<(), String> {
     let rendered = home.join(".rendered").join(key);
-    let text = std::fs::read_to_string(&rendered).map_err(|e| format!("读 {key}: {e}"))?;
+    let text = std::fs::read_to_string(&rendered).map_err(|e| format!("read {key}: {e}"))?;
     if text.is_empty() {
-        return Err(format!("{key}: 预渲染文本为空"));
+        return Err(format!("{key}: pre-rendered text is empty"));
     }
-    let manifest_path = sidecar_path(&rendered).ok_or("预渲染路径没有文件名")?;
+    let manifest_path = sidecar_path(&rendered).ok_or("pre-rendered path has no file name")?;
     let manifest: ManifestFile = serde_json::from_str(
-        &std::fs::read_to_string(manifest_path).map_err(|e| format!("读 manifest: {e}"))?,
+        &std::fs::read_to_string(manifest_path).map_err(|e| format!("read manifest: {e}"))?,
     )
     .map_err(|e| format!("manifest JSON: {e}"))?;
     if manifest.version != 1 || manifest.images.is_empty() {
-        return Err(format!("{key}: manifest 无图或版本不符"));
+        return Err(format!("{key}: manifest has no images or version mismatch"));
     }
     let assets_dir = home.join(".rendered-assets");
     let prep = preflight(&text, manifest.images, &assets_dir, &rendered)?;
@@ -1412,22 +1412,22 @@ pub fn dump_frame(home: &Path, key: &str, rows: u16, cols: u16, row: usize) -> R
 /// `blog --dump-image-frame <article-key> <rows> <cols> <row>` 的 CLI 入口。
 pub fn dump_cli(args: &[String], home: &Path) -> i32 {
     if args.len() != 4 {
-        eprintln!("用法: blog --dump-image-frame <article-key> <rows> <cols> <row>");
+        eprintln!("Usage: blog --dump-image-frame <article-key> <rows> <cols> <row>");
         return 2;
     }
     let parse = |i: usize| -> Option<u32> { args[i].parse().ok() };
     let (Some(rows), Some(cols), Some(row)) = (parse(1), parse(2), parse(3)) else {
-        eprintln!("blog: --dump-image-frame 参数必须是数字");
+        eprintln!("blog: --dump-image-frame arguments must be numbers");
         return 2;
     };
     if rows == 0 || cols == 0 || rows > 1000 || cols > 1000 {
-        eprintln!("blog: rows/cols 须在 1..=1000");
+        eprintln!("blog: rows/cols must be in 1..=1000");
         return 2;
     }
     match dump_frame(home, &args[0], rows as u16, cols as u16, row as usize) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("blog: dump-image-frame 失败: {e}");
+            eprintln!("blog: dump-image-frame failed: {e}");
             1
         }
     }
@@ -1555,11 +1555,11 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content.as_ref(), "图片管线自检");
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
-        // 占位框顶边 dim: \x1b[2m┌─ 图片 ─…\x1b[22m
-        let line = "\x1b[2m┌─ 图片 ─────────────────────\x1b[22m";
+        // 占位框顶边 dim: \x1b[2m┌─ image ─…\x1b[22m
+        let line = "\x1b[2m┌─ image ─────────────────────\x1b[22m";
         let spans = parse_line(line);
         assert_eq!(spans.len(), 1, "{spans:?}");
-        assert_eq!(spans[0].content.as_ref(), "┌─ 图片 ─────────────────────");
+        assert_eq!(spans[0].content.as_ref(), "┌─ image ─────────────────────");
         assert!(spans[0].style.add_modifier.contains(Modifier::DIM));
         // URL 行: dim 前缀 + 空格 + cyan 链接(OSC 8 剥除, 样式保留), 行尾复位
         let line = "\x1b[2m│\x1b[22m \x1b[36m\x1b]8;;http://h/blog/x.png\x1b\\http://h/blog/x.png\x1b]8;;\x1b\\\x1b[0m";

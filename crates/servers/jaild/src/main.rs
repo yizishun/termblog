@@ -48,7 +48,7 @@ fn filter_caps(caps: &[String]) -> Vec<String> {
         .filter(|c| {
             let known = KNOWN.contains(&c.as_str());
             if !known {
-                warn!(cap = %c, "丢弃未知能力通告(白名单之外)");
+                warn!(cap = %c, "dropping unknown capability announcement (not in whitelist)");
             }
             known
         })
@@ -78,13 +78,13 @@ async fn main() -> Result<()> {
     match Group::from_name("www") {
         Ok(Some(g)) => {
             if let Err(e) = chown(&socket, None, Some(g.gid.as_raw())) {
-                warn!(%e, socket = %socket.display(), "chown root:www 失败(非 root 启动?)");
+                warn!(%e, socket = %socket.display(), "chown root:www failed (not started as root?)");
             }
         }
-        Ok(None) => warn!("系统没有 www 组, socket 保持 root 属组"),
-        Err(e) => warn!(%e, "查找 www 组失败"),
+        Ok(None) => warn!("system has no www group, socket keeping root group"),
+        Err(e) => warn!(%e, "failed to query www group"),
     }
-    info!(socket = %socket.display(), "socket 已监听(启动步骤未完成, 连接先排队)");
+    info!(socket = %socket.display(), "socket listening (startup steps pending, connections will queue)");
 
     // 启动残留回收: 上次崩溃遗留的 s-* 全部销毁(幂等)
     JailBackend::sweep(&cfg.jail)?;
@@ -95,14 +95,14 @@ async fn main() -> Result<()> {
         JailBackend::new(cfg.jail.clone(), cfg.comments.clone()),
         Quota { max_total: cfg.session.max_total, max_per_ip: cfg.session.max_per_ip },
     );
-    info!(socket = %socket.display(), "jaild 就绪, 开始 accept");
+    info!(socket = %socket.display(), "jaild ready, starting accept");
 
     loop {
         match listener.accept().await {
             Ok(link) => {
                 tokio::spawn(handle_conn(mgr.clone(), link));
             }
-            Err(e) => error!(%e, "accept 失败"),
+            Err(e) => error!(%e, "accept failed"),
         }
     }
 }
@@ -118,20 +118,20 @@ async fn handle_conn(mgr: SessionManager, link: Link) {
             Ok(Ok(f)) if f.kind == proto::OPEN => match f.parse() {
                 Ok(o) => o,
                 Err(e) => {
-                    warn!(%e, "Open 帧 JSON 解析失败");
+                    warn!(%e, "Open frame JSON parse failed");
                     return;
                 }
             },
             Ok(Ok(f)) => {
-                warn!(kind = f.kind, "首帧不是 Open");
+                warn!(kind = f.kind, "first frame is not Open");
                 return;
             }
             Ok(Err(e)) => {
-                warn!(%e, "读 Open 帧失败");
+                warn!(%e, "read Open frame failed");
                 return;
             }
             Err(_) => {
-                warn!("读 Open 帧超时");
+                warn!("read Open frame timed out");
                 return;
             }
         };
@@ -204,7 +204,7 @@ async fn handle_conn(mgr: SessionManager, link: Link) {
             },
         }
     }
-    tracing::info!(sid = %session.id, "连接结束, 会话交还(立即回收)");
+    tracing::info!(sid = %session.id, "connection closed, session returned (immediate reclamation)");
     // session(input/control/output) 随本函数结束被 drop => 泵回收 shell 并销毁 jail
 }
 

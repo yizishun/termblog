@@ -81,7 +81,7 @@ impl JailBackend {
             if sid.is_empty() || sid.contains('/') || sid.contains('@') {
                 continue;
             }
-            warn!(sid, "回收启动残留 jail");
+            warn!(sid, "reclaiming startup residual jail");
             cleanup_sync(cfg, sid);
         }
         // 旧版本留下的空 mountpoint 目录(/jails/<sid> 或 /jails/s-<sid>)一并清掉。
@@ -117,7 +117,7 @@ impl JailBackend {
             .comments
             .all(PRIVATE_SYNC)
             .await
-            .context("首次同步评论")?;
+            .context("first-time comments sync")?;
         let snapshot = snapshot_bytes(&approved)?;
         let cfg = self.cfg.clone();
         let comments_cfg = self.comments_cfg.clone();
@@ -189,8 +189,8 @@ fn spawn_sync(
     );
     if let Err(e) = &res {
         // 失败原因必须落日志: 否则只剩 socket 上的 Closed 帧, 排障无门
-        error!(sid, error = %e, "jail spawn 失败");
-        warn!(sid, "回收残留资源");
+        error!(sid, error = %e, "jail spawn failed");
+        warn!(sid, "reclaiming residual resources");
         cleanup_sync(cfg, sid);
     }
     res
@@ -224,15 +224,15 @@ fn spawn_inner(
     run("zfs", &["set", &format!("mountpoint={path}"), ds])?;
     let _ = run("zfs", &["mount", ds]);
     if !std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
-        bail!("jail 根目录 {path} 未挂载");
+        bail!("jail root directory {path} not mounted");
     }
 
     // 2. devfs(默认 jail 规则集 4: 只暴露 null/zero/random 等无害设备)。
     // base.txz 不带 /dev 目录, 先建出来再挂
     let dev = format!("{path}/dev");
-    std::fs::create_dir_all(&dev).with_context(|| format!("创建 {dev}"))?;
+    std::fs::create_dir_all(&dev).with_context(|| format!("create {dev}"))?;
     if let Err(e) = run("mount", &["-t", "devfs", "-o", "ruleset=4", "devfs", &dev]) {
-        warn!(sid, %e, "devfs 挂载失败(jail 内没有 /dev, 功能受限)");
+        warn!(sid, %e, "devfs mount failed (no /dev inside jail, functionality limited)");
     }
 
     // 3. 创建 jail: 无网络, allow.* 全关, persist。
@@ -266,11 +266,11 @@ fn spawn_inner(
             "allow.mlock=0",
         ])
         .output()
-        .context("执行 jail -c")?;
+        .context("execute jail -c")?;
     if !out.status.success() {
-        bail!("jail -c 失败: {}", stderr_of(&out));
+        bail!("jail -c failed: {}", stderr_of(&out));
     }
-    let jid = jail_jid(name).context("查询 jail jid")?;
+    let jid = jail_jid(name).context("query jail jid")?;
 
     // 4. rctl 限额(racct 未开启时 fail-closed: 宁可不给会话, 也不跑无配额 jail)
     for limit in [
@@ -290,7 +290,7 @@ fn spawn_inner(
     let targets_rel = comments_cfg
         .targets_file
         .strip_prefix("/")
-        .context("comments.targets_file 必须是绝对路径")?;
+        .context("comments.targets_file must be an absolute path")?;
     let targets = read_targets(&Path::new(path).join(targets_rel))?;
     let home_root = format!("{path}{home}");
     let comment_fifos = targets
@@ -326,7 +326,7 @@ fn spawn_inner(
     // 是安全的, 现有代码同此模式; 子进程只用指针)。内容见 env_strings。
     let envs: Vec<CString> = env_strings(&home, caps)
         .into_iter()
-        .map(|e| CString::new(e).expect("环境串无 NUL"))
+        .map(|e| CString::new(e).expect("environment string without NUL"))
         .collect();
     let mut envp: Vec<*const c_char> = envs.iter().map(|e| e.as_ptr()).collect();
     envp.push(std::ptr::null());
@@ -340,7 +340,7 @@ fn spawn_inner(
                 master.as_raw_fd(),
                 FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
             )?;
-            info!(sid, jid, pid = child.as_raw(), "jail 会话已创建");
+            info!(sid, jid, pid = child.as_raw(), "jail session created");
             Ok(ShellChild {
                 master,
                 pid: child,
@@ -395,7 +395,7 @@ fn snapshot_bytes(comments: &[Comment]) -> Result<Vec<u8>> {
         let date10 = c
             .created_at
             .get(..10)
-            .ok_or_else(|| anyhow::anyhow!("commentd created_at 太短"))?;
+            .ok_or_else(|| anyhow::anyhow!("commentd created_at too short"))?;
         serde_json::to_writer(
             &mut out,
             &SnapshotLine {
@@ -414,13 +414,13 @@ fn snapshot_bytes(comments: &[Comment]) -> Result<Vec<u8>> {
 
 fn read_targets(path: &Path) -> Result<Vec<(String, String)>> {
     let md = std::fs::symlink_metadata(path)
-        .with_context(|| format!("读取评论 target 清单 {}", path.display()))?;
+        .with_context(|| format!("read comments target manifest {}", path.display()))?;
     if !md.file_type().is_file()
         || md.file_type().is_symlink()
         || md.uid() != 0
         || md.mode() & 0o022 != 0
     {
-        bail!("评论 target 清单必须是 root-owned、group/other 不可写的普通文件");
+        bail!("comments target manifest must be a root-owned, group/other non-writable regular file");
     }
     parse_targets(&std::fs::read_to_string(path)?)
 }
@@ -432,7 +432,7 @@ fn parse_targets(text: &str) -> Result<Vec<(String, String)>> {
     for (idx, line) in text.lines().enumerate() {
         let (rel, target) = line
             .split_once('\t')
-            .ok_or_else(|| anyhow::anyhow!("target 清单第 {} 行缺 Tab", idx + 1))?;
+            .ok_or_else(|| anyhow::anyhow!("target manifest line {} missing Tab", idx + 1))?;
         if target.contains('\t')
             || rel.is_empty()
             || rel.starts_with('/')
@@ -440,15 +440,15 @@ fn parse_targets(text: &str) -> Result<Vec<(String, String)>> {
                 .split('/')
                 .any(|p| p.is_empty() || p == "." || p == "..")
         {
-            bail!("target 清单第 {} 行相对路径非法", idx + 1);
+            bail!("target manifest line {} invalid relative path", idx + 1);
         }
         let derived = target_for_fifo(rel)
-            .ok_or_else(|| anyhow::anyhow!("target 清单第 {} 行路径不是评论设备", idx + 1))?;
+            .ok_or_else(|| anyhow::anyhow!("target manifest line {} path is not a comment device", idx + 1))?;
         if derived != target || !termblog_commentd::valid_target(target) {
-            bail!("target 清单第 {} 行映射不一致", idx + 1);
+            bail!("target manifest line {} mapping inconsistent", idx + 1);
         }
         if !paths.insert(rel.to_string()) || !targets.insert(target.to_string()) {
-            bail!("target 清单第 {} 行重复", idx + 1);
+            bail!("target manifest line {} duplicate", idx + 1);
         }
         out.push((rel.to_string(), target.to_string()));
     }
@@ -476,7 +476,7 @@ fn open_fifo_at(home: &Path, rel: &str) -> Result<OwnedFd> {
         )
     };
     if raw < 0 {
-        return Err(std::io::Error::last_os_error()).context("打开 guest home");
+        return Err(std::io::Error::last_os_error()).context("open guest home");
     }
     let mut dir = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut parts = rel.split('/').peekable();
@@ -491,23 +491,23 @@ fn open_fifo_at(home: &Path, rel: &str) -> Result<OwnedFd> {
         let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("openat 评论设备 {rel}"));
+                .with_context(|| format!("openat comment device {rel}"));
         }
         let opened = unsafe { OwnedFd::from_raw_fd(fd) };
         if last {
             let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
             if unsafe { libc::fstat(opened.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-                return Err(std::io::Error::last_os_error()).context("fstat 评论设备");
+                return Err(std::io::Error::last_os_error()).context("fstat comment device");
             }
             let st = unsafe { st.assume_init() };
             if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
-                bail!("评论设备 {rel} 不是 FIFO");
+                bail!("comment device {rel} is not a FIFO");
             }
             return Ok(opened);
         }
         dir = opened;
     }
-    bail!("空评论设备路径")
+    bail!("empty comment device path")
 }
 
 static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -527,7 +527,7 @@ fn write_snapshot(jail_root: &str, bytes: &[u8]) -> Result<()> {
     if final_path.exists() {
         let md = std::fs::symlink_metadata(&final_path)?;
         if !md.file_type().is_file() || md.file_type().is_symlink() || md.uid() != 0 {
-            bail!("评论快照不是 root-owned 普通文件");
+            bail!("comments snapshot is not a root-owned regular file");
         }
     }
     let seq = SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -553,14 +553,14 @@ fn write_snapshot(jail_root: &str, bytes: &[u8]) -> Result<()> {
 
 fn validate_root_dir(path: &Path) -> Result<()> {
     let md = std::fs::symlink_metadata(path)
-        .with_context(|| format!("校验 root-owned 目录 {}", path.display()))?;
+        .with_context(|| format!("validate root-owned directory {}", path.display()))?;
     if !md.file_type().is_dir()
         || md.file_type().is_symlink()
         || md.uid() != 0
         || md.mode() & 0o022 != 0
     {
         bail!(
-            "{} 必须是 root-owned 且 group/other 不可写的真实目录",
+            "{} must be a root-owned, group/other non-writable real directory",
             path.display()
         );
     }
@@ -588,14 +588,14 @@ fn jail_jid(name: &str) -> Result<c_int> {
     let out = Command::new("jls")
         .args(["-j", name, "jid"])
         .output()
-        .context("执行 jls")?;
+        .context("execute jls")?;
     if !out.status.success() {
-        bail!("jls -j {name} 失败: {}", stderr_of(&out));
+        bail!("jls -j {name} failed: {}", stderr_of(&out));
     }
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse()
-        .context("解析 jail jid")
+        .context("parse jail jid")
 }
 
 /// FreeBSD 14+ 的 /etc/defaults/devfs.rules 不再自带默认规则集, jail 默认
@@ -616,11 +616,11 @@ pub fn ensure_devfs_ruleset() {
     ];
     for r in rules {
         if let Err(e) = run("devfs", r) {
-            warn!(%e, "配置 devfs 规则集 4 失败(非 FreeBSD 或权限不足, 可忽略)");
+            warn!(%e, "configure devfs ruleset 4 failed (non-FreeBSD or insufficient permissions, can be ignored)");
             return;
         }
     }
-    info!("devfs 规则集 4 已就绪(jail 内只暴露 null/zero/random 等无害设备)");
+    info!("devfs ruleset 4 ready (only exposes null/zero/random harmless devices inside jail)");
 }
 
 /// 幂等清理。顺序: devfs 先卸(否则 zfs destroy 会因 busy 失败)
@@ -630,13 +630,13 @@ fn cleanup_sync(cfg: &JailConfig, sid: &str) {
     let path = format!("{}/s-{sid}", cfg.path_prefix);
     let name = format!("s-{sid}");
     if let Err(e) = run("umount", &["-f", &format!("{path}/dev")]) {
-        warn!(sid, %e, "umount devfs 失败(可忽略)");
+        warn!(sid, %e, "umount devfs failed (can be ignored)");
     }
     if let Err(e) = run("jail", &["-r", &name]) {
-        warn!(sid, %e, "jail -r 失败(可忽略)");
+        warn!(sid, %e, "jail -r failed (can be ignored)");
     }
     if let Err(e) = run("zfs", &["destroy", "-f", &ds]) {
-        warn!(sid, %e, "zfs destroy 失败(可忽略)");
+        warn!(sid, %e, "zfs destroy failed (can be ignored)");
     }
 }
 
@@ -646,17 +646,17 @@ fn cleanup_sync(cfg: &JailConfig, sid: &str) {
 /// home 在 [5]); Linux/macOS 是 10 字段(home 在 [8])。
 fn guest_ids(jail_root: &str, user: &str) -> Result<(u32, u32, String)> {
     let passwd = std::fs::read_to_string(format!("{jail_root}/etc/passwd"))
-        .with_context(|| format!("读 {jail_root}/etc/passwd"))?;
+        .with_context(|| format!("read {jail_root}/etc/passwd"))?;
     for line in passwd.lines() {
         let f: Vec<&str> = line.split(':').collect();
         if f.len() >= 7 && f[0] == user {
-            let uid: u32 = f[2].parse().context("解析 guest uid")?;
-            let gid: u32 = f[3].parse().context("解析 guest gid")?;
+            let uid: u32 = f[2].parse().context("parse guest uid")?;
+            let gid: u32 = f[3].parse().context("parse guest gid")?;
             let home = if f.len() >= 9 { f[8] } else { f[5] };
             return Ok((uid, gid, home.to_string()));
         }
     }
-    bail!("jail 模板里没有 {user} 用户")
+    bail!("no {user} user found in jail template")
 }
 
 /// kern.osreldate(如 1500000 = 15.0-RELEASE)。读不到时返回 None(调用方兜底)。
@@ -684,9 +684,9 @@ fn run(prog: &str, args: &[&str]) -> Result<()> {
     let out = Command::new(prog)
         .args(args)
         .output()
-        .with_context(|| format!("执行 {prog}"))?;
+        .with_context(|| format!("execute {prog}"))?;
     if !out.status.success() {
-        bail!("{prog} {} 失败: {}", args.join(" "), stderr_of(&out));
+        bail!("{prog} {} failed: {}", args.join(" "), stderr_of(&out));
     }
     Ok(())
 }

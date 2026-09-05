@@ -130,7 +130,7 @@ pub struct ErrorResponse {
 pub fn page_limit(limit: Option<u16>) -> Result<usize, &'static str> {
     let n = limit.unwrap_or(DEFAULT_LIMIT);
     if !(1..=MAX_LIMIT).contains(&n) {
-        return Err("limit 必须在 1..=100");
+        return Err("limit must be between 1 and 100");
     }
     Ok(n as usize)
 }
@@ -151,23 +151,23 @@ pub fn visible_comments(comments: &[Comment]) -> Result<Vec<VisibleComment>, Str
 
     for comment in comments {
         if comment.id == 0 || comment.id <= last_id {
-            return Err("评论 ID 未严格递增".into());
+            return Err("comment IDs not strictly increasing".into());
         }
         last_id = comment.id;
 
         let counter = next_number.entry(&comment.target).or_default();
         *counter = counter
             .checked_add(1)
-            .ok_or_else(|| "局部评论编号已耗尽".to_string())?;
+            .ok_or_else(|| "local comment numbers exhausted".to_string())?;
         let number = *counter;
 
         let reply_to = match comment.reply_to_id {
             Some(parent_id) => {
                 let Some((parent_target, parent)) = seen.get(&parent_id) else {
-                    return Err(format!("回复指向不存在或更晚的评论 ID {parent_id}"));
+                    return Err(format!("reply points to nonexistent or later comment ID {parent_id}"));
                 };
                 if *parent_target != comment.target.as_str() {
-                    return Err(format!("回复跨越 target: ID {parent_id}"));
+                    return Err(format!("reply crosses target boundary: ID {parent_id}"));
                 }
                 Some(parent.clone())
             }

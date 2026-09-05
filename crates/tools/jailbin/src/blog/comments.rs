@@ -32,9 +32,9 @@ pub fn render(target: &str, empty_hint: &str) {
         Ok(comments) => {
             let total = comments.len();
             let start = total.saturating_sub(MAX_SHOWN);
-            let _ = writeln!(out, "\n── 评论 ({total}) ───────────────────────────");
+            let _ = writeln!(out, "\n── Comments ({total}) ───────────────────────────");
             if start > 0 {
-                let _ = writeln!(out, "… 还有 {start} 条更早评论\n");
+                let _ = writeln!(out, "… {start} earlier comments omitted\n");
             }
             for c in &comments[start..] {
                 let author = strip_controls(&c.author);
@@ -52,7 +52,7 @@ pub fn render(target: &str, empty_hint: &str) {
         Err(_) => {
             let _ = writeln!(
                 out,
-                "\n── 评论 ───────────────────────────────\n(评论暂不可用)"
+                "\n── Comments ───────────────────────────────\n(Comments temporarily unavailable)"
             );
         }
     }
@@ -66,10 +66,10 @@ fn load(path: &Path, target: &str) -> Result<Vec<SnapshotComment>, String> {
     let mut seen: HashMap<(String, u64), String> = HashMap::new();
     for (idx, line) in text.lines().enumerate() {
         if line.is_empty() {
-            return Err(format!("第 {} 行为空", idx + 1));
+            return Err(format!("line {} is empty", idx + 1));
         }
         let c: SnapshotComment =
-            serde_json::from_str(line).map_err(|e| format!("第 {} 行: {e}", idx + 1))?;
+            serde_json::from_str(line).map_err(|e| format!("line {}: {e}", idx + 1))?;
         if !valid_target(&c.target)
             || c.author.is_empty()
             || c.author.len() > 32
@@ -77,15 +77,15 @@ fn load(path: &Path, target: &str) -> Result<Vec<SnapshotComment>, String> {
             || c.text.len() > 512
             || !valid_date10(&c.date10)
         {
-            return Err(format!("第 {} 行字段非法", idx + 1));
+            return Err(format!("line {} has invalid fields", idx + 1));
         }
         let next = numbers.entry(c.target.clone()).or_default();
         *next = next
             .checked_add(1)
-            .ok_or_else(|| format!("第 {} 行局部编号溢出", idx + 1))?;
+            .ok_or_else(|| format!("line {} local number overflow", idx + 1))?;
         if c.number != *next {
             return Err(format!(
-                "第 {} 行局部编号不连续: 应为 {}，实际为 {}",
+                "line {} local number not contiguous: expected {}, got {}",
                 idx + 1,
                 *next,
                 c.number
@@ -93,14 +93,14 @@ fn load(path: &Path, target: &str) -> Result<Vec<SnapshotComment>, String> {
         }
         if let Some(parent) = &c.reply_to {
             if parent.number == 0 || parent.author.is_empty() || parent.author.len() > 32 {
-                return Err(format!("第 {} 行回复字段非法", idx + 1));
+                return Err(format!("line {} reply field invalid", idx + 1));
             }
             let key = (c.target.clone(), parent.number);
             let Some(author) = seen.get(&key) else {
-                return Err(format!("第 {} 行回复指向不存在或更晚的评论", idx + 1));
+                return Err(format!("line {} reply references non-existent or later comment", idx + 1));
             };
             if author != &parent.author {
-                return Err(format!("第 {} 行回复作者不匹配", idx + 1));
+                return Err(format!("line {} reply author mismatch", idx + 1));
             }
         }
         seen.insert((c.target.clone(), c.number), c.author.clone());

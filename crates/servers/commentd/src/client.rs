@@ -27,13 +27,13 @@ impl Client {
     async fn request<T: Serialize, R: DeserializeOwned>(&self, kind: u8, req: &T) -> Result<R> {
         let link = Link::connect(&self.socket)
             .await
-            .with_context(|| format!("连接 {}", self.socket.display()))?;
+            .with_context(|| format!("connect {}", self.socket.display()))?;
         link.send(&Frame::json(kind, req)).await?;
         let frame = link.recv().await?;
         if frame.kind != kind {
-            bail!("commentd 响应 kind 不匹配: {} != {kind}", frame.kind);
+            bail!("commentd response kind mismatch: {} != {kind}", frame.kind);
         }
-        frame.parse().context("解析 commentd 响应")
+        frame.parse().context("parse commentd response")
     }
 
     pub async fn public_query(&self, req: &PublicQuery) -> Result<PublicQueryResponse> {
@@ -74,8 +74,8 @@ impl Client {
                         break;
                     }
                     bail!(
-                        "commentd 查询失败: {}",
-                        res.error.unwrap_or_else(|| "未知错误".into())
+                        "commentd query failed: {}",
+                        res.error.unwrap_or_else(|| "unknown error".into())
                     );
                 }
                 if revision.is_none() {
@@ -87,9 +87,9 @@ impl Client {
                 }
                 after_id = res
                     .next_after_id
-                    .ok_or_else(|| anyhow::anyhow!("commentd has_more 缺 next_after_id"))?;
+                    .ok_or_else(|| anyhow::anyhow!("commentd has_more missing next_after_id"))?;
             }
         }
-        bail!("commentd 数据持续变化，无法取得一致快照")
+        bail!("commentd data continuously changing, unable to acquire consistent snapshot")
     }
 }
