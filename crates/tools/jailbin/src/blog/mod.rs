@@ -14,7 +14,7 @@ use std::process::Command;
 
 use termblog_content_model::{ArticleIndex, ArticleIndexEntry, ArticlePath, CommentAttachment};
 
-use crate::webctl::osc_url;
+use crate::webctl::{osc_title, osc_url};
 
 const TARGETS_FILE: &str = "/usr/local/share/termblog/comment-targets.tsv";
 
@@ -78,6 +78,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     let article = article.expect("checked above");
 
+    emit_title(&article.title);
     emit_osc(&article.route);
     let rendered = rendered_dir.join(&article.key);
     if rendered.is_file() {
@@ -208,6 +209,16 @@ fn show_file(path: &Path) -> i32 {
 fn emit_osc(path: &str) {
     let mut out = std::io::stdout().lock();
     if out.write_all(&osc_url(path)).is_ok() {
+        let _ = out.flush();
+    }
+}
+
+fn emit_title(title: &str) {
+    let Some(sequence) = osc_title(title) else {
+        return;
+    };
+    let mut out = std::io::stdout().lock();
+    if out.write_all(&sequence).is_ok() {
         let _ = out.flush();
     }
 }

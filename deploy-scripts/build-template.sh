@@ -89,6 +89,13 @@ export LANG=C.UTF-8
 umask 022
 PS1='%F{green}blog@jail%f %~ %# '
 setopt INTERACTIVE_COMMENTS
+# 每次提示符出现前以标准 OSC 2 报告当前目录。Web xterm 用它更新浏览器
+# 标签标题；cd/pushd/popd 都无需包装，blog 退出后也会自然恢复路径标题。
+autoload -Uz add-zsh-hook
+_termblog_title_precmd() {
+    print -Pn '\e]2;%~\a'
+}
+add-zsh-hook precmd _termblog_title_precmd
 # jaild 的评论回执不经 PTY，可能在 prompt 之后异步到达。SIGURG
 # 默认为忽略；在 zsh 内只用它通知 ZLE 重画 prompt 和未提交的编辑行。
 TRAPURG() {

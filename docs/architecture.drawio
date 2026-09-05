@@ -324,7 +324,7 @@
                 <mxCell id="m5_ansi" value="ANSI 投影 → jailtpl/content/.rendered/&#xa;· &lt;article-key&gt;: 76 列折行 + SGR (CJK=2)&#xa;· .index: 人类列表&#xa;· .index.json: source/key/route 机器事实源" style="rounded=1;whiteSpace=wrap;fill=#d0ece7;strokeColor=#0e8088;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
                     <mxGeometry x="830" y="1910" width="330" height="130" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_tpl" value="jail 模板 (build-template.sh)&#xa;· content 完整非隐藏树 → ~/ 同构复制&#xa;· .rendered/ + assets 单独安装&#xa;· 配置目录注入 comment FIFO&#xa;· bin/blog/play/webctl → /usr/local/bin (0555)&#xa;· zshrc: LANG=C.UTF-8 + MOTD&#xa;内容更新: 完整静态树发布 + 模板旁路换名" style="rounded=1;whiteSpace=wrap;fill=#e1d5e7;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
+                <mxCell id="m5_tpl" value="jail 模板 (build-template.sh)&#xa;· content 完整非隐藏树 → ~/ 同构复制&#xa;· .rendered/ + assets 单独安装&#xa;· 配置目录注入 comment FIFO&#xa;· bin/blog/play/webctl → /usr/local/bin (0555)&#xa;· zshrc: LANG=C.UTF-8 + MOTD + precmd OSC 2 路径标题&#xa;内容更新: 完整静态树发布 + 模板旁路换名" style="rounded=1;whiteSpace=wrap;fill=#e1d5e7;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
                     <mxGeometry x="1380" y="1870" width="340" height="190" as="geometry"/>
                 </mxCell>
                 <mxCell id="m5_e1" value="*.md 递归收集" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d6b656;" parent="1" source="m5_src" target="m5_cb" edge="1">
@@ -362,8 +362,8 @@
                 <mxCell id="m5_osc" value="osc.ts: parser.registerOscHandler(7777)&#xa;只认 url= · 白名单 ^/[a-z0-9-]*(/[a-z0-9-]+)*/?$ 且 ≤512&#xa;只 history.replaceState —— 绝不跳转 / 不写 DOM&#xa;天花板 = 地址栏显示一个站内路径" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#b85450;fontSize=12;" parent="m5_browser" vertex="1">
                     <mxGeometry x="20" y="206" width="340" height="80" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_main" value="main.ts 落地状态机&#xa;· 读取并校验 termblog-source + route&#xa;· 镜像页: Open.fresh=1 → 每次全新会话&#xa;· 新会话首帧后自动敲&#xa;  blog -- &amp;quot;$HOME/&lt;source-rel&gt;&amp;quot;&#xa;· 首页: attach 回放保留终端历史&#xa;· 本页 OSC + 200ms → 等待层淡出&#xa;· 5s 兜底 / WS 断: 露出静态全文" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="m5_browser" vertex="1">
-                    <mxGeometry x="20" y="296" width="340" height="110" as="geometry"/>
+                <mxCell id="m5_main" value="main.ts 落地状态机&#xa;· 读取并校验 termblog-source + route&#xa;· 镜像页: Open.fresh=1 → 每次全新会话&#xa;· 新会话首帧后自动敲&#xa;  blog -- &amp;quot;$HOME/&lt;source-rel&gt;&amp;quot;&#xa;· 首页: attach 回放保留终端历史&#xa;· OSC 0/2 校验后同步 document.title&#xa;· 本页 OSC + 200ms → 等待层淡出&#xa;· 5s 兜底 / WS 断: 露出静态全文" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#6c8ebf;fontSize=12;" parent="m5_browser" vertex="1">
+                    <mxGeometry x="20" y="296" width="340" height="125" as="geometry"/>
                 </mxCell>
                 <mxCell id="m5_web" value="termblog-web (axum, www) —— M5 路由零新增" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
                     <mxGeometry x="720" y="2180" width="330" height="210" as="geometry"/>
@@ -380,7 +380,7 @@
                 <mxCell id="m5_jail" value="jail 会话 (每访客一个真实 FreeBSD jail, guest)" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
                     <mxGeometry x="1100" y="2180" width="420" height="440" as="geometry"/>
                 </mxCell>
-                <mxCell id="m5_zsh" value="zsh (guest)&#xa;落地页自动敲入 blog -- $HOME/&lt;source-rel&gt;&#xa;(正常键入通路, 进 zsh 历史)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="m5_jail" vertex="1">
+                <mxCell id="m5_zsh" value="zsh (guest)&#xa;落地页自动敲入 blog -- $HOME/&lt;source-rel&gt;&#xa;(正常键入通路, 进 zsh 历史)&#xa;precmd 以 OSC 2 报告当前 %~；blog 以 OSC 2 报告文章标题" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="m5_jail" vertex="1">
                     <mxGeometry x="20" y="46" width="380" height="80" as="geometry"/>
                 </mxCell>
                 <mxCell id="m5_blog" value="blog —— HOME-rooted 阅读器 (Rust)&#xa;查找: 原样 → $HOME/arg → $HOME/arg.md&#xa;.index.json 精确命中 → rendered + 明确 route&#xa;其他可读文件 → 原文, 不猜 route&#xa;配置 attachment 才展示目录评论&#xa;退出 → webctl url /" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;verticalAlign=top;align=left;spacingLeft=8;spacingTop=6;" parent="m5_jail" vertex="1">

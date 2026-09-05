@@ -2,7 +2,8 @@
 
 每篇文章一个稳定 URL: 爬虫看到静态 HTML 镜像, 真人打开 URL 则自动接入
 每个访客一个的真实 FreeBSD jail 终端(zsh + less), 读预渲染排版的文章。
-URL⇄终端双向同步(OSC 7777), SEO 产物(sitemap/atom/canonical)构建期生成。
+URL⇄终端双向同步(OSC 7777)，浏览器标题随 shell 当前路径/文章标题同步(OSC 2)；
+SEO 产物(sitemap/atom/canonical)构建期生成。
 
 ## 架构
 

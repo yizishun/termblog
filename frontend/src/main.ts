@@ -124,6 +124,12 @@ const term = new Terminal({
     activate: (_event, uri) => confirmOpenLink(uri),
   },
 });
+// OSC 0/2 来自不可信 PTY：只允许短、非控制字符标题。document.title 按文本
+// 赋值，不解释 HTML；zsh 用它报告当前目录，blog 阅读期间用文章标题覆盖。
+const SAFE_TERMINAL_TITLE = /^[^\u0000-\u001f\u007f-\u009f]{1,512}$/u;
+term.onTitleChange((title) => {
+  if (SAFE_TERMINAL_TITLE.test(title)) document.title = title;
+});
 const fit = new FitAddon();
 term.loadAddon(fit);
 // 图片二期: iTerm2 Inline Images Protocol(像素内嵌显示)。选项名是
