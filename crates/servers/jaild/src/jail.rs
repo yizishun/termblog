@@ -36,7 +36,9 @@ use nix::pty::{openpty, Winsize};
 use nix::unistd::{fork, ForkResult};
 use tracing::{error, info, warn};
 
-use termblog_commentd::{protocol::PRIVATE_SYNC, Client as CommentClient, Comment};
+use termblog_commentd::{
+    protocol::PRIVATE_SYNC, visible_comments, Client as CommentClient, Comment, VisibleReply,
+};
 use termblog_config::{CommentsConfig, JailConfig};
 
 use crate::pty::{CommentFifo, ShellChild};
@@ -378,16 +380,18 @@ fn spawn_inner(
 
 #[derive(serde::Serialize)]
 struct SnapshotLine<'a> {
-    id: u64,
+    number: u64,
     target: &'a str,
     author: &'a str,
     date10: &'a str,
     text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<&'a VisibleReply>,
 }
 
 fn snapshot_bytes(comments: &[Comment]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    for c in comments {
+    for c in visible_comments(comments).map_err(anyhow::Error::msg)? {
         let date10 = c
             .created_at
             .get(..10)
@@ -395,11 +399,12 @@ fn snapshot_bytes(comments: &[Comment]) -> Result<Vec<u8>> {
         serde_json::to_writer(
             &mut out,
             &SnapshotLine {
-                id: c.id,
+                number: c.number,
                 target: &c.target,
                 author: &c.author,
                 date10,
                 text: &c.text,
+                reply_to: c.reply_to.as_ref(),
             },
         )?;
         out.push(b'\n');
@@ -711,6 +716,52 @@ mod tests {
             !envs.iter().any(|e| e.starts_with("TERMBLOG_IMG")),
             "{envs:?}"
         );
+    }
+
+    #[test]
+    fn guest_snapshot_contains_only_local_numbers_and_reply_summary() {
+        let comments = vec![
+            Comment {
+                id: 40,
+                target: "/a/".into(),
+                author: "alice".into(),
+                text: "root".into(),
+                created_at: "2026-09-05T00:00:00Z".into(),
+                reply_to_id: None,
+            },
+            Comment {
+                id: 41,
+                target: "/b/".into(),
+                author: "other".into(),
+                text: "elsewhere".into(),
+                created_at: "2026-09-05T00:00:01Z".into(),
+                reply_to_id: None,
+            },
+            Comment {
+                id: 50,
+                target: "/a/".into(),
+                author: "bob".into(),
+                text: "reply".into(),
+                created_at: "2026-09-05T00:00:02Z".into(),
+                reply_to_id: Some(40),
+            },
+        ];
+        let bytes = snapshot_bytes(&comments).unwrap();
+        let rows: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(rows[0]["number"], 1);
+        assert_eq!(rows[1]["number"], 1);
+        assert_eq!(rows[2]["number"], 2);
+        assert_eq!(rows[2]["reply_to"]["number"], 1);
+        assert_eq!(rows[2]["reply_to"]["author"], "alice");
+        for row in rows {
+            assert!(row.get("id").is_none());
+            assert!(row.get("reply_to_id").is_none());
+        }
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const PUBLIC_QUERY: u8 = 1;
@@ -17,6 +19,25 @@ pub struct Comment {
     pub author: String,
     pub text: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VisibleReply {
+    pub number: u64,
+    pub author: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VisibleComment {
+    pub number: u64,
+    pub target: String,
+    pub author: String,
+    pub text: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<VisibleReply>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,7 +45,7 @@ pub struct Comment {
 pub struct PublicQuery {
     pub target: String,
     #[serde(default)]
-    pub after_id: Option<u64>,
+    pub after_number: Option<u64>,
     #[serde(default)]
     pub limit: Option<u16>,
     #[serde(default)]
@@ -37,9 +58,9 @@ pub struct PublicQueryResponse {
     pub revision: String,
     pub total: usize,
     pub omitted_earlier: usize,
-    pub comments: Vec<Comment>,
+    pub comments: Vec<VisibleComment>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_after_id: Option<u64>,
+    pub next_after_number: Option<u64>,
     pub has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -119,9 +140,135 @@ pub fn valid_target(target: &str) -> bool {
     termblog_content_model::validate_target(target).is_ok()
 }
 
+/// 将私有、全局 ID 模型投影为公开的 target 内局部编号模型。
+///
+/// 输入必须按全局 ID 严格递增；reply 只能指向同 target 的更早评论。
+pub fn visible_comments(comments: &[Comment]) -> Result<Vec<VisibleComment>, String> {
+    let mut last_id = 0;
+    let mut next_number: HashMap<&str, u64> = HashMap::new();
+    let mut seen: HashMap<u64, (&str, VisibleReply)> = HashMap::new();
+    let mut out = Vec::with_capacity(comments.len());
+
+    for comment in comments {
+        if comment.id == 0 || comment.id <= last_id {
+            return Err("评论 ID 未严格递增".into());
+        }
+        last_id = comment.id;
+
+        let counter = next_number.entry(&comment.target).or_default();
+        *counter = counter
+            .checked_add(1)
+            .ok_or_else(|| "局部评论编号已耗尽".to_string())?;
+        let number = *counter;
+
+        let reply_to = match comment.reply_to_id {
+            Some(parent_id) => {
+                let Some((parent_target, parent)) = seen.get(&parent_id) else {
+                    return Err(format!("回复指向不存在或更晚的评论 ID {parent_id}"));
+                };
+                if *parent_target != comment.target.as_str() {
+                    return Err(format!("回复跨越 target: ID {parent_id}"));
+                }
+                Some(parent.clone())
+            }
+            None => None,
+        };
+        let own_ref = VisibleReply {
+            number,
+            author: comment.author.clone(),
+        };
+        seen.insert(comment.id, (&comment.target, own_ref));
+        out.push(VisibleComment {
+            number,
+            target: comment.target.clone(),
+            author: comment.author.clone(),
+            text: comment.text.clone(),
+            created_at: comment.created_at.clone(),
+            reply_to,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn comment(id: u64, target: &str, author: &str, reply_to_id: Option<u64>) -> Comment {
+        Comment {
+            id,
+            target: target.into(),
+            author: author.into(),
+            text: format!("text {id}"),
+            created_at: "2026-09-05T00:00:00Z".into(),
+            reply_to_id,
+        }
+    }
+
+    #[test]
+    fn projection_uses_per_target_numbers_and_direct_parent() {
+        let visible = visible_comments(&[
+            comment(1, "/a/", "alice", None),
+            comment(2, "/b/", "elsewhere", None),
+            comment(3, "/a/", "bob", Some(1)),
+            comment(4, "/a/", "carol", Some(3)),
+        ])
+        .unwrap();
+
+        assert_eq!(visible[0].number, 1);
+        assert_eq!(visible[1].number, 1);
+        assert_eq!(visible[2].number, 2);
+        assert_eq!(
+            visible[2].reply_to,
+            Some(VisibleReply {
+                number: 1,
+                author: "alice".into()
+            })
+        );
+        assert_eq!(
+            visible[3].reply_to,
+            Some(VisibleReply {
+                number: 2,
+                author: "bob".into()
+            })
+        );
+    }
+
+    #[test]
+    fn projection_rejects_missing_or_cross_target_parent() {
+        assert!(visible_comments(&[comment(2, "/", "a", Some(1))]).is_err());
+        assert!(visible_comments(&[
+            comment(1, "/a/", "a", None),
+            comment(2, "/b/", "b", Some(1)),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn public_json_has_no_global_id_and_old_cursor_is_rejected() {
+        let response = PublicQueryResponse {
+            ok: true,
+            revision: "r".into(),
+            total: 1,
+            omitted_earlier: 0,
+            comments: visible_comments(&[comment(99, "/", "alice", None)]).unwrap(),
+            next_after_number: None,
+            has_more: false,
+            error: None,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        let first = &value["comments"][0];
+        assert_eq!(first["number"], 1);
+        assert!(first.get("id").is_none());
+        assert!(first.get("reply_to_id").is_none());
+
+        assert!(serde_json::from_value::<PublicQuery>(serde_json::json!({
+            "target": "/",
+            "after_id": 1,
+            "revision": "r"
+        }))
+        .is_err());
+    }
 
     #[test]
     fn target_validation() {

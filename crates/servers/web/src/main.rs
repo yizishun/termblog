@@ -38,9 +38,10 @@ struct AppState {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommentsParams {
     target: Option<String>,
-    after_id: Option<u64>,
+    after_number: Option<u64>,
     limit: Option<u16>,
     revision: Option<String>,
 }
@@ -99,7 +100,7 @@ async fn comments_handler(
     };
     if !valid_target(&target)
         || page_limit(params.limit).is_err()
-        || params.after_id.unwrap_or(0) > 0 && params.revision.is_none()
+        || params.after_number.unwrap_or(0) > 0 && params.revision.is_none()
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -110,7 +111,7 @@ async fn comments_handler(
         .comments
         .public_query(&PublicQuery {
             target,
-            after_id: params.after_id,
+            after_number: params.after_number,
             limit: params.limit,
             revision: params.revision,
         })
@@ -123,7 +124,7 @@ async fn comments_handler(
                 "total": res.total,
                 "omitted_earlier": res.omitted_earlier,
                 "comments": res.comments,
-                "next_after_id": res.next_after_id,
+                "next_after_number": res.next_after_number,
                 "has_more": res.has_more,
             })),
         ),

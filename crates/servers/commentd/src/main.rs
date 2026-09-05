@@ -132,9 +132,12 @@ async fn queue(client: &Client, args: &[String]) -> Result<()> {
         rows.extend(res.comments);
         if !res.has_more {
             for c in rows {
+                let reply = c
+                    .reply_to_id
+                    .map_or_else(|| "root".to_string(), |id| format!("reply_to=#{id}"));
                 println!(
-                    "#{}\t{}\t{}\t{}\t{}",
-                    c.id, c.target, c.author, c.created_at, c.text
+                    "#{}\t{}\t{}\t{}\t{}\t{}",
+                    c.id, c.target, c.author, c.created_at, reply, c.text
                 );
             }
             break;

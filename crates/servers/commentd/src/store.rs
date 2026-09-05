@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::protocol::{
-    page_limit, valid_target, Comment, ModerateResponse, PageRequest, PageResponse, PublicQuery,
-    PublicQueryResponse, SubmitRequest, SubmitResponse,
+    page_limit, valid_target, visible_comments, Comment, ModerateResponse, PageRequest,
+    PageResponse, PublicQuery, PublicQueryResponse, SubmitRequest, SubmitResponse,
 };
 
 const DATA_FILE: &str = "comments.jsonl";
@@ -37,6 +37,8 @@ struct StoredComment {
     target: String,
     author: String,
     text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_to_id: Option<u64>,
     ip_hash: String,
     created_at: String,
     status: Status,
@@ -50,6 +52,7 @@ impl StoredComment {
             author: self.author.clone(),
             text: self.text.clone(),
             created_at: self.created_at.clone(),
+            reply_to_id: self.reply_to_id,
         }
     }
 }
@@ -127,6 +130,7 @@ impl Store {
             last_id = c.id;
             comments.push(c);
         }
+        validate_relations(&comments)?;
         let canonical = encode(&comments)?;
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -160,15 +164,29 @@ impl Store {
         if req.ip.parse::<std::net::IpAddr>().is_err() {
             return Ok(reject("IP 非法"));
         }
-        let Some((author, text)) = normalize_line(&req.line) else {
-            return Ok(reject("清洗后正文为空"));
+        let parsed = match normalize_line(&req.line) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return Ok(reject("清洗后正文为空")),
+            Err(message) => return Ok(reject(message)),
         };
+        let ParsedLine {
+            author,
+            text,
+            reply_number,
+        } = parsed;
         if author.len() > 32 {
             return Ok(reject("名字超过 32 字节"));
         }
         if text.len() > 512 {
             return Ok(reject("正文超过 512 字节"));
         }
+        let reply_to_id = match reply_number {
+            Some(number) => match resolve_reply_id(&self.comments, &req.target, number) {
+                Some(id) => Some(id),
+                None => return Ok(reject(&format!("当前目录不存在已公开评论 #{number}"))),
+            },
+            None => None,
+        };
 
         let ip_hash = hash_ip(&self.salt, &req.ip);
         let now = Utc::now();
@@ -192,7 +210,11 @@ impl Store {
             return Ok(reject("同一来源每小时最多 10 条"));
         }
         if self.comments.iter().any(|c| {
-            c.ip_hash == ip_hash && c.target == req.target && c.text == text && recent(c, 300)
+            c.ip_hash == ip_hash
+                && c.target == req.target
+                && c.text == text
+                && c.reply_to_id == reply_to_id
+                && recent(c, 300)
         }) {
             return Ok(reject("5 分钟内请勿重复提交相同内容"));
         }
@@ -208,6 +230,7 @@ impl Store {
             target: req.target.clone(),
             author,
             text,
+            reply_to_id,
             ip_hash,
             created_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
             status: Status::Pending,
@@ -228,7 +251,7 @@ impl Store {
             total: 0,
             omitted_earlier: 0,
             comments: vec![],
-            next_after_id: None,
+            next_after_number: None,
             has_more: false,
             error: Some(message),
         };
@@ -239,22 +262,26 @@ impl Store {
             Ok(n) => n,
             Err(e) => return err(e.into()),
         };
-        if req.after_id.unwrap_or(0) > 0 && req.revision.is_none() {
-            return err("after_id>0 时 revision 必填".into());
+        if req.after_number.unwrap_or(0) > 0 && req.revision.is_none() {
+            return err("after_number>0 时 revision 必填".into());
         }
         if let Some(r) = &req.revision {
             if r != &self.revision {
                 return err("stale_revision".into());
             }
         }
-        let all: Vec<_> = self
+        let private: Vec<_> = self
             .comments
             .iter()
             .filter(|c| c.status == Status::Approved && c.target == req.target)
             .map(StoredComment::view)
             .collect();
+        let all = match visible_comments(&private) {
+            Ok(comments) => comments,
+            Err(_) => return err("评论数据不可用".into()),
+        };
         let total = all.len();
-        if req.after_id.is_none() {
+        if req.after_number.is_none() {
             let start = total.saturating_sub(limit);
             return PublicQueryResponse {
                 ok: true,
@@ -262,23 +289,25 @@ impl Store {
                 total,
                 omitted_earlier: start,
                 comments: all[start..].to_vec(),
-                next_after_id: None,
+                next_after_number: None,
                 has_more: false,
                 error: None,
             };
         }
-        let after = req.after_id.unwrap_or(0);
-        let mut rest = all.into_iter().filter(|c| c.id > after);
+        let after = req.after_number.unwrap_or(0);
+        let mut rest = all.into_iter().filter(|c| c.number > after);
         let comments: Vec<_> = rest.by_ref().take(limit).collect();
         let has_more = rest.next().is_some();
-        let next_after_id = has_more.then(|| comments.last().map(|c| c.id)).flatten();
+        let next_after_number = has_more
+            .then(|| comments.last().map(|c| c.number))
+            .flatten();
         PublicQueryResponse {
             ok: true,
             revision: self.revision.clone(),
             total,
             omitted_earlier: 0,
             comments,
-            next_after_id,
+            next_after_number,
             has_more,
             error: None,
         }
@@ -403,23 +432,113 @@ impl Store {
     }
 }
 
-fn normalize_line(line: &str) -> Option<(String, String)> {
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedLine {
+    author: String,
+    text: String,
+    reply_number: Option<u64>,
+}
+
+fn normalize_line(line: &str) -> Result<Option<ParsedLine>, &'static str> {
     let clean: String = line
         .chars()
         .filter(|c| !matches!(*c as u32, 0x00..=0x1f | 0x7f..=0x9f))
         .collect();
     let clean = clean.trim();
     if clean.is_empty() {
-        return None;
+        return Ok(None);
+    }
+
+    // 整行以 #N: 开头时是 guest 回复，必须先于 author: text 解析。
+    if let Some((reply_number, text)) = reply_prefix(clean)? {
+        return Ok(Some(ParsedLine {
+            author: "guest".into(),
+            text: text.into(),
+            reply_number: Some(reply_number),
+        }));
     }
     if let Some((left, right)) = clean.split_once(':') {
         let author = left.trim();
         let text = right.trim();
-        if !author.is_empty() && author.len() <= 32 && !text.is_empty() {
-            return Some((author.to_string(), text.to_string()));
+        if !author.is_empty() && !text.is_empty() {
+            let reply = reply_prefix(text)?;
+            return Ok(Some(ParsedLine {
+                author: author.to_string(),
+                text: reply.map_or(text, |(_, body)| body).to_string(),
+                reply_number: reply.map(|(number, _)| number),
+            }));
         }
     }
-    Some(("guest".into(), clean.to_string()))
+    Ok(Some(ParsedLine {
+        author: "guest".into(),
+        text: clean.to_string(),
+        reply_number: None,
+    }))
+}
+
+fn reply_prefix(text: &str) -> Result<Option<(u64, &str)>, &'static str> {
+    let Some(rest) = text.strip_prefix('#') else {
+        return Ok(None);
+    };
+    let digit_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len == 0 || rest.as_bytes().get(digit_len) != Some(&b':') {
+        return Ok(None);
+    }
+    let number = rest[..digit_len]
+        .parse::<u64>()
+        .map_err(|_| "回复编号过大")?;
+    if number == 0 {
+        return Err("回复编号必须大于 0");
+    }
+    let body = rest[digit_len + 1..].trim();
+    if body.is_empty() {
+        return Err("回复正文为空");
+    }
+    Ok(Some((number, body)))
+}
+
+fn resolve_reply_id(comments: &[StoredComment], target: &str, wanted: u64) -> Option<u64> {
+    let mut number = 0u64;
+    for comment in comments
+        .iter()
+        .filter(|c| c.status == Status::Approved && c.target == target)
+    {
+        number = number.checked_add(1)?;
+        if number == wanted {
+            return Some(comment.id);
+        }
+    }
+    None
+}
+
+fn validate_relations(comments: &[StoredComment]) -> Result<()> {
+    let mut seen: HashMap<u64, (&str, Status)> = HashMap::new();
+    for (index, comment) in comments.iter().enumerate() {
+        let line = index + 1;
+        if let Some(parent_id) = comment.reply_to_id {
+            let Some((parent_target, parent_status)) = seen.get(&parent_id) else {
+                bail!(
+                    "comments.jsonl 第 {line} 行：评论 ID {} 的 reply_to_id {} 不存在或不早于它",
+                    comment.id,
+                    parent_id
+                );
+            };
+            if *parent_target != comment.target {
+                bail!(
+                    "comments.jsonl 第 {line} 行：评论 ID {} 的回复跨越 target",
+                    comment.id
+                );
+            }
+            if *parent_status != Status::Approved {
+                bail!(
+                    "comments.jsonl 第 {line} 行：评论 ID {} 回复的父评论未公开",
+                    comment.id
+                );
+            }
+        }
+        seen.insert(comment.id, (&comment.target, comment.status));
+    }
+    Ok(())
 }
 
 fn validate_stored(c: &StoredComment) -> Result<()> {
@@ -522,17 +641,60 @@ mod tests {
         }
     }
 
+    fn submit(s: &mut Store, target: &str, line: &str, ip: &str) -> SubmitResponse {
+        s.submit(SubmitRequest {
+            target: target.into(),
+            line: line.into(),
+            ip: ip.into(),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn prefix_and_controls() {
         assert_eq!(
             normalize_line(" alice: 好\u{1b}文 "),
-            Some(("alice".into(), "好文".into()))
+            Ok(Some(ParsedLine {
+                author: "alice".into(),
+                text: "好文".into(),
+                reply_number: None,
+            }))
         );
         assert_eq!(
             normalize_line("无前缀"),
-            Some(("guest".into(), "无前缀".into()))
+            Ok(Some(ParsedLine {
+                author: "guest".into(),
+                text: "无前缀".into(),
+                reply_number: None,
+            }))
         );
-        assert_eq!(normalize_line("\u{7f}\n"), None);
+        assert_eq!(
+            normalize_line("alice: #12: reply"),
+            Ok(Some(ParsedLine {
+                author: "alice".into(),
+                text: "reply".into(),
+                reply_number: Some(12),
+            }))
+        );
+        assert_eq!(
+            normalize_line("#2: guest reply"),
+            Ok(Some(ParsedLine {
+                author: "guest".into(),
+                text: "guest reply".into(),
+                reply_number: Some(2),
+            }))
+        );
+        assert_eq!(normalize_line("\u{7f}\n"), Ok(None));
+        assert_eq!(normalize_line("#0: nope"), Err("回复编号必须大于 0"));
+        assert_eq!(normalize_line("#1:"), Err("回复正文为空"));
+        assert_eq!(
+            normalize_line("#rust: ordinary"),
+            Ok(Some(ParsedLine {
+                author: "#rust".into(),
+                text: "ordinary".into(),
+                reply_number: None,
+            }))
+        );
     }
 
     #[test]
@@ -565,12 +727,105 @@ mod tests {
         assert_eq!(s.moderate(&[1], true).unwrap().changed, 1);
         let q = s.public_query(PublicQuery {
             target: "/blog/hello/".into(),
-            after_id: None,
+            after_number: None,
             limit: None,
             revision: None,
         });
+        assert_eq!(q.comments[0].number, 1);
         assert_eq!(q.comments[0].author, "alice");
         assert_eq!(q.comments[0].text, "好文");
+    }
+
+    #[test]
+    fn named_guest_and_nested_replies_resolve_to_stable_ids() {
+        let td = tempfile::tempdir().unwrap();
+        let mut s = memory_store(td.path());
+
+        assert!(submit(&mut s, "/", "alice: root", "127.0.0.1").ok);
+        s.moderate(&[1], true).unwrap();
+        assert!(submit(&mut s, "/other/", "other", "127.0.0.2").ok);
+        s.moderate(&[2], true).unwrap();
+        assert!(submit(&mut s, "/", "bob: #1: reply", "127.0.0.3").ok);
+        assert_eq!(s.comments[2].reply_to_id, Some(1));
+        assert_eq!(s.comments[2].text, "reply");
+        s.moderate(&[3], true).unwrap();
+        assert!(submit(&mut s, "/", "#2: nested", "127.0.0.4").ok);
+        assert_eq!(s.comments[3].reply_to_id, Some(3));
+        assert_eq!(s.comments[3].author, "guest");
+        s.moderate(&[4], true).unwrap();
+
+        let q = s.public_query(PublicQuery {
+            target: "/".into(),
+            after_number: None,
+            limit: None,
+            revision: None,
+        });
+        assert_eq!(
+            q.comments.iter().map(|c| c.number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(q.comments[1].reply_to.as_ref().unwrap().number, 1);
+        assert_eq!(q.comments[1].reply_to.as_ref().unwrap().author, "alice");
+        assert_eq!(q.comments[2].reply_to.as_ref().unwrap().number, 2);
+        assert_eq!(q.comments[2].reply_to.as_ref().unwrap().author, "bob");
+    }
+
+    #[test]
+    fn invalid_or_unapproved_reply_is_rejected_without_consuming_id() {
+        let td = tempfile::tempdir().unwrap();
+        let mut s = memory_store(td.path());
+        assert!(submit(&mut s, "/", "pending", "127.0.0.1").ok);
+
+        for (target, line) in [
+            ("/", "bob: #1: pending parent"),
+            ("/other/", "#1: other target"),
+            ("/", "#99: missing"),
+            ("/", "#0: invalid"),
+            ("/", "#18446744073709551616: overflow"),
+            ("/", "#1:"),
+        ] {
+            let response = submit(&mut s, target, line, "127.0.0.2");
+            assert!(!response.ok, "应拒绝 {line:?}");
+        }
+        assert_eq!(s.comments.len(), 1);
+
+        s.moderate(&[1], true).unwrap();
+        let response = submit(&mut s, "/", "#1: accepted", "127.0.0.2");
+        assert!(response.ok);
+        assert_eq!(response.id, Some(2));
+    }
+
+    #[test]
+    fn duplicate_text_to_different_parents_is_allowed() {
+        let td = tempfile::tempdir().unwrap();
+        let mut s = memory_store(td.path());
+        assert!(submit(&mut s, "/", "first", "127.0.0.1").ok);
+        assert!(submit(&mut s, "/", "second", "127.0.0.2").ok);
+        s.moderate(&[1, 2], true).unwrap();
+
+        assert!(submit(&mut s, "/", "#1: same", "127.0.0.3").ok);
+        assert!(submit(&mut s, "/", "#2: same", "127.0.0.3").ok);
+        assert_eq!(s.comments[2].reply_to_id, Some(1));
+        assert_eq!(s.comments[3].reply_to_id, Some(2));
+    }
+
+    #[test]
+    fn old_records_default_to_root_and_bad_relations_are_rejected() {
+        let old: StoredComment = serde_json::from_str(
+            r#"{"id":1,"target":"/","author":"a","text":"old","ip_hash":"0000000000000000000000000000000000000000000000000000000000000000","created_at":"2026-09-05T00:00:00Z","status":"approved"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.reply_to_id, None);
+
+        let mut child = old.clone();
+        child.id = 2;
+        child.reply_to_id = Some(1);
+        let mut pending_parent = old.clone();
+        pending_parent.status = Status::Pending;
+        assert!(validate_relations(&[pending_parent, child.clone()]).is_err());
+
+        child.target = "/other/".into();
+        assert!(validate_relations(&[old, child]).is_err());
     }
 
     #[test]
@@ -606,6 +861,73 @@ mod tests {
             .ok
         );
         assert_eq!(s.comments.last().unwrap().id, 10);
+    }
+
+    #[test]
+    fn public_pagination_uses_local_numbers_and_relation_survives_renumbering() {
+        let td = tempfile::tempdir().unwrap();
+        let mut s = memory_store(td.path());
+
+        // ID 1 暂时 pending；ID 2 此时是 target / 中访得到的 #1。
+        assert!(submit(&mut s, "/", "older pending", "127.0.0.1").ok);
+        assert!(submit(&mut s, "/", "visible root", "127.0.0.2").ok);
+        s.moderate(&[2], true).unwrap();
+        assert!(submit(&mut s, "/other/", "other target", "127.0.0.3").ok);
+        s.moderate(&[3], true).unwrap();
+        assert!(submit(&mut s, "/", "second root", "127.0.0.4").ok);
+        s.moderate(&[4], true).unwrap();
+        assert!(submit(&mut s, "/", "#1: stable reply", "127.0.0.5").ok);
+        assert_eq!(s.comments[4].reply_to_id, Some(2));
+        s.moderate(&[5], true).unwrap();
+
+        let first = s.public_query(PublicQuery {
+            target: "/".into(),
+            after_number: Some(0),
+            limit: Some(2),
+            revision: None,
+        });
+        assert!(first.ok);
+        assert!(first.has_more);
+        assert_eq!(first.next_after_number, Some(2));
+        assert_eq!(
+            first.comments.iter().map(|c| c.number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let second = s.public_query(PublicQuery {
+            target: "/".into(),
+            after_number: first.next_after_number,
+            limit: Some(2),
+            revision: Some(first.revision),
+        });
+        assert!(second.ok);
+        assert!(!second.has_more);
+        assert_eq!(
+            second.comments.iter().map(|c| c.number).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(second.comments[0].reply_to.as_ref().unwrap().number, 1);
+
+        // 更早的 pending 获批后所有局部编号顺延，但稳定 ID 关系仍指向原父项。
+        s.moderate(&[1], true).unwrap();
+        let renumbered = s.public_query(PublicQuery {
+            target: "/".into(),
+            after_number: None,
+            limit: None,
+            revision: None,
+        });
+        assert_eq!(
+            renumbered
+                .comments
+                .iter()
+                .map(|c| c.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(renumbered.comments[3].reply_to.as_ref().unwrap().number, 2);
+        assert_eq!(
+            renumbered.comments[3].reply_to.as_ref().unwrap().author,
+            "guest"
+        );
     }
 
     #[test]

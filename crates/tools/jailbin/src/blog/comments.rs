@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -6,14 +7,23 @@ use serde::Deserialize;
 const SNAPSHOT: &str = "/var/run/termblog/comments.jsonl";
 const MAX_SHOWN: usize = 100;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SnapshotReply {
+    number: u64,
+    author: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SnapshotComment {
-    id: u64,
+    number: u64,
     target: String,
     author: String,
     date10: String,
     text: String,
+    #[serde(default)]
+    reply_to: Option<SnapshotReply>,
 }
 
 pub fn render(target: &str, empty_hint: &str) {
@@ -26,14 +36,13 @@ pub fn render(target: &str, empty_hint: &str) {
             if start > 0 {
                 let _ = writeln!(out, "… 还有 {start} 条更早评论\n");
             }
-            for (offset, c) in comments[start..].iter().enumerate() {
+            for c in &comments[start..] {
                 let author = strip_controls(&c.author);
-                let text = strip_controls(&c.text);
-                let ordinal = start + offset + 1;
+                let text = display_text(c);
                 let _ = writeln!(
                     out,
                     "\x1b[2m#{}\x1b[0m  \x1b[1m{}\x1b[0m \x1b[2m· {}\x1b[0m\n    {}\n",
-                    ordinal, author, c.date10, text
+                    c.number, author, c.date10, text
                 );
             }
             if comments.is_empty() {
@@ -53,16 +62,14 @@ pub fn render(target: &str, empty_hint: &str) {
 fn load(path: &Path, target: &str) -> Result<Vec<SnapshotComment>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    let mut last_id = 0;
+    let mut numbers: HashMap<String, u64> = HashMap::new();
+    let mut seen: HashMap<(String, u64), String> = HashMap::new();
     for (idx, line) in text.lines().enumerate() {
         if line.is_empty() {
             return Err(format!("第 {} 行为空", idx + 1));
         }
         let c: SnapshotComment =
             serde_json::from_str(line).map_err(|e| format!("第 {} 行: {e}", idx + 1))?;
-        if c.id == 0 || c.id <= last_id {
-            return Err(format!("第 {} 行 ID 非严格递增", idx + 1));
-        }
         if !valid_target(&c.target)
             || c.author.is_empty()
             || c.author.len() > 32
@@ -72,12 +79,49 @@ fn load(path: &Path, target: &str) -> Result<Vec<SnapshotComment>, String> {
         {
             return Err(format!("第 {} 行字段非法", idx + 1));
         }
-        last_id = c.id;
+        let next = numbers.entry(c.target.clone()).or_default();
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| format!("第 {} 行局部编号溢出", idx + 1))?;
+        if c.number != *next {
+            return Err(format!(
+                "第 {} 行局部编号不连续: 应为 {}，实际为 {}",
+                idx + 1,
+                *next,
+                c.number
+            ));
+        }
+        if let Some(parent) = &c.reply_to {
+            if parent.number == 0 || parent.author.is_empty() || parent.author.len() > 32 {
+                return Err(format!("第 {} 行回复字段非法", idx + 1));
+            }
+            let key = (c.target.clone(), parent.number);
+            let Some(author) = seen.get(&key) else {
+                return Err(format!("第 {} 行回复指向不存在或更晚的评论", idx + 1));
+            };
+            if author != &parent.author {
+                return Err(format!("第 {} 行回复作者不匹配", idx + 1));
+            }
+        }
+        seen.insert((c.target.clone(), c.number), c.author.clone());
         if c.target == target {
             out.push(c);
         }
     }
     Ok(out)
+}
+
+fn display_text(comment: &SnapshotComment) -> String {
+    let text = strip_controls(&comment.text);
+    match &comment.reply_to {
+        Some(parent) => format!(
+            "(In reply to {} from comment #{}):\n    {}",
+            strip_controls(&parent.author),
+            parent.number,
+            text
+        ),
+        None => text,
+    }
 }
 
 fn valid_target(target: &str) -> bool {
@@ -100,13 +144,22 @@ fn strip_controls(s: &str) -> String {
 }
 
 #[cfg(test)]
-fn display_ordinal(omitted_earlier: usize, offset: usize) -> usize {
-    omitted_earlier + offset + 1
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn comment(number: u64, author: &str, parent: Option<(u64, &str)>) -> SnapshotComment {
+        SnapshotComment {
+            number,
+            target: "/".into(),
+            author: author.into(),
+            date10: "2026-09-05".into(),
+            text: format!("text {number}"),
+            reply_to: parent.map(|(number, author)| SnapshotReply {
+                number,
+                author: author.into(),
+            }),
+        }
+    }
 
     #[test]
     fn whole_snapshot_fails_on_bad_line() {
@@ -114,7 +167,7 @@ mod tests {
         let path = td.path().join("comments.jsonl");
         std::fs::write(
             &path,
-            "{\"id\":1,\"target\":\"/\",\"author\":\"a\",\"date10\":\"2026-09-01\",\"text\":\"ok\"}\nnot json\n",
+            "{\"number\":1,\"target\":\"/\",\"author\":\"a\",\"date10\":\"2026-09-01\",\"text\":\"ok\"}\nnot json\n",
         )
         .unwrap();
         assert!(load(&path, "/").is_err());
@@ -126,7 +179,7 @@ mod tests {
         let path = td.path().join("comments.jsonl");
         std::fs::write(
             &path,
-            "{\"id\":1,\"target\":\"/blog/\",\"author\":\"a\\u001b\",\"date10\":\"2026-09-01\",\"text\":\"ok\"}\n{\"id\":2,\"target\":\"/\",\"author\":\"b\",\"date10\":\"2026-09-02\",\"text\":\"root\"}\n",
+            "{\"number\":1,\"target\":\"/blog/\",\"author\":\"a\\u001b\",\"date10\":\"2026-09-01\",\"text\":\"ok\"}\n{\"number\":1,\"target\":\"/\",\"author\":\"b\",\"date10\":\"2026-09-02\",\"text\":\"root\"}\n",
         )
         .unwrap();
         let got = load(&path, "/blog/").unwrap();
@@ -141,19 +194,57 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"id\":1,\"target\":\"/blog/a/\",\"author\":\"a\",\"date10\":\"2026-09-01\",\"text\":\"first\"}\n",
-                "{\"id\":2,\"target\":\"/blog/b/\",\"author\":\"b\",\"date10\":\"2026-09-01\",\"text\":\"other article\"}\n",
-                "{\"id\":3,\"target\":\"/blog/a/\",\"author\":\"c\",\"date10\":\"2026-09-02\",\"text\":\"second\"}\n",
+                "{\"number\":1,\"target\":\"/blog/a/\",\"author\":\"a\",\"date10\":\"2026-09-01\",\"text\":\"first\"}\n",
+                "{\"number\":1,\"target\":\"/blog/b/\",\"author\":\"b\",\"date10\":\"2026-09-01\",\"text\":\"other article\"}\n",
+                "{\"number\":2,\"target\":\"/blog/a/\",\"author\":\"c\",\"date10\":\"2026-09-02\",\"text\":\"second\"}\n",
             ),
         )
         .unwrap();
 
         let comments = load(&path, "/blog/a/").unwrap();
-        let shown: Vec<_> = comments
-            .iter()
-            .enumerate()
-            .map(|(offset, comment)| (display_ordinal(0, offset), comment.id))
-            .collect();
-        assert_eq!(shown, vec![(1, 1), (2, 3)]);
+        assert_eq!(
+            comments
+                .iter()
+                .map(|comment| comment.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn nested_replies_show_the_direct_parent_on_its_own_line() {
+        let reply = comment(3, "bob", Some((1, "alice")));
+        let nested_reply = comment(4, "carol", Some((3, "bob")));
+        assert_eq!(
+            display_text(&reply),
+            "(In reply to alice from comment #1):\n    text 3"
+        );
+        assert_eq!(
+            display_text(&nested_reply),
+            "(In reply to bob from comment #3):\n    text 4"
+        );
+    }
+
+    #[test]
+    fn reply_keeps_its_label_when_parent_is_outside_latest_window() {
+        let reply = comment(101, "reply", Some((1, "old")));
+        assert_eq!(
+            display_text(&reply),
+            "(In reply to old from comment #1):\n    text 101"
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_global_ids_gaps_and_bad_parent_summary() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("comments.jsonl");
+        for bad in [
+            "{\"id\":1,\"target\":\"/\",\"author\":\"a\",\"date10\":\"2026-09-01\",\"text\":\"old schema\"}\n",
+            "{\"number\":2,\"target\":\"/\",\"author\":\"a\",\"date10\":\"2026-09-01\",\"text\":\"gap\"}\n",
+            "{\"number\":1,\"target\":\"/\",\"author\":\"a\",\"date10\":\"2026-09-01\",\"text\":\"root\"}\n{\"number\":2,\"target\":\"/\",\"author\":\"b\",\"date10\":\"2026-09-02\",\"text\":\"reply\",\"reply_to\":{\"number\":1,\"author\":\"wrong\"}}\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load(&path, "/").is_err(), "应拒绝 {bad:?}");
+        }
     }
 }
