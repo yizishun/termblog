@@ -113,7 +113,14 @@ const term = new Terminal({
   fontSize: 15,
   cursorBlink: true,
   scrollback: 2000,
-  theme: { background: "#fafafa", foreground: "#2e3338", cursor: "#2e3338" },
+  theme: {
+    background: "#fafafa",
+    foreground: "#2e3338",
+    cursor: "#2e3338",
+    // xterm 默认是 30% 白色选区，在浅色背景上几乎不可见。
+    selectionBackground: "rgba(46, 51, 56, 0.20)",
+    selectionInactiveBackground: "rgba(46, 51, 56, 0.12)",
+  },
   linkHandler: {
     activate: (_event, uri) => confirmOpenLink(uri),
   },
