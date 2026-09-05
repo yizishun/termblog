@@ -522,7 +522,9 @@ fn render_block(
         Block::Code(code_lines) => {
             for (i, l) in code_lines.iter().enumerate() {
                 let pre = if i == 0 { &ind.first } else { &ind.cont };
-                lines.push(format!("{pre}    {l}"));
+                // 用 dim 左边线区分代码块，同时保持原来的 4 列缩进和长行语义。
+                // 2/22 已同时受 less -R 与图片文章 TUI reader 支持。
+                lines.push(format!("{pre}\x1b[2m│\x1b[22m   {l}"));
             }
         }
         Block::Quote(inner) => {
@@ -909,13 +911,14 @@ mod tests {
     }
 
     #[test]
-    fn code_block_not_wrapped() {
+    fn code_block_has_dim_guide_and_is_not_wrapped() {
         let long = "c".repeat(100);
         let out = render(&format!("```\n{long}\n```\n"));
         assert!(
-            out.contains(&format!("    {long}")),
-            "代码块应 4 空格缩进且不折行: {out:?}"
+            out.contains(&format!("\x1b[2m│\x1b[22m   {long}")),
+            "代码块应有 dim 左边线、保持 4 列前缀且不折行: {out:?}"
         );
+        assert_eq!(plain(&out)[0], format!("│   {long}"));
     }
 
     #[test]
