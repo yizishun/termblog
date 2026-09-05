@@ -247,7 +247,6 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
       <div id="term-screen"></div>
     </div>
   </div>
-  <button id="enter-terminal" type="button" hidden>进入终端 ↵</button>
   <script type="module" src="/assets/{{ENTRY_JS}}"></script>
   {{#if comments}}<script type="module" src="/assets/{{COMMENTS_JS}}"></script>{{/if}}
 </body>
@@ -556,6 +555,10 @@ mod tests {
         assert!(page.contains("正在接入真实终端…"));
         assert!(page.contains("noscript") && page.contains("#mirror-cover{display:none}"));
         assert!(page.contains("id=\"static-view\"") && page.contains("<article>"));
+        assert!(
+            !page.contains("enter-terminal"),
+            "镜像页不应包含文章/终端切换按钮: {page}"
+        );
         // 无 site_url: 无 canonical / ssh_hint / og:url
         let page = render_mirror_page(
             &a,

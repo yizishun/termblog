@@ -42,7 +42,6 @@ if ((ARTICLE_SOURCE || ARTICLE_ROUTE) && !onMirror) {
 }
 const WANT = onMirror ? ARTICLE_ROUTE : "";
 let takeoverDone = false; // 终端是否已完成首次接管
-let articleVisible = true; // 双向“阅读文章 / 进入终端”切换
 let autoArmed = false; // 新会话落地页: 等首帧数据后补敲 blog 命令
 let autoSent = false; // 自动命令已发出(一次性)
 
@@ -278,47 +277,22 @@ function handleOscUrl(path: string) {
 }
 
 function takeOver() {
-  if (!takeoverDone) {
-    takeoverDone = true;
-    const cover = document.getElementById("mirror-cover");
-    cover?.classList.add("fade-out");
-    setTimeout(() => cover?.remove(), 450);
-  }
-  showTerminal();
-}
-
-function showTerminal() {
+  if (takeoverDone) return;
+  takeoverDone = true;
+  // 先藏正文再淡等待层：淡出过程透出的是终端，不是静态正文。
   document.getElementById("static-view")?.style.setProperty("display", "none");
-  const toggle = document.getElementById("enter-terminal");
-  if (toggle) {
-    toggle.textContent = "阅读文章";
-    toggle.removeAttribute("hidden");
-  }
-  articleVisible = false;
-}
-
-function showArticle() {
-  document.getElementById("static-view")?.style.removeProperty("display");
-  const toggle = document.getElementById("enter-terminal");
-  if (toggle) {
-    toggle.textContent = "进入终端 ↵";
-    toggle.removeAttribute("hidden");
-  }
-  articleVisible = true;
+  const cover = document.getElementById("mirror-cover");
+  cover?.classList.add("fade-out");
+  setTimeout(() => cover?.remove(), 450);
 }
 
 function revealStaticFallback() {
-  // 会话死了 / WS 断了 / 5s 无 OSC: 撤掉等待层, 静态正文保留可读 + 手动入口。
+  // 会话死了 / WS 断了 / 5s 无 OSC：撤掉等待层，保留可读的静态正文。
+  // 若 OSC 稍后到达，takeOver 仍会完成自动接管。
   document.getElementById("static-view")?.style.removeProperty("display");
   const cover = document.getElementById("mirror-cover");
   cover?.classList.add("fade-out");
   setTimeout(() => cover?.remove(), 450);
-  articleVisible = true;
-  const toggle = document.getElementById("enter-terminal");
-  if (toggle) {
-    toggle.textContent = "进入终端 ↵";
-    toggle.removeAttribute("hidden");
-  }
 }
 
 function armFallback() {
@@ -326,8 +300,3 @@ function armFallback() {
     if (!takeoverDone) revealStaticFallback();
   }, 5000);
 }
-
-document.getElementById("enter-terminal")?.addEventListener("click", () => {
-  if (!takeoverDone || articleVisible) takeOver();
-  else showArticle();
-});

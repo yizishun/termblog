@@ -72,23 +72,6 @@
 
 .mirror-status { color: #6a737d; font-size: 13px; margin: 0 0 1.5em; }
 
-/* 降级手动入口: 由 main.ts 揭示 */
-#enter-terminal {
-  position: fixed;
-  top: 16px;
-  right: 16px;
-  z-index: 30;
-  font: inherit;
-  font-size: 13px;
-  padding: 6px 14px;
-  background: var(--fg);
-  color: var(--bg);
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-}
-#enter-terminal:hover { opacity: .85; }
-
 @media (max-width: 640px) {
   #static-view { inset: 4px; padding: 14px 8px; }
   #mirror-cover { inset: 4px; }
