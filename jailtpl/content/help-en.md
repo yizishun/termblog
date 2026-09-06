@@ -19,9 +19,8 @@ cat /proc/stat        # View the root scope's frozen statistics snapshot
 exit                  # End the session
 ```
 
-While reading, scroll with the arrow keys, Page Up, and Page Down; press `q` to return to the
-shell. During playback, Space pauses or resumes, `.` advances one frame while paused, and `q`
-or Ctrl-C stops playback.
+While reading, press `j`/`k` to scroll down/up and `q` to return to the shell. During playback,
+Space pauses or resumes, `.` advances one frame while paused, and `q` or Ctrl-C stops playback.
 
 ## Comments and replies
 
