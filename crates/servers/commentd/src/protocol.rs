@@ -11,6 +11,7 @@ pub const PRIVATE_REJECT: u8 = 5;
 
 pub const DEFAULT_LIMIT: u16 = 100;
 pub const MAX_LIMIT: u16 = 100;
+pub const MAX_COMMENT_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Comment {

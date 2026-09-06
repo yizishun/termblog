@@ -10,8 +10,9 @@ SEO 产物(sitemap/atom/canonical)构建期生成。
 - **jaild**(root, 会话特权进程): 每访客从只读模板 `zroot/jails/template@release`
   ZFS clone 出一个会话 jail(rctl 限额 + 4M 磁盘配额), PTY 经 Unix socket 供接入层使用。
 - **commentd**(root, 评论单写者): 用独立 root-only JSONL 数据库存储待审/通过/删除状态，
-  通过 public/private 两个 Unix socket 分隔只读查询与投稿、审核；访客向 jail 内 FIFO
-  写一行即可投稿。评论 attachment 由内容配置显式列出；同目录文章共享一个 FIFO，
+  通过 public/private 两个 Unix socket 分隔只读查询与投稿、审核；访客每次打开并写入
+  jail 内 FIFO 即投稿一条评论，正文可包含换行。评论 attachment 由内容配置显式列出；
+  同目录文章共享一个 FIFO，
   空目录也可独立启用评论。`alice: #1: 内容`（或 guest 的 `#1: 内容`）可回复同目录的
   已公开评论；数据库全局 ID 不进入公开 API 或 guest 快照。
 - **termblog-statd**(root, 统计单写者): 用 root-only SQLite 持久化 target/article 计数，

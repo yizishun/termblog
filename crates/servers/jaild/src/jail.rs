@@ -1113,7 +1113,7 @@ mod tests {
                 id: 50,
                 target: "/a/".into(),
                 author: "bob".into(),
-                text: "reply".into(),
+                text: "reply\ncontinued".into(),
                 created_at: "2026-09-05T00:00:02Z".into(),
                 reply_to_id: Some(40),
             },
@@ -1130,6 +1130,7 @@ mod tests {
         assert_eq!(rows[2]["number"], 2);
         assert_eq!(rows[2]["reply_to"]["number"], 1);
         assert_eq!(rows[2]["reply_to"]["author"], "alice");
+        assert_eq!(rows[2]["text"], "reply\ncontinued");
         for row in rows {
             assert!(row.get("id").is_none());
             assert!(row.get("reply_to_id").is_none());

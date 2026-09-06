@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::protocol::{
     page_limit, valid_target, visible_comments, Comment, ModerateResponse, PageRequest,
     PageResponse, PublicQuery, PublicQueryResponse, SubmitRequest, SubmitResponse,
+    MAX_COMMENT_BYTES,
 };
 
 const DATA_FILE: &str = "comments.jsonl";
@@ -158,8 +159,8 @@ impl Store {
         if !valid_target(&req.target) {
             return Ok(reject("invalid target"));
         }
-        if req.line.len() > 512 {
-            return Ok(reject("line exceeds 512 bytes"));
+        if req.line.len() > MAX_COMMENT_BYTES {
+            return Ok(reject("comment exceeds 512 bytes"));
         }
         if req.ip.parse::<std::net::IpAddr>().is_err() {
             return Ok(reject("invalid IP"));
@@ -177,7 +178,7 @@ impl Store {
         if author.len() > 32 {
             return Ok(reject("author name exceeds 32 bytes"));
         }
-        if text.len() > 512 {
+        if text.len() > MAX_COMMENT_BYTES {
             return Ok(reject("body exceeds 512 bytes"));
         }
         let reply_to_id = match reply_number {
@@ -440,16 +441,14 @@ struct ParsedLine {
 }
 
 fn normalize_line(line: &str) -> Result<Option<ParsedLine>, &'static str> {
-    let clean: String = line
-        .chars()
-        .filter(|c| !matches!(*c as u32, 0x00..=0x1f | 0x7f..=0x9f))
-        .collect();
+    let clean = normalize_comment_controls(line);
     let clean = clean.trim();
     if clean.is_empty() {
         return Ok(None);
     }
 
-    // 整行以 #N: 开头时是 guest 回复，必须先于 author: text 解析。
+    // A leading #N: applies to the whole (possibly multiline) guest body and
+    // must be parsed before the optional author prefix.
     if let Some((reply_number, text)) = reply_prefix(clean)? {
         return Ok(Some(ParsedLine {
             author: "guest".into(),
@@ -457,9 +456,13 @@ fn normalize_line(line: &str) -> Result<Option<ParsedLine>, &'static str> {
             reply_number: Some(reply_number),
         }));
     }
-    if let Some((left, right)) = clean.split_once(':') {
-        let author = left.trim();
-        let text = right.trim();
+
+    // Only the first physical line may introduce an author. A colon in a later
+    // body line must not retroactively turn the preceding text into a name.
+    let first_line = clean.split_once('\n').map_or(clean, |(first, _)| first);
+    if let Some(colon) = first_line.find(':') {
+        let author = clean[..colon].trim();
+        let text = clean[colon + 1..].trim();
         if !author.is_empty() && !text.is_empty() {
             let reply = reply_prefix(text)?;
             return Ok(Some(ParsedLine {
@@ -548,11 +551,17 @@ fn validate_stored(c: &StoredComment) -> Result<()> {
     if !valid_target(&c.target) {
         bail!("invalid target");
     }
-    if c.author.is_empty() || c.author.len() > 32 || c.text.is_empty() || c.text.len() > 512 {
+    if c.author.is_empty()
+        || c.author.len() > 32
+        || c.text.is_empty()
+        || c.text.len() > MAX_COMMENT_BYTES
+    {
         bail!("invalid author/text length");
     }
-    if normalize_controls(&c.author) != c.author || normalize_controls(&c.text) != c.text {
-        bail!("author/text contains control characters");
+    if normalize_controls(&c.author) != c.author
+        || normalize_comment_controls(&c.text) != c.text
+    {
+        bail!("author/text contains unsupported control characters");
     }
     if c.ip_hash.len() != 64 || !c.ip_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("invalid ip_hash");
@@ -564,6 +573,12 @@ fn validate_stored(c: &StoredComment) -> Result<()> {
 fn normalize_controls(s: &str) -> String {
     s.chars()
         .filter(|c| !matches!(*c as u32, 0x00..=0x1f | 0x7f..=0x9f))
+        .collect()
+}
+
+fn normalize_comment_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c == '\n' || !matches!(*c as u32, 0x00..=0x1f | 0x7f..=0x9f))
         .collect()
 }
 
@@ -695,6 +710,22 @@ mod tests {
                 reply_number: None,
             }))
         );
+        assert_eq!(
+            normalize_line("first line\nsecond: still body"),
+            Ok(Some(ParsedLine {
+                author: "guest".into(),
+                text: "first line\nsecond: still body".into(),
+                reply_number: None,
+            }))
+        );
+        assert_eq!(
+            normalize_line("bob: #2: first line\nsecond line"),
+            Ok(Some(ParsedLine {
+                author: "bob".into(),
+                text: "first line\nsecond line".into(),
+                reply_number: Some(2),
+            }))
+        );
     }
 
     #[test]
@@ -704,7 +735,7 @@ mod tests {
         let r = s
             .submit(SubmitRequest {
                 target: "/blog/hello/".into(),
-                line: "alice: 好文".into(),
+                line: "alice: 好文\nsecond: still body".into(),
                 ip: "127.0.0.1".into(),
             })
             .unwrap();
@@ -733,7 +764,7 @@ mod tests {
         });
         assert_eq!(q.comments[0].number, 1);
         assert_eq!(q.comments[0].author, "alice");
-        assert_eq!(q.comments[0].text, "好文");
+        assert_eq!(q.comments[0].text, "好文\nsecond: still body");
     }
 
     #[test]

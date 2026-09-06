@@ -1,43 +1,54 @@
-# 欢迎来到 termblog
+# 欢迎来到 ~yzs 的 termblog
 
-这里既是博客首页，也是一个临时的 FreeBSD 终端。每次连接都会得到独立、短暂的环境。
+这里既是个人博客，也是一个真实、临时的 FreeBSD jail。你可以像使用普通终端一样阅读、
+浏览和留言；退出后，本次会话中创建的文件会被丢弃。
 
-## 阅读文章
+English version: `blog help-en.md`
 
-- `blog`：列出所有文章
-- `blog path/to/article`：按列表给出的 HOME 相对 article key 阅读文章
-- `blog ~/help.md`：再次打开这份首页说明和首页留言
-- `less ~/path/to/article.md`：查看未经排版的 Markdown 原文
-
-## 留言
-
-留言格式是 `名字: 内容`，例如：
+## 快速开始
 
 ```sh
-echo 'alice: 你好' > ~/comment
+blog                  # 列出文章
+blog help.md          # 阅读中文帮助
+blog help-en.md       # Read the English guide
+less ~/help.md        # 查看 Markdown 原文
+play                  # 列出终端录像
+play demo             # 播放本站演示
+cat /proc/stat        # 查看根目录的访问、访客和评论统计快照
+exit                  # 结束会话
 ```
 
-回复当前评论区里已经公开的第 1 条留言，可以写名字，也可以继续使用 `guest`：
+阅读文章时可用方向键、Page Up 和 Page Down 滚动，按 `q` 返回终端。播放录像时，
+按 Space 暂停或继续，暂停时按 `.` 单步播放，按 `q` 或 Ctrl-C 停止。
+
+## 留言与回复
+
+每次打开并写入当前目录的 `comment` FIFO，会提交一条留言：
 
 ```sh
-echo 'alice: #1: 我也这么觉得' > ~/comment
-echo '#1: guest 的回复' > ~/comment
+echo 'alice: hello' > ~/comment
+echo 'bob: #1: thanks for sharing' > ~/comment
 ```
 
-`#1` 是这个评论目录内显示给访客的局部编号，不是数据库编号；只能回复当前已公开、同一
-目录内的评论。回复还可以继续被回复。所有评论始终按局部编号线性显示，不因回复关系重排；
-回复提示会标出直接回复了谁。
+格式是 `名字: 内容`；省略名字时会显示为 `guest`。`#1` 是当前目录中已公开留言的局部
+编号，上面的第二条命令会回复第 1 条留言。也可以先编辑一个多行文件，再提交一次：
 
-提交成功只会提示“评论已投入待审队列”，不会泄露内部编号。当前会话的评论快照不会变化，
-审核通过后重新连接终端即可看到。
-
-评论目录由站点配置显式启用，不从目录名猜测。文章绑定了评论时，阅读器会在文末显示对应的投稿路径；同一 attachment 下的多篇文章共享评论。例如提示路径为 `~/path/to/comment` 时：
+```text
+bob: #1: How can I comment/reply with multiple lines?
+1. Write a file. 2. cat file > comment.
+```
 
 ```sh
-echo 'alice: 好文' > ~/path/to/comment
+cat reply.txt > ~/comment
 ```
 
-## 终端录像
+一次 `cat` 的完整内容只会成为一条留言，文件中的换行会原样保留。每条留言最多 512
+字节，提交后先进入审核队列；当前会话中的评论与统计都是启动时的快照，审核通过后请
+重新连接查看。
 
-- `play`：列出录像
-- `play path/to/demo`：按列表给出的 HOME 相对 key 播放录像（空格暂停，`q` 退出）
+## 图片
+
+同目录图片可以直接用相对路径插入文章。Web 镜像会显示原图；支持图片协议的终端也能
+内嵌显示，其他终端会显示一个可点击的占位框。
+
+![termblog 图片演示](demo.png)

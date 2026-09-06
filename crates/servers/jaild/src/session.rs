@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+#[cfg(target_os = "freebsd")]
+use std::os::fd::AsFd;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,7 +13,7 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use termblog_commentd::{Client as CommentClient, SubmitRequest};
+use termblog_commentd::{Client as CommentClient, SubmitRequest, MAX_COMMENT_BYTES};
 use termblog_core::{Control, SessionHandle};
 use termblog_statd::{RecordEvent, Source, MAX_BATCH_EVENTS};
 use tokio::io::unix::AsyncFd;
@@ -24,7 +26,6 @@ use crate::watcher::{ArticleRead, RunningArticleReads};
 const OUTPUT_CHUNKS: usize = 128;
 const COMMENT_QUEUE: usize = 16;
 const ACK_QUEUE: usize = 32;
-const MAX_COMMENT_LINE: usize = 512;
 const MAX_SESSION_COMMENTS: usize = 8;
 
 pub struct Quota {
@@ -159,10 +160,9 @@ async fn pump(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let accepted = Arc::new(AtomicUsize::new(0));
     let mut readers = Vec::new();
-    for (fifo, target) in fifos {
+    for fifo in fifos {
         readers.push(tokio::spawn(fifo_reader(
             fifo,
-            target,
             submit_tx.clone(),
             ack_tx.clone(),
             shutdown_rx.clone(),
@@ -329,44 +329,184 @@ async fn article_stats_worker(
     }
 }
 
-fn prepare_fifos(fifos: Vec<CommentFifo>) -> Result<Vec<(AsyncFd<OwnedFd>, String)>> {
+struct PreparedCommentFifo {
+    fifo: AsyncFd<OwnedFd>,
+    target: String,
+    closes: FifoCloseEvents,
+}
+
+#[cfg(target_os = "freebsd")]
+struct PollableKqueue(nix::sys::event::Kqueue);
+
+#[cfg(target_os = "freebsd")]
+impl AsRawFd for PollableKqueue {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_fd().as_raw_fd()
+    }
+}
+
+struct FifoCloseEvents {
+    #[cfg(target_os = "freebsd")]
+    queue: AsyncFd<PollableKqueue>,
+}
+
+impl FifoCloseEvents {
+    #[cfg(target_os = "freebsd")]
+    fn new(fd: &OwnedFd) -> Result<Self> {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue};
+        use tokio::io::Interest;
+
+        let queue = Kqueue::new()?;
+        fcntl(
+            queue.as_fd().as_raw_fd(),
+            FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC),
+        )?;
+        let change = KEvent::new(
+            fd.as_raw_fd() as usize,
+            EventFilter::EVFILT_VNODE,
+            EventFlag::EV_ADD | EventFlag::EV_ENABLE | EventFlag::EV_CLEAR | EventFlag::EV_RECEIPT,
+            FilterFlag::from_bits_retain(libc::NOTE_CLOSE_WRITE),
+            0,
+            0,
+        );
+        let mut receipt = [KEvent::new(
+            0,
+            EventFilter::EVFILT_VNODE,
+            EventFlag::empty(),
+            FilterFlag::empty(),
+            0,
+            0,
+        )];
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let received = queue.kevent(&[change], &mut receipt, Some(timeout))?;
+        if received != 1
+            || !receipt[0].flags().contains(EventFlag::EV_ERROR)
+            || receipt[0].data() != 0
+        {
+            bail!("kqueue rejected comment FIFO NOTE_CLOSE_WRITE registration");
+        }
+        Ok(Self {
+            queue: AsyncFd::with_interest(PollableKqueue(queue), Interest::READABLE)?,
+        })
+    }
+
+    #[cfg(not(target_os = "freebsd"))]
+    fn new(_fd: &OwnedFd) -> Result<Self> {
+        Ok(Self {})
+    }
+
+    #[cfg(target_os = "freebsd")]
+    async fn wait(&self) -> Result<()> {
+        use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent};
+
+        loop {
+            let mut ready = self.queue.readable().await?;
+            let mut event = [KEvent::new(
+                0,
+                EventFilter::EVFILT_VNODE,
+                EventFlag::empty(),
+                FilterFlag::empty(),
+                0,
+                0,
+            )];
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let received = self
+                .queue
+                .get_ref()
+                .0
+                .kevent(&[], &mut event, Some(timeout))?;
+            ready.clear_ready();
+            if received == 0 {
+                continue;
+            }
+            if event[0].flags().contains(EventFlag::EV_ERROR) {
+                bail!("comment FIFO vnode watcher failed: {}", event[0].data());
+            }
+            return Ok(());
+        }
+    }
+
+    #[cfg(not(target_os = "freebsd"))]
+    async fn wait(&self) -> Result<()> {
+        std::future::pending::<Result<()>>().await
+    }
+}
+
+fn prepare_fifos(fifos: Vec<CommentFifo>) -> Result<Vec<PreparedCommentFifo>> {
     fifos
         .into_iter()
-        .map(|f| Ok((AsyncFd::new(f.fd)?, f.target)))
+        .map(|f| {
+            let closes = FifoCloseEvents::new(&f.fd)?;
+            Ok(PreparedCommentFifo {
+                fifo: AsyncFd::new(f.fd)?,
+                target: f.target,
+                closes,
+            })
+        })
         .collect()
 }
 
 async fn fifo_reader(
-    fifo: AsyncFd<OwnedFd>,
-    target: String,
+    prepared: PreparedCommentFifo,
     tx: mpsc::Sender<Submission>,
     ack: mpsc::Sender<Bytes>,
     mut shutdown: watch::Receiver<bool>,
     accepted: Arc<AtomicUsize>,
 ) {
-    let mut line = Vec::with_capacity(MAX_COMMENT_LINE);
-    let mut discard = false;
+    let PreparedCommentFifo {
+        fifo,
+        target,
+        closes,
+    } = prepared;
+    // A normal echo/cat appends LF (or CRLF). Keep room for that terminator
+    // without reducing the documented 512-byte comment limit.
+    let mut payload = Vec::with_capacity(MAX_COMMENT_BYTES + 2);
+    let mut overflow = false;
     let mut buf = [0u8; 1024];
     loop {
         tokio::select! {
             ready = fifo.readable() => {
                 let mut guard = match ready { Ok(g) => g, Err(_) => break };
-                match nix::unistd::read(fifo.as_raw_fd(), &mut buf) {
-                    Ok(0) => guard.clear_ready(), // O_RDWR 主方案不应 EOF；清 readiness 防空转。
-                    Ok(n) => consume_fifo_bytes(&buf[..n], &target, &tx, &ack, &accepted, &mut line, &mut discard).await,
-                    Err(nix::errno::Errno::EAGAIN) => guard.clear_ready(),
-                    Err(_) => break,
+                if !drain_fifo(&fifo, &mut buf, &mut payload, &mut overflow) {
+                    break;
+                }
+                guard.clear_ready();
+            }
+            closed = closes.wait() => {
+                if closed.is_err()
+                    || !drain_fifo(&fifo, &mut buf, &mut payload, &mut overflow)
+                {
+                    break;
+                }
+                if !finalize_fifo_write(
+                    &target,
+                    &tx,
+                    &ack,
+                    &accepted,
+                    &mut payload,
+                    &mut overflow,
+                ).await {
+                    break;
                 }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    loop {
-                        match nix::unistd::read(fifo.as_raw_fd(), &mut buf) {
-                            Ok(0) | Err(nix::errno::Errno::EAGAIN) => break,
-                            Ok(n) => consume_fifo_bytes(&buf[..n], &target, &tx, &ack, &accepted, &mut line, &mut discard).await,
-                            Err(_) => break,
-                        }
-                    }
+                    let _ = drain_fifo(&fifo, &mut buf, &mut payload, &mut overflow);
+                    let _ = finalize_fifo_write(
+                        &target,
+                        &tx,
+                        &ack,
+                        &accepted,
+                        &mut payload,
+                        &mut overflow,
+                    ).await;
                     break;
                 }
             }
@@ -374,56 +514,86 @@ async fn fifo_reader(
     }
 }
 
-async fn consume_fifo_bytes(
-    bytes: &[u8],
+fn drain_fifo(
+    fifo: &AsyncFd<OwnedFd>,
+    buf: &mut [u8],
+    payload: &mut Vec<u8>,
+    overflow: &mut bool,
+) -> bool {
+    loop {
+        match nix::unistd::read(fifo.as_raw_fd(), buf) {
+            Ok(0) | Err(nix::errno::Errno::EAGAIN) => return true,
+            Ok(n) => buffer_fifo_bytes(&buf[..n], payload, overflow),
+            Err(_) => return false,
+        }
+    }
+}
+
+fn buffer_fifo_bytes(bytes: &[u8], payload: &mut Vec<u8>, overflow: &mut bool) {
+    if *overflow {
+        return;
+    }
+    let max_raw = MAX_COMMENT_BYTES + 2;
+    if payload
+        .len()
+        .checked_add(bytes.len())
+        .is_none_or(|len| len > max_raw)
+    {
+        payload.clear();
+        *overflow = true;
+    } else {
+        payload.extend_from_slice(bytes);
+    }
+}
+
+async fn finalize_fifo_write(
     target: &str,
     tx: &mpsc::Sender<Submission>,
     ack: &mpsc::Sender<Bytes>,
     accepted: &AtomicUsize,
-    line: &mut Vec<u8>,
-    discard: &mut bool,
-) {
-    for &byte in bytes {
-        if *discard {
-            if byte == b'\n' {
-                *discard = false;
-            }
-            continue;
-        }
-        if byte == b'\n' {
-            let raw = std::mem::take(line);
-            let text = match String::from_utf8(raw) {
-                Ok(s) => s,
-                Err(_) => {
-                    send_ack(ack, "Comment not submitted: input is not valid UTF-8").await;
-                    continue;
-                }
-            };
-            let slot = accepted.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < MAX_SESSION_COMMENTS).then_some(n + 1)
-            });
-            if slot.is_err() {
-                send_ack(ack, "Comment not submitted: maximum 8 comments per session").await;
-                continue;
-            }
-            if tx
-                .send(Submission {
-                    target: target.to_string(),
-                    line: text,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-        } else if line.len() == MAX_COMMENT_LINE {
-            line.clear();
-            *discard = true;
-            send_ack(ack, "Comment not submitted: line exceeds 512 bytes").await;
-        } else {
-            line.push(byte);
+    payload: &mut Vec<u8>,
+    overflow: &mut bool,
+) -> bool {
+    if std::mem::take(overflow) {
+        payload.clear();
+        send_ack(ack, "Comment not submitted: comment exceeds 512 bytes").await;
+        return true;
+    }
+    if payload.is_empty() {
+        return true;
+    }
+
+    let mut raw = std::mem::take(payload);
+    if raw.last() == Some(&b'\n') {
+        raw.pop();
+        if raw.last() == Some(&b'\r') {
+            raw.pop();
         }
     }
+    if raw.len() > MAX_COMMENT_BYTES {
+        send_ack(ack, "Comment not submitted: comment exceeds 512 bytes").await;
+        return true;
+    }
+    let text = match String::from_utf8(raw) {
+        Ok(text) => text,
+        Err(_) => {
+            send_ack(ack, "Comment not submitted: input is not valid UTF-8").await;
+            return true;
+        }
+    };
+    let slot = accepted.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        (n < MAX_SESSION_COMMENTS).then_some(n + 1)
+    });
+    if slot.is_err() {
+        send_ack(ack, "Comment not submitted: maximum 8 comments per session").await;
+        return true;
+    }
+    tx.send(Submission {
+        target: target.to_string(),
+        line: text,
+    })
+    .await
+    .is_ok()
 }
 
 async fn comment_worker(
@@ -477,37 +647,130 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn fifo_lines_are_strict_utf8_bounded_and_session_limited() {
+    async fn one_fifo_write_preserves_internal_newlines_and_is_bounded() {
         let (tx, mut rx) = mpsc::channel(16);
         let (ack, mut ack_rx) = mpsc::channel(16);
         let accepted = AtomicUsize::new(0);
-        let mut line = Vec::new();
-        let mut discard = false;
-        consume_fifo_bytes(
-            b"alice: ok\n",
+        let mut payload = Vec::new();
+        let mut overflow = false;
+
+        buffer_fifo_bytes(b"alice: first\nsecond\n", &mut payload, &mut overflow);
+        assert!(
+            finalize_fifo_write(
+                "/",
+                &tx,
+                &ack,
+                &accepted,
+                &mut payload,
+                &mut overflow,
+            )
+            .await
+        );
+        assert_eq!(rx.recv().await.unwrap().line, "alice: first\nsecond");
+        assert!(rx.try_recv().is_err());
+        assert!(ack_rx.try_recv().is_err());
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+
+        buffer_fifo_bytes(&[0xff, b'\n'], &mut payload, &mut overflow);
+        finalize_fifo_write(
             "/",
             &tx,
             &ack,
             &accepted,
-            &mut line,
-            &mut discard,
-        )
-        .await;
-        assert_eq!(rx.recv().await.unwrap().line, "alice: ok");
-        consume_fifo_bytes(
-            &[0xff, b'\n'],
-            "/",
-            &tx,
-            &ack,
-            &accepted,
-            &mut line,
-            &mut discard,
+            &mut payload,
+            &mut overflow,
         )
         .await;
         assert!(String::from_utf8_lossy(&ack_rx.recv().await.unwrap()).contains("UTF-8"));
-        let mut over = vec![b'x'; 513];
-        over.push(b'\n');
-        consume_fifo_bytes(&over, "/", &tx, &ack, &accepted, &mut line, &mut discard).await;
+
+        buffer_fifo_bytes(
+            &vec![b'x'; MAX_COMMENT_BYTES + 1],
+            &mut payload,
+            &mut overflow,
+        );
+        finalize_fifo_write(
+            "/",
+            &tx,
+            &ack,
+            &accepted,
+            &mut payload,
+            &mut overflow,
+        )
+        .await;
         assert!(String::from_utf8_lossy(&ack_rx.recv().await.unwrap()).contains("512"));
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[tokio::test]
+    async fn close_write_event_frames_each_cat_as_one_submission() {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comment");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let raw_fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        assert!(raw_fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let prepared = prepare_fifos(vec![CommentFifo {
+            fd,
+            target: "/".into(),
+        }])
+        .unwrap()
+        .pop()
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let (ack, _ack_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let reader = tokio::spawn(fifo_reader(
+            prepared,
+            tx,
+            ack,
+            shutdown_rx,
+            accepted.clone(),
+        ));
+
+        {
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            writer.write_all(b"bob: first\nsecond\n").unwrap();
+        }
+
+        let submission = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(submission.line, "bob: first\nsecond");
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "one cat invocation produced more than one submission"
+        );
+
+        {
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            writer.write_all(b"carol: separate write\n").unwrap();
+        }
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.line, "carol: separate write");
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+
+        shutdown_tx.send(true).unwrap();
+        reader.await.unwrap();
     }
 }

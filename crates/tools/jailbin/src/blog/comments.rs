@@ -112,7 +112,7 @@ fn load(path: &Path, target: &str) -> Result<Vec<SnapshotComment>, String> {
 }
 
 fn display_text(comment: &SnapshotComment) -> String {
-    let text = strip_controls(&comment.text);
+    let text = strip_comment_controls(&comment.text).replace('\n', "\n    ");
     match &comment.reply_to {
         Some(parent) => format!(
             "(In reply to {} from comment #{}):\n    {}",
@@ -140,6 +140,12 @@ fn valid_date10(s: &str) -> bool {
 fn strip_controls(s: &str) -> String {
     s.chars()
         .filter(|c| !matches!(*c as u32, 0x00..=0x1f | 0x7f..=0x9f))
+        .collect()
+}
+
+fn strip_comment_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c == '\n' || !matches!(*c as u32, 0x00..=0x1f | 0x7f..=0x9f))
         .collect()
 }
 
@@ -222,6 +228,20 @@ mod tests {
         assert_eq!(
             display_text(&nested_reply),
             "(In reply to bob from comment #3):\n    text 4"
+        );
+    }
+
+    #[test]
+    fn multiline_body_keeps_newlines_and_indents_every_line() {
+        let mut root = comment(1, "alice", None);
+        root.text = "first\nsecond".into();
+        assert_eq!(display_text(&root), "first\n    second");
+
+        let mut reply = comment(2, "bob", Some((1, "alice")));
+        reply.text = "reply first\nreply second".into();
+        assert_eq!(
+            display_text(&reply),
+            "(In reply to alice from comment #1):\n    reply first\n    reply second"
         );
     }
 

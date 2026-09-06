@@ -51,10 +51,19 @@ number=$(printf '%s\n' "$comment_json" | sed -n 's/.*"number":\([0-9][0-9]*\).*/
 [ -n "$number" ] || { echo "FAIL: API 缺少目录内局部编号"; exit 1; }
 
 reply_nonce="${nonce}-reply"
-printf 'verify-reply: #%s: %s\n' "$number" "$reply_nonce" > "$JAIL_ROOT/home/guest/comment"
+printf 'verify-reply: #%s: %s first line\n%s second line\n' \
+    "$number" "$reply_nonce" "$reply_nonce" > "$JAIL_ROOT/home/guest/comment"
 sleep 1
-reply_row=$(TERMBLOG_CONFIG="$CONFIG" "$COMMENTCTL" queue | grep "$reply_nonce" | tail -1)
-[ -n "$reply_row" ] || { echo "FAIL: 嵌套回复未进入 pending"; exit 1; }
+queue_output=$(TERMBLOG_CONFIG="$CONFIG" "$COMMENTCTL" queue)
+reply_count=$(printf '%s\n' "$queue_output" | grep -Fc "$reply_nonce" || true)
+[ "$reply_count" -eq 1 ] || {
+    echo "FAIL: 一次多行 FIFO 写入应只生成一条 pending，实际为 $reply_count"; exit 1;
+}
+reply_row=$(printf '%s\n' "$queue_output" | grep -F "$reply_nonce" | tail -1)
+[ -n "$reply_row" ] || { echo "FAIL: 多行嵌套回复未进入 pending"; exit 1; }
+printf '%s\n' "$reply_row" | grep -Fq "${reply_nonce} first line\\n${reply_nonce} second line" || {
+    echo "FAIL: commentctl queue 未在单行中保留多行正文"; exit 1;
+}
 printf '%s\n' "$reply_row" | awk -F '\t' -v parent="$id" '
     $5 == "reply_to=#" parent { found=1 }
     END { exit found ? 0 : 1 }
@@ -67,8 +76,10 @@ reply_json=$(printf '%s\n' "$reply_api" | sed 's/},{/}\
 {/g' | grep -F "$reply_nonce" | tail -1)
 printf '%s\n' "$reply_json" | grep -Fq '"reply_to":{' &&
     printf '%s\n' "$reply_json" | grep -Fq "\"number\":$number" &&
-    printf '%s\n' "$reply_json" | grep -Fq '"author":"verify"' || {
-    echo "FAIL: API 回复摘要不是局部编号/父作者"; exit 1;
+    printf '%s\n' "$reply_json" | grep -Fq '"author":"verify"' &&
+    printf '%s\n' "$reply_json" |
+        grep -Fq "${reply_nonce} first line\\n${reply_nonce} second line" || {
+    echo "FAIL: API 未保留多行正文或回复摘要不正确"; exit 1;
 }
 
 # 当前会话保留创建时快照；审核后的评论由新会话在启动 barrier 中取得。
@@ -77,4 +88,4 @@ snapshot="$JAIL_ROOT/var/run/termblog/comments.jsonl"
 if grep -Eq '"(id|reply_to_id)"[[:space:]]*:' "$snapshot"; then
     echo "FAIL: guest 快照泄露数据库全局 ID"; exit 1
 fi
-echo "OK: FIFO -> queue -> approve -> nested reply -> local-number API；终端评论需新建会话后查看"
+echo "OK: multiline FIFO -> one queue row -> approve -> nested reply -> local-number API；终端评论需新建会话后查看"

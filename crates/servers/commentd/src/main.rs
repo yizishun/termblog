@@ -137,7 +137,12 @@ async fn queue(client: &Client, args: &[String]) -> Result<()> {
                     .map_or_else(|| "root".to_string(), |id| format!("reply_to=#{id}"));
                 println!(
                     "#{}\t{}\t{}\t{}\t{}\t{}",
-                    c.id, c.target, c.author, c.created_at, reply, c.text
+                    c.id,
+                    c.target,
+                    c.author,
+                    c.created_at,
+                    reply,
+                    escape_tsv(&c.text)
                 );
             }
             break;
@@ -145,6 +150,10 @@ async fn queue(client: &Client, args: &[String]) -> Result<()> {
         cursor = res.next_after_id.context("has_more missing next_after_id")?;
     }
     Ok(())
+}
+
+fn escape_tsv(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
 async fn queue_revision(client: &Client) -> Result<String> {
@@ -193,4 +202,17 @@ fn take_option(args: &mut Vec<String>, name: &str) -> Result<Option<String>> {
     let value = args.remove(pos + 1);
     args.remove(pos);
     Ok(Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_escapes_multiline_text_into_one_tsv_row() {
+        assert_eq!(
+            escape_tsv("first\nsecond\\literal"),
+            "first\\nsecond\\\\literal"
+        );
+    }
 }
