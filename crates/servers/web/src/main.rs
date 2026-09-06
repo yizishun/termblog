@@ -31,7 +31,7 @@ use termblog_core::{Control, SessionClient};
 use termblog_proto as proto;
 use tower_http::services::ServeDir;
 
-use sessions::{CloseReason, SessionStore};
+use sessions::{CloseReason, OutItem, SessionStore};
 
 #[derive(Clone)]
 struct AppState {
@@ -277,7 +277,10 @@ async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {
                 }
                 msg = output.recv() => {
                     let frame = match msg {
-                        Some(bytes) => proto::Frame::data(bytes),
+                        Some(item) => match item {
+                            OutItem::Data(bytes) => proto::Frame::data(bytes),
+                            OutItem::ReplayEnd => proto::Frame::replay_end(),
+                        },
                         None => {
                             // 会话已终结(shell 退出 / 宽限期耗尽被回收), 告知前端后收尾
                             proto::Frame::json(proto::CLOSED, &proto::Closed { reason: "exit".into() })

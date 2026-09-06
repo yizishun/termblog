@@ -76,8 +76,17 @@ impl CloseReason {
 /// 转发 task 维护的唯一活跃 WS 连接。
 struct Subscriber {
     id: u64,
-    queue: mpsc::Sender<Bytes>,
+    queue: mpsc::Sender<OutItem>,
     close: oneshot::Sender<CloseReason>,
+}
+
+/// 输出队列条目: 裸 PTY 字节或回放结束标记。
+/// ReplayEnd 必须在「回放块之后、实时输出之前」进入同一队列, 前端据此在
+/// Opened 与 ReplayEnd 之间关闭 xterm stdin(回放里的终端查询不能触发回答上行)。
+#[derive(Debug, PartialEq, Eq)]
+pub enum OutItem {
+    Data(Bytes),
+    ReplayEnd,
 }
 
 /// web 侧持有的会话: 句柄通道端 + 转发 task 命令通道 + 当前 owner
@@ -100,7 +109,7 @@ pub struct Connection {
     pub attached: bool,
     pub input: mpsc::Sender<Bytes>,
     pub control: mpsc::Sender<Control>,
-    pub output: mpsc::Receiver<Bytes>,
+    pub output: mpsc::Receiver<OutItem>,
     /// 新 attach 接管或慢消费者时, forward task 通知 WS 写循环关闭。
     pub close_rx: oneshot::Receiver<CloseReason>,
 }
@@ -276,6 +285,16 @@ async fn forward_output(
     let mut active = Some(initial);
     let mut scrollback: Vec<u8> = Vec::new();
 
+    // 新会话没有 scrollback 回放, 但 ReplayEnd 仍必须先于实时输出入队:
+    // 前端在 Opened 后禁用了 xterm stdin, 没有这帧就永远不恢复。
+    // 队列容量 128, 此时必为空, 发送不会失败; 失败只可能是连接已死, 直接返回。
+    if let Some(first) = &active {
+        if first.queue.send(OutItem::ReplayEnd).await.is_err() {
+            table.lock().unwrap().remove(&token);
+            return;
+        }
+    }
+
     loop {
         tokio::select! {
             // 回放期间不会处理实时输出, 因此回放与后续输出不重不漏。
@@ -286,7 +305,7 @@ async fn forward_output(
                         // 回放 ≤32 条 < 队列容量 128, 新队列必为空。
                         if subscriber
                             .queue
-                            .send(Bytes::copy_from_slice(chunk))
+                            .send(OutItem::Data(Bytes::copy_from_slice(chunk)))
                             .await
                             .is_err()
                         {
@@ -294,6 +313,9 @@ async fn forward_output(
                             break;
                         }
                     }
+                    // 无论回放是否完整, ReplayEnd 都必须入队(且排在实时输出之前):
+                    // 前端只在收到它之后恢复 stdin, 缺失会让终端输入永久禁用。
+                    let _ = subscriber.queue.send(OutItem::ReplayEnd).await;
                     if !replayed {
                         let _ = reply.send(false);
                         continue;
@@ -330,7 +352,7 @@ async fn forward_output(
                         scrollback.drain(..excess);
                     }
                     if let Some(s) = active.take() {
-                        match s.queue.try_send(b) {
+                        match s.queue.try_send(OutItem::Data(b)) {
                             Ok(()) => active = Some(s),
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 tracing::warn!(
@@ -416,27 +438,40 @@ mod tests {
             },
         ));
 
+        // 新会话的 initial subscriber 先收到 ReplayEnd, 之后才是实时输出
+        assert_eq!(
+            old_output.recv().await.unwrap(),
+            OutItem::ReplayEnd,
+            "新会话必须先发 ReplayEnd(空回放)"
+        );
         pty_output
             .send(Bytes::from_static(b"before"))
             .await
             .unwrap();
         assert_eq!(
             old_output.recv().await.unwrap(),
-            Bytes::from_static(b"before")
+            OutItem::Data(Bytes::from_static(b"before"))
         );
 
         let mut new = store.attach(&token).await.expect("attach 应成功");
         assert!(matches!(old_close_rx.await, Ok(CloseReason::Replaced)));
         assert_eq!(
             new.output.recv().await.unwrap(),
-            Bytes::from_static(b"before")
+            OutItem::Data(Bytes::from_static(b"before")),
+            "attach 先回放 scrollback"
+        );
+        assert_eq!(
+            new.output.recv().await.unwrap(),
+            OutItem::ReplayEnd,
+            "回放块之后必须紧跟 ReplayEnd"
         );
         assert!(old_output.recv().await.is_none(), "旧连接的输出队列应关闭");
 
         pty_output.send(Bytes::from_static(b"after")).await.unwrap();
         assert_eq!(
             new.output.recv().await.unwrap(),
-            Bytes::from_static(b"after")
+            OutItem::Data(Bytes::from_static(b"after")),
+            "ReplayEnd 之后的实时输出仍照常送达"
         );
 
         // 被接管连接的迟到 detach 不能让当前会话进入宽限期。
@@ -455,6 +490,91 @@ mod tests {
             assert_eq!(session.owner, None);
             session.idle_timer.take().unwrap().abort();
         }
+
+        drop(pty_output);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_replay_still_attempts_replay_end_and_keeps_session() {
+        let store = SessionStore::new(SessionClient::new("/unused"));
+        let token = "test-token".to_string();
+        let old_id = next_conn_id();
+
+        let (input, _input_rx) = mpsc::channel(1);
+        let (control, _control_rx) = mpsc::channel(1);
+        let (commands, command_rx) = mpsc::channel(8);
+        let (pty_output, output_rx) = mpsc::channel(8);
+        let (old_queue, mut old_output) = mpsc::channel(8);
+        let (old_close, _old_close_rx) = oneshot::channel();
+
+        store.table.lock().unwrap().insert(
+            token.clone(),
+            WebSession {
+                sid: "sid".into(),
+                input,
+                control,
+                fwd_cmd: commands.clone(),
+                owner: Some(old_id),
+                idle_timer: None,
+            },
+        );
+        let task = tokio::spawn(forward_output(
+            store.table.clone(),
+            token.clone(),
+            "sid".into(),
+            output_rx,
+            command_rx,
+            Subscriber {
+                id: old_id,
+                queue: old_queue,
+                close: old_close,
+            },
+        ));
+
+        // 新会话的 ReplayEnd 先行; 然后积累一段 scrollback
+        assert_eq!(old_output.recv().await.unwrap(), OutItem::ReplayEnd);
+        pty_output
+            .send(Bytes::from_static(b"history"))
+            .await
+            .unwrap();
+        assert_eq!(
+            old_output.recv().await.unwrap(),
+            OutItem::Data(Bytes::from_static(b"history"))
+        );
+
+        // 新订阅者的接收端立刻 drop → 回放中途失败: reply=false, 会话不因此终结
+        let (dead_queue, dead_rx) = mpsc::channel(8);
+        drop(dead_rx);
+        let (dead_close, _) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands
+            .send(FwdCmd::Attach {
+                id: next_conn_id(),
+                subscriber: Subscriber {
+                    id: next_conn_id(),
+                    queue: dead_queue,
+                    close: dead_close,
+                },
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            false,
+            "回放失败必须如实上报(attach 转开新会话)"
+        );
+
+        // 会话仍存活, 旧连接继续收实时输出
+        pty_output
+            .send(Bytes::from_static(b"still-alive"))
+            .await
+            .unwrap();
+        assert_eq!(
+            old_output.recv().await.unwrap(),
+            OutItem::Data(Bytes::from_static(b"still-alive"))
+        );
 
         drop(pty_output);
         task.await.unwrap();

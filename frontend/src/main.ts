@@ -11,6 +11,7 @@ const T_DATA = 0x02;
 const T_RESIZE = 0x03;
 const T_OPENED = 0x04;
 const T_CLOSED = 0x05;
+const T_REPLAY_END = 0x06;
 
 const textEnc = new TextEncoder();
 const textDec = new TextDecoder();
@@ -144,6 +145,24 @@ term.loadAddon(new WebLinksAddon((_event, uri) => confirmOpenLink(uri)));
 const TOKEN_KEY = "termblog.attach_token";
 let ws: WebSocket | undefined;
 
+// ── 回放窗口: attach 会话在 Opened(attached=true)与 ReplayEnd 之间禁用 xterm stdin ──
+// 服务端 attach 时会把原始 scrollback(128 KiB)原样回放给全新 xterm 实例。
+// 历史里可能有终端查询(如 vim 启动时的 CSI 6n / DA / OSC 10;?): xterm.js 会把
+// 它们当实时指令执行并生成回答, 而 onData 会把回答上行进 PTY, 落进 zsh 编辑行
+// 变成乱码。disableStdin 能让 triggerDataEvent 整体静默(渲染不受影响), 等
+// ReplayEnd 且所有回放 write 的解析完成后才恢复, 实时输出里的查询不受影响。
+// 计数口径只含 ReplayEnd 之前收到的帧: 协议保证回放块全部先于 ReplayEnd 按序
+// 送达, 之后的实时帧不进计数, 否则它们会把禁用窗口顺延(窗口内的实时查询
+// 与用户按键会被吞掉)。fresh 会话没有回放, 不进这个窗口(不依赖 ReplayEnd 帧)。
+let replayPending = 0; // 尚未解析完的回放 write 数(仅统计 ReplayEnd 之前的帧)
+let replayEndSeen = false; // 是否已收到 ReplayEnd 帧
+
+function finishReplayIfReady() {
+  if (replayEndSeen && replayPending <= 0) {
+    term.options.disableStdin = false;
+  }
+}
+
 function send(buf: ArrayBuffer) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(buf);
 }
@@ -218,7 +237,18 @@ function connect() {
     const payload = b.subarray(5);
     switch (b[0]) {
       case T_DATA:
-        term.write(payload); // 裸 PTY 字节, ANSI 原样上屏
+        // 只统计 ReplayEnd 之前收到的帧(即回放块): write 的 callback 在该块被
+        // 解析器完整消费后触发, 保证 ReplayEnd 到达时所有回放块都已解析完、
+        // 不会有查询回答漏出。ReplayEnd 之后的实时帧不计数, 不延长禁用窗口。
+        if (!replayEndSeen) {
+          replayPending += 1;
+          term.write(payload, () => {
+            replayPending -= 1;
+            finishReplayIfReady();
+          }); // 裸 PTY 字节, ANSI 原样上屏
+        } else {
+          term.write(payload);
+        }
         if (autoArmed && !autoSent) {
           // 自动命令推迟到 zsh 已开始输出(MOTD/提示符已在画)之后才发:
           // 早发的字节会被 tty 驱动立刻回显在屏幕顶部(那时提示符还不存在),
@@ -231,6 +261,12 @@ function connect() {
         break;
       case T_OPENED: {
         const opened = JSON.parse(textDec.decode(payload));
+        // 只有 attach 才有 scrollback 回放: 仅此时禁用 stdin, 回放里的终端查询
+        // 不能再触发 xterm.js 回答上行(污染 shell 编辑行); ReplayEnd 会恢复。
+        // fresh 会话(镜像页/新 token)无回放, stdin 从一开始就可用, 不依赖新帧。
+        if (opened.attached) term.options.disableStdin = true;
+        replayPending = 0;
+        replayEndSeen = false;
         // 恢复的会话: 屏幕清干净, 由 SIGWINCH 触发前台程序重绘; 新会话本来就是新画面
         term.reset();
         sessionStorage.setItem(TOKEN_KEY, opened.attach_token);
@@ -243,7 +279,13 @@ function connect() {
         armFallback(); // 5s 兜底(§9.2 末)
         break;
       }
+      case T_REPLAY_END:
+        replayEndSeen = true;
+        finishReplayIfReady();
+        break;
       case T_CLOSED: {
+        // 兜底: 无论何种原因会话结束, 都要恢复 stdin, 防止协议异常时终端变砖
+        term.options.disableStdin = false;
         let reason = textDec.decode(payload);
         try {
           reason = JSON.parse(reason).reason;
@@ -257,6 +299,7 @@ function connect() {
   };
 
   socket.onclose = () => {
+    term.options.disableStdin = false; // 断线兜底, 同上
     term.write("\r\n\x1b[90m[Connection closed, refresh page to reconnect]\x1b[0m\r\n");
     if (onMirror && !takeoverDone) revealStaticFallback();
   };

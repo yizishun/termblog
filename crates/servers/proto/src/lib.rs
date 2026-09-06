@@ -16,6 +16,11 @@ pub const DATA: u8 = 0x02; // <-> 裸字节  键入 / PTY 输出
 pub const RESIZE: u8 = 0x03; // -> Resize  窗口变化
 pub const OPENED: u8 = 0x04; // <- Opened  会话已建立
 pub const CLOSED: u8 = 0x05; // <- Closed  会话结束(含配额拒绝等原因)
+/// <- 空 payload: scrollback 回放(若有)已全部入队, 其后的 DATA 均为实时输出。
+/// 前端在 Opened 与 ReplayEnd 之间禁用 xterm stdin, 防止回放里的终端查询
+/// (CSI 6n / DA / OSC 10;? 等)触发 xterm.js 回答并上行污染 shell 编辑行。
+/// 无论 attach 还是新开会话都必须发送(新会话回放为空, 紧随 Opened)。
+pub const REPLAY_END: u8 = 0x06;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Open {
@@ -72,6 +77,11 @@ impl Frame {
     /// 构造一个 Data 帧(裸字节)
     pub fn data(b: impl Into<Bytes>) -> Self {
         Self { kind: DATA, payload: b.into() }
+    }
+
+    /// 构造一个 ReplayEnd 帧(空 payload, 无 JSON)
+    pub fn replay_end() -> Self {
+        Self { kind: REPLAY_END, payload: Bytes::new() }
     }
 
     /// 构造一个 JSON 控制帧
@@ -161,6 +171,14 @@ mod tests {
         let f = Frame::data(vec![1u8, 2, 3, 4, 5]);
         let got = decode_one(&encode(&f)).expect("frame");
         assert_eq!(&got.payload[..], &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn replay_end_roundtrip() {
+        let f = Frame::replay_end();
+        let got = decode_one(&encode(&f)).expect("frame");
+        assert_eq!(got.kind, REPLAY_END);
+        assert!(got.payload.is_empty());
     }
 
     #[test]
