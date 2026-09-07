@@ -1,8 +1,9 @@
 #!/bin/sh
 # verify-m5.sh —— M5 验收(非 root, 需生产实例在跑; root 项标 [root])
-BASE=${1:-http://127.0.0.1:8080}
+BASE=${1:-http://127.0.0.1}
 CONTENT=${CONTENT:-jailtpl/content}
-SSH="ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+# termblog-ssh 端口(生产=22; 老式 2222 部署: TERMBLOG_SSH_PORT=2222)
+SSH="ssh -p ${TERMBLOG_SSH_PORT:-22} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
      -o PreferredAuthentications=none -o LogLevel=ERROR blog@127.0.0.1"
 pass=0; fail=0
 check() { if [ "$1" -eq 0 ]; then echo "✅ $2"; pass=$((pass+1)); else echo "❌ $2"; fail=$((fail+1)); fi }

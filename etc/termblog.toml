@@ -2,22 +2,25 @@
 
 [web]
 # 生产直连公网; 后续想挂反代/Anubis 时改回 127.0.0.1:8080
-listen = "0.0.0.0:8080"
+# 80 是特权端口, www 用户直绑需 mac_portacl 放行 uid:80:tcp:80
+# (完整步骤见 docs/deploy-aliyun-freebsd.md 阶段 6.5)
+listen = "0.0.0.0:80"
 static_dir = "/usr/local/share/termblog/frontend"
 # 站点对外绝对地址(不带尾斜杠)。canonical/sitemap/atom/OG 用;不设则镜像页
 # 照常生成, 只是不产出 sitemap/atom 与 canonical(部署后务必设置!)
-site_url = "http://192.168.0.100:8080"
+site_url = "http://www.yizishun.com"
 # 站点标题: 镜像页 <title> / og:site_name / atom feed 标题用
 site_title = "~yzs"
 
 [ssh]
-# 降权 www 跑不了特权端口 22, 生产用 2222
-listen = "0.0.0.0:2222"
+# 22 为特权端口: www 直绑需 mac_portacl 放行 uid:80:tcp:22(保留段上界须≤21),
+# 系统 sshd 已迁至 2222。详见 docs/deploy-aliyun-freebsd.md 阶段 6.5/6.6
+listen = "0.0.0.0:22"
 user = "blog"
 host_key = "/var/db/termblog/ssh_host_ed25519"
 
 [session]
-max_total = 64
+max_total = 16
 max_per_ip = 3
 # M4 落地(先占位)
 hard_lifetime_secs = 7200

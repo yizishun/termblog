@@ -6,7 +6,7 @@
 ## 两种入口, 一个源头
 
 - 网页：从全站文章列表打开本文，几秒后由真实终端接管
-- SSH：`ssh -p 2222 blog@<host>`，然后使用列表显示的 article key 阅读
+- SSH：`ssh blog@<host>`，然后使用列表显示的 article key 阅读
 
 > 文章本体只存在于 `jailtpl/content/` 内容树中，其余都是编译产物。
 

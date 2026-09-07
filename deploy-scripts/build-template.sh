@@ -1,19 +1,24 @@
 #!/bin/sh
 # deploy-scripts/build-template.sh —— 构建 zroot/jails/template@release
 #
-# 生成一个只读的 jail 模板数据集: FreeBSD base + zsh + 常用工具 + guest 用户
-# + 定制 zshrc + 博客内容 + jailbin 命令(blog/webctl 为其符号链接),
-# 最后打 snapshot 并设 readonly=on。jaild 的 JailBackend 用它做 ZFS clone
-# 秒开每访客一个的会话 jail。
+# 分两层构建:
+#   template-base@prepared: FreeBSD base + pkg + zsh/less/tree，只在首次或
+#                           --refresh-base 时联网构建。
+#   template@release:      从 prepared 本地 clone，再加 guest、zshrc、博客内容
+#                           和 jailbin。常规 --replace 不再下载 base/pkg。
+# 最终模板设 readonly=on；jaild 用它做 ZFS clone，秒开每访客一个会话 jail。
 #
-# 用法(需要 root, 需要网络):
+# 用法(需要 root; 只有首次/--refresh-base 需要网络):
 #   sh deploy-scripts/build-template.sh [base.txz 的 URL]
-#       首次构建; 模板已存在则拒绝(防覆盖在跑会话的模板)
+#       首次准备 base 并构建模板; 模板已存在则拒绝
 #   sh deploy-scripts/build-template.sh --replace [base.txz 的 URL]
-#       零停机换模板(内容更新用): 构建到旁路名 template.new 再换名上场,
+#       从本地 prepared base 零停机换模板(内容更新用)。
+#   sh deploy-scripts/build-template.sh --refresh-base [base.txz 的 URL]
+#       显式联网重建 prepared base，并零停机替换当前模板。
+# 模板替换构建到旁路名 template.new 再换名上场,
 #       全程不停服、不杀会话。旧会话继续用旧模板(内容旧), 新会话取新模板
 #       (内容新); 旧模板被旧会话的 clone pin 住, 全部退出后回收。
-# 默认拉 download.freebsd.org 上 CURRENT 快照的 base.txz。
+# 默认使用与宿主同版本的 RELEASE base.txz，持久缓存在 /var/cache/termblog。
 #
 # 构建输入(jailbin 二进制 + 内容产物 .rendered)由本脚本自建(以 yzs 编译,
 # 不依赖 Makefile)。
@@ -21,11 +26,34 @@
 set -eu
 
 REPLACE=0
-[ "${1:-}" = "--replace" ] && { REPLACE=1; shift; }
+REFRESH_BASE=0
+BASE_TXZ_ARG=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --replace) REPLACE=1 ;;
+        --refresh-base) REFRESH_BASE=1 ;;
+        --*) echo "unknown option: $1"; exit 64 ;;
+        *)
+            [ -z "$BASE_TXZ_ARG" ] || { echo "only one base.txz URL may be specified"; exit 64; }
+            BASE_TXZ_ARG=$1
+            ;;
+    esac
+    shift
+done
 
 DATASET=zroot/jails/template
 MOUNT=/jails/template
-BASE_TXZ_URL="${1:-https://download.freebsd.org/snapshots/amd64/16.0-CURRENT/base.txz}"
+BASE_DATASET=zroot/jails/template-base
+BASE_SNAPSHOT="$BASE_DATASET@prepared"
+BASE_MOUNT=/jails/template-base
+HOST_RELEASE=$(freebsd-version -u 2>/dev/null || uname -r)
+HOST_RELEASE=${HOST_RELEASE%%-p*}
+PLATFORM=$(uname -m)
+MACHINE=$(uname -p)
+BASE_TXZ_URL="${BASE_TXZ_ARG:-https://download.freebsd.org/releases/$PLATFORM/$MACHINE/$HOST_RELEASE/base.txz}"
+BASE_CACHE_DIR=/var/cache/termblog
+BASE_TXZ_CACHE="$BASE_CACHE_DIR/base.txz"
+BASE_URL_CACHE="$BASE_CACHE_DIR/base.txz.url"
 GUEST=guest
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 REPO=$(dirname "$SCRIPT_DIR")
@@ -33,6 +61,108 @@ BUILD_USER=yzs
 
 [ "$(id -u)" -eq 0 ] || { echo "root required (zfs/mount/pw)"; exit 1; }
 command -v zfs >/dev/null || { echo "ZFS required"; exit 1; }
+
+CLEANUP_BASE_DS=
+CLEANUP_BASE_MOUNT=
+CACHE_TMP="$BASE_TXZ_CACHE.new.$$"
+CACHE_URL_TMP="$BASE_URL_CACHE.new.$$"
+cleanup_on_exit() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    rm -f "$CACHE_TMP" "$CACHE_URL_TMP"
+    if [ -n "$CLEANUP_BASE_DS" ]; then
+        [ -z "$CLEANUP_BASE_MOUNT" ] || umount -f "$CLEANUP_BASE_MOUNT/dev" 2>/dev/null || true
+        zfs destroy -r "$CLEANUP_BASE_DS" 2>/dev/null || true
+    fi
+    exit "$status"
+}
+trap cleanup_on_exit EXIT HUP INT TERM
+
+ensure_base_archive() {
+    install -d -m 755 "$BASE_CACHE_DIR"
+    cached_url=
+    [ ! -f "$BASE_URL_CACHE" ] || cached_url=$(cat "$BASE_URL_CACHE")
+    if [ ! -f "$BASE_TXZ_CACHE" ] || [ "$cached_url" != "$BASE_TXZ_URL" ]; then
+        echo ">> Downloading base.txz once: $BASE_TXZ_URL"
+        fetch -o "$CACHE_TMP" "$BASE_TXZ_URL"
+        chmod 644 "$CACHE_TMP"
+        printf '%s\n' "$BASE_TXZ_URL" > "$CACHE_URL_TMP"
+        mv "$CACHE_TMP" "$BASE_TXZ_CACHE"
+        mv "$CACHE_URL_TMP" "$BASE_URL_CACHE"
+    else
+        echo ">> Reusing cached base.txz: $BASE_TXZ_CACHE"
+    fi
+}
+
+prepare_base() {
+    base_ds=$1
+    base_mount=$2
+    CLEANUP_BASE_DS=$base_ds
+    CLEANUP_BASE_MOUNT=$base_mount
+
+    zfs create -o mountpoint="$base_mount" -o org.termblog:base-url="$BASE_TXZ_URL" "$base_ds"
+    ensure_base_archive
+    echo ">> Extracting prepared base -> $base_mount"
+    tar -xf "$BASE_TXZ_CACHE" -C "$base_mount"
+    rm -rf "$base_mount/boot"
+
+    mkdir -p "$base_mount/dev"
+    mount -t devfs devfs "$base_mount/dev"
+    cp /etc/resolv.conf "$base_mount/etc/resolv.conf"
+    echo ">> Bootstrapping pkg and installing zsh/less/tree (prepared base only)"
+    pkg -c "$base_mount" bootstrap -y
+    pkg -c "$base_mount" install -y zsh less tree
+    umount -f "$base_mount/dev"
+    rm -f "$base_mount/etc/resolv.conf"
+
+    zfs snapshot "$base_ds@prepared"
+    zfs set readonly=on "$base_ds"
+    zfs set mountpoint=none "$base_ds"
+    CLEANUP_BASE_DS=
+    CLEANUP_BASE_MOUNT=
+}
+
+zfs list -H -o name zroot/jails >/dev/null 2>&1 || zfs create -o mountpoint=none zroot/jails
+
+# 先拒绝误用，避免在明知不会替换现有模板时才去准备 base。
+if [ "$REPLACE" -eq 0 ] && [ "$REFRESH_BASE" -eq 0 ] \
+    && zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
+    echo "template dataset already exists: $DATASET (add --replace to rebuild it)"
+    exit 1
+fi
+
+# prepared base 用旁路数据集构建：失败不会破坏现有 base/template。
+if [ "$REFRESH_BASE" -eq 1 ] || ! zfs list -H -o name "$BASE_SNAPSHOT" >/dev/null 2>&1; then
+    if [ "$REFRESH_BASE" -eq 0 ] && zfs list -H -o name "$BASE_DATASET" >/dev/null 2>&1; then
+        echo "prepared base dataset exists but $BASE_SNAPSHOT is missing; refusing to overwrite it"
+        exit 1
+    fi
+    zfs destroy -r "$BASE_DATASET.new" 2>/dev/null || true
+    prepare_base "$BASE_DATASET.new" "$BASE_MOUNT.new"
+
+    previous_base=
+    if zfs list -H -o name "$BASE_DATASET" >/dev/null 2>&1; then
+        previous_base="$BASE_DATASET.old-$(date +%s)-$$"
+        zfs rename "$BASE_DATASET" "$previous_base"
+    fi
+    if ! zfs rename "$BASE_DATASET.new" "$BASE_DATASET"; then
+        [ -z "$previous_base" ] || zfs rename "$previous_base" "$BASE_DATASET" 2>/dev/null || true
+        exit 1
+    fi
+    echo ">> Prepared base ready: $BASE_SNAPSHOT"
+    # 更新 base 时同步换掉旧 template；旧会话仍由 template.old* 承载。
+    if [ "$REFRESH_BASE" -eq 1 ] && zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
+        REPLACE=1
+    fi
+else
+    prepared_url=$(zfs get -H -o value org.termblog:base-url "$BASE_DATASET" 2>/dev/null || true)
+    if [ -n "$prepared_url" ] && [ "$prepared_url" != "-" ] && [ "$prepared_url" != "$BASE_TXZ_URL" ]; then
+        echo "prepared base uses a different URL: $prepared_url"
+        echo "re-run with --refresh-base to change it to: $BASE_TXZ_URL"
+        exit 1
+    fi
+    echo ">> Reusing prepared base: $BASE_SNAPSHOT (no base/pkg download)"
+fi
 
 # 0. 自包含前置(以 yzs 编译, 不依赖 Makefile): 模板要装的 jailbin 与内容
 #    产物(.rendered)必须存在; content-build 还要读 frontend/dist 的入口资产。
@@ -55,33 +185,15 @@ else
     BUILD_DS="$DATASET"
     BUILD_MOUNT="$MOUNT"
 fi
-zfs list -H -o name zroot/jails >/dev/null 2>&1 || zfs create -o mountpoint=none zroot/jails
-zfs create -o mountpoint="$BUILD_MOUNT" "$BUILD_DS"
+echo ">> Cloning local prepared base -> $BUILD_DS"
+zfs clone -o readonly=off -o mountpoint="$BUILD_MOUNT" "$BASE_SNAPSHOT" "$BUILD_DS"
+zfs mount "$BUILD_DS" 2>/dev/null || true
+[ -d "$BUILD_MOUNT" ] || { echo "prepared template clone did not mount at $BUILD_MOUNT"; exit 1; }
 
-# 2. base.txz(FreeBSD base 全量; /boot 对 jail 无用, 解完删掉)
-if [ ! -f /tmp/termblog-base.txz ]; then
-    echo ">> Downloading base.txz: $BASE_TXZ_URL"
-    fetch -o /tmp/termblog-base.txz "$BASE_TXZ_URL"
-fi
-echo ">> Extracting base.txz -> $BUILD_MOUNT"
-tar -xf /tmp/termblog-base.txz -C "$BUILD_MOUNT"
-rm -rf "$BUILD_MOUNT/boot"
-
-# 3. devfs(供 pkg chroot 安装使用, 规则集 0 仅构建期可用, 会话 jail 用规则集 4)
-mount -t devfs devfs "$BUILD_MOUNT/dev"
-
-# 4. DNS(pkg 拉包用)
-cp /etc/resolv.conf "$BUILD_MOUNT/etc/resolv.conf"
-
-# 5. pkg + 软件(zsh 是登录 shell; less/tree 是访客常用工具; less 供 blog 分页)
-echo ">> Installing zsh and common tools"
-pkg -c "$BUILD_MOUNT" bootstrap -y
-pkg -c "$BUILD_MOUNT" install -y zsh less tree
-
-# 6. guest 用户(会话 jail 里降权运行; uid 1001 避开 base 自带用户)
+# 2. guest 用户(会话 jail 里降权运行; uid 1001 避开 base 自带用户)
 pw -R "$BUILD_MOUNT" useradd -n "$GUEST" -u 1001 -d "/home/$GUEST" -s /usr/local/bin/zsh -m
 
-# 7. 定制 zshrc(欢迎语 / 提示符 / 受限 PATH / locale / MOTD)
+# 3. 定制 zshrc(欢迎语 / 提示符 / 受限 PATH / locale / MOTD)
 cat > "$BUILD_MOUNT/home/$GUEST/.zshrc" <<'EOF'
 # termblog guest shell —— 每个访客一个真实 FreeBSD jail
 export PATH=/usr/local/bin:/usr/bin:/bin
@@ -106,7 +218,7 @@ echo 'Help: blog ~/help.md    Blog: blog for list, blog <article-key> to read'
 echo 'Casts: play for list, play <cast-key> to watch (space to pause, q to quit)'
 EOF
 
-# 8. content 是 guest HOME 的唯一蓝图。复制全部非隐藏路径，系统生成的
+# 4. content 是 guest HOME 的唯一蓝图。复制全部非隐藏路径，系统生成的
 #    .rendered 与 .rendered-assets 再按白名单单独安装。
 CONTENT="$REPO/jailtpl/content"
 HOME_DIR="$BUILD_MOUNT/home/$GUEST"
@@ -172,21 +284,19 @@ done < "$TARGETS"
 # 评论快照运行目录由 root 管理；guest 只能读取 comments.jsonl。
 install -d -m 755 "$BUILD_MOUNT/var/run/termblog"
 
-# 9. jailbin 命令(0555, 只读): blog / play / webctl 是指向 jailbin 的符号链接(busybox 式)
+# 5. jailbin 命令(0555, 只读): blog / play / webctl 是指向 jailbin 的符号链接(busybox 式)
 echo ">> Installing jailbin commands (blog / play / webctl → jailbin)"
 install -m 555 "$REPO/target/release/jailbin" "$BUILD_MOUNT/usr/local/bin/jailbin"
 ln -s jailbin "$BUILD_MOUNT/usr/local/bin/blog"
 ln -s jailbin "$BUILD_MOUNT/usr/local/bin/play"
 ln -s jailbin "$BUILD_MOUNT/usr/local/bin/webctl"
 
-# 10. 收尾: 卸 devfs, 清 DNS, 打 snapshot, 模板转只读
-umount -f "$BUILD_MOUNT/dev" 2>/dev/null || true
-rm -f "$BUILD_MOUNT/etc/resolv.conf"
+# 6. 收尾: 打 snapshot, 模板转只读
 zfs snapshot "$BUILD_DS@release"
 zfs set readonly=on "$BUILD_DS"
 
 if [ "$REPLACE" -eq 1 ]; then
-    # 11. 零停机换面: 名字让位 -> 换名 -> mountpoint 归位 -> 异步清理旧模板。
+    # 7. 零停机换面: 名字让位 -> 换名 -> mountpoint 归位 -> 异步清理旧模板。
     #     两条 rename 之间有微秒级窗口(template 名字瞬时不存在), 恰逢其会的
     #     新会话 clone 会失败 -> jaild fail-closed, 访客重试即可。
     zfs unmount "$DATASET" 2>/dev/null || true        # 旧模板(构建后保持挂载)
@@ -204,6 +314,11 @@ if [ "$REPLACE" -eq 1 ]; then
     # 会话硬寿命 7200s 兜底, 不会永远 pin 住)
     for old in $(zfs list -H -o name -r zroot/jails 2>/dev/null | grep -E '^zroot/jails/template\.old(-[0-9]+)?$' || true); do
         zfs destroy -r "$old" 2>/dev/null || true
+    done
+    # base 刷新时退役的旧 base 会被 template.old* pin 住；待相关会话
+    # 退出且旧 template 回收后，在此处一并尝试回收。
+    for old_base in $(zfs list -H -o name -r zroot/jails 2>/dev/null | grep -E '^zroot/jails/template-base\.old-[0-9]+-[0-9]+$' || true); do
+        zfs destroy -r "$old_base" 2>/dev/null || true
     done
     echo "Done: $DATASET@release replaced with zero downtime (old sessions continue using old template; template.old* reclaimed after all exit)"
 else

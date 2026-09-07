@@ -6,7 +6,7 @@ set -eu
 [ "$(id -u)" -eq 0 ] || { echo "需要 root"; exit 1; }
 CONFIG=${TERMBLOG_CONFIG:-/usr/local/etc/termblog.toml}
 COMMENTCTL=${COMMENTCTL:-/usr/local/sbin/commentctl}
-BASE_URL=${TERMBLOG_BASE_URL:-http://127.0.0.1:8080}
+BASE_URL=${TERMBLOG_BASE_URL:-http://127.0.0.1}
 
 for socket in /var/run/commentd-public.sock /var/run/commentd-private.sock; do
     [ -S "$socket" ] || { echo "FAIL: 缺少 socket $socket"; exit 1; }

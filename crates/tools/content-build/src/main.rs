@@ -649,6 +649,14 @@ fn main() -> Result<()> {
         .or(cfg.web.site_url)
         .map(|u| u.trim_end_matches('/').to_string());
     let site_title = cli.site_title.clone().unwrap_or(cfg.web.site_title.clone());
+    // 终端阅读提示里的 ssh 端口: 取 [ssh] listen 的端口部分(22 时提示省略 -p)
+    let ssh_port: u16 = cfg
+        .ssh
+        .listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(22);
 
     // content 是唯一扫描根；blog/ 只是其中一个普通目录。
     let content_metadata = std::fs::symlink_metadata(&cli.content)
@@ -1013,6 +1021,7 @@ fn main() -> Result<()> {
             entry_css.as_deref().unwrap_or_default(),
             &comments_js,
             site_url.as_deref(),
+            ssh_port,
             &site_title,
             a.first_image.as_deref(),
         );

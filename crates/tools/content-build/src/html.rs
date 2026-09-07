@@ -227,7 +227,7 @@ const MIRROR_TEMPLATE: &str = r#"<!doctype html>
         <h1>{{TITLE}}</h1>
         {{BODY_HTML}}
         <footer class="post-meta">
-          {{DATE}}{{#if ssh_hint}} · Also readable in terminal: ssh -p 2222 blog@{{HOST}} then run blog {{KEY}}{{/if}}
+          {{DATE}}{{#if ssh_hint}} · Also readable in terminal: {{SSH_CMD}} then run blog {{KEY}}{{/if}}
         </footer>
         {{#if comments}}<section class="comments" data-comments-target="{{COMMENT_TARGET}}" data-comments-fifo="~/{{COMMENT_FIFO}}">
           <h2>Comments</h2>
@@ -265,19 +265,27 @@ fn blog_css_href(entry_js: &str) -> String {
 }
 
 /// 渲染单篇镜像页。first_image: 文章第一张本地图的站点绝对路径(og:image 用,
-/// 需同时有 site_url 才输出)。
+/// 需同时有 site_url 才输出)。ssh_port: termblog-ssh 监听端口(22 是 ssh 默认
+/// 端口, 提示里省略 -p, 访客命令最简)。
 pub fn render_mirror_page(
     a: &Article,
     entry_js: &str,
     entry_css: &str,
     comments_js: &str,
     site_url: Option<&str>,
+    ssh_port: u16,
     site_title: &str,
     first_image: Option<&str>,
 ) -> String {
     let body = body_html(&a.events, &a.image_meta);
     let host = site_url.map(host_of).unwrap_or("");
     let ssh_hint = site_url.is_some();
+    // 终端阅读提示的 ssh 命令(端口来自 [ssh] listen, 不再写死)
+    let ssh_cmd = if ssh_port == 22 {
+        format!("ssh blog@{host}")
+    } else {
+        format!("ssh -p {ssh_port} blog@{host}")
+    };
     let og_image = site_url.is_some() && first_image.is_some();
     fill(
         MIRROR_TEMPLATE,
@@ -304,7 +312,7 @@ pub fn render_mirror_page(
             ),
             ("EXCERPT", attr_escape(&a.excerpt)),
             ("DATE", a.date10.clone()),
-            ("HOST", attr_escape(host)),
+            ("SSH_CMD", attr_escape(&ssh_cmd)),
             ("ENTRY_JS", attr_escape(entry_js)),
             ("ENTRY_CSS", attr_escape(entry_css)),
             ("COMMENTS_JS", attr_escape(comments_js)),
@@ -490,6 +498,7 @@ mod tests {
             "index-abc123.css",
             "comments-abc123.js",
             Some("https://blog.example.com"),
+            2222,
             "~yzs",
             a.first_image.as_deref(),
         );
@@ -504,6 +513,7 @@ mod tests {
             "index-abc123.css",
             "comments-abc123.js",
             None,
+            2222,
             "~yzs",
             a.first_image.as_deref(),
         );
@@ -519,6 +529,7 @@ mod tests {
             "index-abc123.css",
             "comments-abc123.js",
             Some("https://blog.example.com"),
+            2222,
             "~yzs",
             None,
         );
@@ -534,6 +545,7 @@ mod tests {
             "index-abc123.css",
             "comments-abc123.js",
             Some("https://blog.example.com"),
+            2222,
             "~yzs",
             None,
         );
@@ -566,12 +578,33 @@ mod tests {
             "index-abc123.css",
             "comments-abc123.js",
             None,
+            2222,
             "~yzs",
             None,
         );
         assert!(!page.contains("canonical"));
         assert!(!page.contains("og:url"));
         assert!(!page.contains("ssh -p 2222"));
+    }
+
+    #[test]
+    fn mirror_page_ssh_hint_port_22() {
+        let a = article("hello", "你好", "# 你好\n\n正文\n");
+        let page = render_mirror_page(
+            &a,
+            "index-abc123.js",
+            "index-abc123.css",
+            "comments-abc123.js",
+            Some("http://blog.example.com"),
+            22,
+            "~yzs",
+            None,
+        );
+        assert!(
+            page.contains("ssh blog@blog.example.com"),
+            "22 端口提示应省略 -p: {page}"
+        );
+        assert!(!page.contains("-p 22"), "22 端口不应出现 -p 参数: {page}");
     }
 
     #[test]
@@ -587,6 +620,7 @@ mod tests {
             "index-abc123.css",
             "comments-abc123.js",
             None,
+            2222,
             "~yzs",
             None,
         );

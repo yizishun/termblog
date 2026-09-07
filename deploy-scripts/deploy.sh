@@ -223,5 +223,5 @@ echo "== Deployment complete, current status =="
 ls -l /var/run/commentd-public.sock /var/run/commentd-private.sock /var/run/termblog-statd.sock /var/run/termblog.sock
 ps -axo user,pid,comm | grep -E "commentd|jaild|termblog-" | grep -v grep
 echo ""
-echo ">> Web: http://$(hostname):8080   ssh: ssh -p 2222 blog@$(hostname)"
+echo ">> Web: http://$(hostname)   ssh: ssh blog@$(hostname)   (端口以 etc/termblog.toml 为准)"
 echo ">> Verification: sh $REPO/tests/verify-m3.sh (root), sh $REPO/tests/verify-m5.sh, sh $REPO/tests/verify-comments.sh, sh $REPO/tests/verify-stats.sh"

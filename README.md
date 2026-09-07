@@ -59,13 +59,22 @@ frontend/        # xterm.js 前端(vite)
 
 | 入口 | 做什么 |
 | --- | --- |
-| `make tpl` | 构建 jail 模板(首次); 已存在则拒绝 |
+| `make tpl` | 首次准备 `template-base@prepared` 并构建 jail 模板; 仅首次下载 FreeBSD base/pkg |
+| `make tpl-refresh` | 显式联网刷新 FreeBSD base/pkg 基础层，并零停机换模板 |
 | `make deploy` | 全量生产部署: racct 检查 → 编译 → 安装 → 发布镜像 → 拉起服务(需模板已构建) |
 | `make content` | 只改文章的部署: 静态发布 + 模板零停机换面, 全程不停服、不杀会话 |
 | `deploy.sh --static-only` | 只发静态镜像(零停机); jail 侧下次模板重建跟进 |
 | `build-template.sh --replace` | 零停机换模板(旧会话继续用旧模板, 全部退出后回收) |
 
-部署目标内嵌 sudo, 直接 `make tpl` / `make deploy` / `make content` 即可
+`build-template.sh` 使用两层 ZFS 模板。`zroot/jails/template-base@prepared`
+只含 FreeBSD base 和 jail 的通用包；首次构建时下载并将 `base.txz`
+持久缓存到 `/var/cache/termblog`。后续 `--replace`/`make content` 直接从
+该快照本地 clone，只更新 guest 配置、`jailbin` 和博客内容，不再访问
+FreeBSD/pkg 网络。需要安全更新或升级 jail 用户态时才运行
+`make tpl-refresh`。Cargo/npm 仍按各自的本地依赖缓存做增量构建。
+
+部署目标内嵌 sudo, 直接 `make tpl` / `make tpl-refresh` / `make deploy` /
+`make content` 即可
 (会提示输入密码)。部署脚本不依赖 Makefile; Makefile 只是薄入口。
 
 > **模板功能升级注意**: 新 jailbin、评论 FIFO/scope 清单、jail-root `/proc` 目录树、文章机器索引、`help.md` 和图片产物只存在于

@@ -2,9 +2,10 @@
 # bmake(FreeBSD 默认 make)风格, 直接 `make <目标>` 即可, 无需 gmake。
 #
 # 部署目标(需要 root, sudo 已内嵌, 会提示输入密码):
-#   make tpl      构建 jail 模板(build-template.sh; 加 --replace 零停机换面)
-#   make deploy   全量生产部署(deploy.sh; 需模板已构建)
-#   make content  只改文章的部署: 静态发布 + 模板零停机换面
+#   make tpl          首次准备 base 并构建 jail 模板
+#   make tpl-refresh  联网刷新 base/pkg 并零停机换模板
+#   make deploy       全量生产部署(deploy.sh; 需模板已构建)
+#   make content      只改文章的部署: 静态发布 + 模板零停机换面
 #
 # 开发期目标(不带后缀的操作 web, 带 -ssh 后缀的对应操作 ssh):
 #   run/run-ssh            前台运行(Ctrl-C 停止, 调试用)
@@ -32,7 +33,7 @@ URL_WEB := http://$(HOSTNAME):8080
 URL_SSH := ssh://0.0.0.0:2222
 
 .PHONY: all build build-frontend build-content \
-        tpl deploy content verify-comments verify-stats verify-content-paths \
+        tpl tpl-refresh deploy content verify-comments verify-stats verify-content-paths \
         run run-ssh \
         start start-ssh stop stop-ssh restart restart-ssh \
         status status-ssh logs logs-ssh clean
@@ -60,6 +61,10 @@ build: build-frontend
 # ── 部署入口(需要 root): 薄入口, sudo 已内嵌; 逻辑在 deploy-scripts/ ──
 tpl:
 	sudo sh deploy-scripts/build-template.sh
+
+# 显式联网刷新 FreeBSD base/pkg 基础层，然后零停机换模板。
+tpl-refresh:
+	sudo sh deploy-scripts/build-template.sh --refresh-base
 
 deploy:
 	sudo sh deploy-scripts/deploy.sh
