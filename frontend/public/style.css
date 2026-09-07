@@ -78,6 +78,23 @@ html, body {
 }
 #term-screen .xterm { height: 100%; }
 
+/* An attached session replays raw PTY history into a fresh xterm instance.
+   Keep that fast-forward hidden and reveal only the fully parsed screen. */
+#term-host.restoring #term-screen { visibility: hidden; }
+#session-restore {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  color: #6a737d;
+  background: var(--bg);
+  font: 15px/20px var(--mono-font);
+}
+#session-restore[hidden] { display: none; }
+
 /* Enable OpenType ligatures consistently. Chrome doesn't enable them by
    default for this font while Safari does, so the italic 'll' (and
    programming ligatures like =>, ==) only showed in Safari. Maple Mono's

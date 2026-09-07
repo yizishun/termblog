@@ -157,9 +157,17 @@ let ws: WebSocket | undefined;
 let replayPending = 0; // 尚未解析完的回放 write 数(仅统计 ReplayEnd 之前的帧)
 let replayEndSeen = false; // 是否已收到 ReplayEnd 帧
 
+function showSessionRestore(show: boolean) {
+  const host = document.getElementById("term-host");
+  const status = document.getElementById("session-restore");
+  host?.classList.toggle("restoring", show);
+  if (status) status.hidden = !show;
+}
+
 function finishReplayIfReady() {
   if (replayEndSeen && replayPending <= 0) {
     term.options.disableStdin = false;
+    showSessionRestore(false);
   }
 }
 
@@ -264,7 +272,12 @@ function connect() {
         // 只有 attach 才有 scrollback 回放: 仅此时禁用 stdin, 回放里的终端查询
         // 不能再触发 xterm.js 回答上行(污染 shell 编辑行); ReplayEnd 会恢复。
         // fresh 会话(镜像页/新 token)无回放, stdin 从一开始就可用, 不依赖新帧。
-        if (opened.attached) term.options.disableStdin = true;
+        if (opened.attached) {
+          term.options.disableStdin = true;
+          showSessionRestore(true);
+        } else {
+          showSessionRestore(false);
+        }
         replayPending = 0;
         replayEndSeen = false;
         // 恢复的会话: 屏幕清干净, 由 SIGWINCH 触发前台程序重绘; 新会话本来就是新画面
@@ -286,6 +299,7 @@ function connect() {
       case T_CLOSED: {
         // 兜底: 无论何种原因会话结束, 都要恢复 stdin, 防止协议异常时终端变砖
         term.options.disableStdin = false;
+        showSessionRestore(false);
         let reason = textDec.decode(payload);
         try {
           reason = JSON.parse(reason).reason;
@@ -300,6 +314,7 @@ function connect() {
 
   socket.onclose = () => {
     term.options.disableStdin = false; // 断线兜底, 同上
+    showSessionRestore(false);
     term.write("\r\n\x1b[90m[Connection closed, refresh page to reconnect]\x1b[0m\r\n");
     if (onMirror && !takeoverDone) revealStaticFallback();
   };
