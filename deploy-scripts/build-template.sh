@@ -171,7 +171,7 @@ echo ">> Preparing build inputs (as $BUILD_USER: content-build + jailbin + conte
 su -l "$BUILD_USER" -c "set -e; cd $REPO; \
     cargo build --release -p content-build -p termblog-jailbin; \
     ( cd frontend; [ -d node_modules ] || npm install; npm run build ); \
-    ./target/release/content-build --content jailtpl/content --dist frontend/dist"
+    TERMBLOG_CONFIG=$REPO/etc/termblog.toml ./target/release/content-build --content jailtpl/content --dist frontend/dist"
 
 # 1. 确定构建目标数据集: --replace 走旁路名(旧模板与在线会话全程不动)
 if [ "$REPLACE" -eq 1 ]; then

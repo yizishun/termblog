@@ -13,7 +13,9 @@ termblog-core = { path = "../core" }
 termblog-config = { path = "../../config" }
 termblog-proto = { path = "../proto" }
 axum = { version = "0.8", features = ["ws"] }
+axum-server = "0.8"
 futures = "0.3"
+rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 serde.workspace = true
 serde_json.workspace = true
 termblog-commentd = { path = "../commentd" }

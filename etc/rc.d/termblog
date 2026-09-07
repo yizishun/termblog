@@ -25,6 +25,7 @@ termblog_start()
     # 降权用户需要写的目录与日志
     mkdir -p /var/db/termblog /var/log
     chown "$termblog_user" /var/db/termblog
+    install -d -m 700 -o "$termblog_user" -g "$termblog_user" /var/db/termblog/acme
     touch /var/log/termblog-web.log /var/log/termblog-ssh.log
     chown "$termblog_user" /var/log/termblog-web.log /var/log/termblog-ssh.log
 

@@ -1,16 +1,28 @@
 # termblog 运行配置(jaild / termblog-web / termblog-ssh 三个二进制共用)
 
 [web]
-# 生产直连公网; 后续想挂反代/Anubis 时改回 127.0.0.1:8080
-# 80 是特权端口, www 用户直绑需 mac_portacl 放行 uid:80:tcp:80
+# 80 只承载 ACME HTTP-01 与 308 HTTPS 跳转。
+# 80/443 都是特权端口, www 用户直绑需 mac_portacl 分别放行。
 # (完整步骤见 docs/deploy-aliyun-freebsd.md 阶段 6.5)
 listen = "0.0.0.0:80"
 static_dir = "/usr/local/share/termblog/frontend"
 # 站点对外绝对地址(不带尾斜杠)。canonical/sitemap/atom/OG 用;不设则镜像页
 # 照常生成, 只是不产出 sitemap/atom 与 canonical(部署后务必设置!)
-site_url = "http://www.yizishun.com"
+site_url = "https://www.yizishun.com"
 # 站点标题: 镜像页 <title> / og:site_name / atom feed 标题用
 site_title = "~yzs"
+
+[web.tls]
+# termblog-web 直接使用 rustls 提供 HTTPS/WSS；rustls-acme 通过 80 端口的
+# HTTP-01 自动申请与续期 Let's Encrypt 证书，无需 nginx/certbot。
+enabled = true
+listen = "0.0.0.0:443"
+domains = ["www.yizishun.com"]
+# 可留空；填写时格式为 ["mailto:you@example.com"]。
+contacts = []
+cache_dir = "/var/db/termblog/acme"
+# 本地验证时改 false 使用 Let's Encrypt staging，生产保持 true。
+production = true
 
 [ssh]
 # 22 为特权端口: www 直绑需 mac_portacl 放行 uid:80:tcp:22(保留段上界须≤21),

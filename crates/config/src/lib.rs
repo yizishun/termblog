@@ -39,6 +39,46 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        let tls = &self.web.tls;
+        if tls.enabled {
+            if self.web.listen == tls.listen {
+                anyhow::bail!("web HTTP and HTTPS listen addresses must be different");
+            }
+            if tls.domains.is_empty() {
+                anyhow::bail!("web TLS requires at least one ACME domain");
+            }
+            if tls.domains.iter().any(|domain| {
+                domain.is_empty()
+                    || domain.starts_with("*.")
+                    || domain.contains(['/', ':'])
+                    || domain.chars().any(char::is_whitespace)
+            }) {
+                anyhow::bail!("web TLS domains must be plain non-wildcard DNS names");
+            }
+            if tls
+                .contacts
+                .iter()
+                .any(|contact| !contact.starts_with("mailto:") || contact.len() <= 7)
+            {
+                anyhow::bail!("web TLS contacts must be non-empty mailto: URLs");
+            }
+            if !tls.cache_dir.is_absolute() {
+                anyhow::bail!("web TLS cache_dir must be an absolute path");
+            }
+            let Some(site_url) = self.web.site_url.as_deref() else {
+                anyhow::bail!("web TLS requires web.site_url");
+            };
+            let Some(authority) = site_url.strip_prefix("https://") else {
+                anyhow::bail!("web.site_url must use https:// when TLS is enabled");
+            };
+            if authority.is_empty()
+                || authority.contains(['/', '?', '#'])
+                || authority.chars().any(char::is_whitespace)
+            {
+                anyhow::bail!("web.site_url must be an HTTPS origin without a trailing path");
+            }
+        }
+
         let c = &self.comments;
         if !c.public_socket.is_absolute()
             || !c.private_socket.is_absolute()
@@ -125,7 +165,7 @@ impl Default for CommentsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
-    /// axum 监听地址(生产直连 0.0.0.0:8080)
+    /// HTTP 监听地址。TLS 开启时仅承载 ACME HTTP-01 和 HTTPS 跳转。
     pub listen: String,
     /// 前端静态资源目录(安装布局下为绝对路径)
     pub static_dir: String,
@@ -134,6 +174,8 @@ pub struct WebConfig {
     pub site_url: Option<String>,
     /// 站点标题: 镜像页 <title> / og:site_name / atom feed 标题, content-build 消费。
     pub site_title: String,
+    /// Rustls + ACME HTTPS 配置。
+    pub tls: TlsConfig,
 }
 
 impl Default for WebConfig {
@@ -143,6 +185,37 @@ impl Default for WebConfig {
             static_dir: "frontend/dist".into(),
             site_url: None,
             site_title: "~yzs".into(),
+            tls: TlsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// false 时保持单端口纯 HTTP，方便本地开发。
+    pub enabled: bool,
+    /// HTTPS 监听地址。
+    pub listen: String,
+    /// ACME 证书包含的 DNS 名称；HTTP-01 不支持通配符。
+    pub domains: Vec<String>,
+    /// ACME 联系方式，须为 mailto: URL；可以为空。
+    pub contacts: Vec<String>,
+    /// ACME 账户与证书缓存。生产环境应为仅运行用户可访问的绝对目录。
+    pub cache_dir: PathBuf,
+    /// true 使用 Let's Encrypt production；false 使用 staging。
+    pub production: bool,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "0.0.0.0:3443".into(),
+            domains: Vec::new(),
+            contacts: Vec::new(),
+            cache_dir: PathBuf::from("acme-cache"),
+            production: false,
         }
     }
 }
@@ -264,5 +337,35 @@ mod tests {
         let mut cfg = Config::default();
         cfg.stats.request_timeout_ms = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn tls_requires_safe_complete_acme_configuration() {
+        let mut cfg = Config::default();
+        cfg.web.tls.enabled = true;
+        assert!(cfg.validate().is_err(), "missing domains and site_url");
+
+        cfg.web.site_url = Some("https://www.example.com".into());
+        cfg.web.tls.domains = vec!["www.example.com".into()];
+        cfg.web.tls.cache_dir = "/var/db/termblog/acme".into();
+        assert!(cfg.validate().is_ok());
+
+        cfg.web.tls.domains = vec!["*.example.com".into()];
+        assert!(cfg.validate().is_err(), "HTTP-01 cannot issue wildcards");
+
+        cfg.web.tls.domains = vec!["www.example.com".into()];
+        cfg.web.site_url = Some("http://www.example.com".into());
+        assert!(cfg.validate().is_err(), "TLS site URL must use https");
+
+        cfg.web.site_url = Some("https://www.example.com/path".into());
+        assert!(cfg.validate().is_err(), "site URL must be an origin");
+
+        cfg.web.site_url = Some("https://www.example.com".into());
+        cfg.web.tls.contacts = vec!["admin@example.com".into()];
+        assert!(cfg.validate().is_err(), "ACME contacts need mailto");
+
+        cfg.web.tls.contacts = Vec::new();
+        cfg.web.tls.listen = cfg.web.listen.clone();
+        assert!(cfg.validate().is_err(), "listeners cannot collide");
     }
 }

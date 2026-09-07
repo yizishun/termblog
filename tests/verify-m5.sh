@@ -1,6 +1,13 @@
 #!/bin/sh
 # verify-m5.sh —— M5 验收(非 root, 需生产实例在跑; root 项标 [root])
-BASE=${1:-http://127.0.0.1}
+# 默认使用生产 site_url，HTTPS 证书因此按真实域名校验；仍可用第一个参数覆盖。
+if [ "$#" -gt 0 ]; then
+    BASE=$1
+else
+    BASE=$(awk -F '"' '/^[[:space:]]*site_url[[:space:]]*=/{print $2; exit}' \
+        /usr/local/etc/termblog.toml 2>/dev/null)
+    BASE=${BASE:-http://127.0.0.1}
+fi
 CONTENT=${CONTENT:-jailtpl/content}
 # termblog-ssh 端口(生产=22; 老式 2222 部署: TERMBLOG_SSH_PORT=2222)
 SSH="ssh -p ${TERMBLOG_SSH_PORT:-22} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \

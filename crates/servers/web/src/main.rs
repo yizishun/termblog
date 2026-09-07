@@ -16,15 +16,18 @@ mod stats;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
+use anyhow::Context;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, Query, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, OriginalUri, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Json;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
+use rustls_acme::caches::DirCache;
+use rustls_acme::{AcmeConfig, UseChallenge};
 use termblog_commentd::{page_limit, valid_target, Client as CommentClient, PublicQuery};
 use termblog_config::Config;
 use termblog_core::{Control, SessionClient};
@@ -60,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(v) = std::env::var("TERMBLOG_LISTEN") {
         cfg.web.listen = v;
     }
+    if let Ok(v) = std::env::var("TERMBLOG_TLS_LISTEN") {
+        cfg.web.tls.listen = v;
+    }
     if let Ok(v) = std::env::var("TERMBLOG_SOCKET") {
         cfg.jail.socket = v.into();
     }
@@ -77,8 +83,18 @@ async fn main() -> anyhow::Result<()> {
         .layer(middleware::from_fn_with_state(stats, stats::track_request))
         .with_state(state);
 
-    // 默认 0.0.0.0:8080(生产直连), TERMBLOG_LISTEN 可覆盖
-    let listener = tokio::net::TcpListener::bind(&cfg.web.listen).await?;
+    if cfg.web.tls.enabled {
+        serve_https(&cfg, app).await?;
+    } else {
+        serve_http(&cfg, app).await?;
+    }
+    Ok(())
+}
+
+async fn serve_http(cfg: &Config, app: Router) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(&cfg.web.listen)
+        .await
+        .with_context(|| format!("bind HTTP listener {}", cfg.web.listen))?;
     println!(
         "termblog-web listening on http://{} (jaild socket {})",
         cfg.web.listen,
@@ -88,8 +104,80 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await?;
+    .await
+    .context("serve HTTP")?;
     Ok(())
+}
+
+async fn serve_https(cfg: &Config, app: Router) -> anyhow::Result<()> {
+    let tls = &cfg.web.tls;
+    let https_addr: SocketAddr = tls
+        .listen
+        .parse()
+        .with_context(|| format!("parse HTTPS listen address {}", tls.listen))?;
+    let site_url = cfg
+        .web
+        .site_url
+        .clone()
+        .context("TLS requires web.site_url")?;
+
+    let mut acme_state = AcmeConfig::new(tls.domains.clone())
+        .contact(tls.contacts.clone())
+        .cache(DirCache::new(tls.cache_dir.clone()))
+        .directory_lets_encrypt(tls.production)
+        .challenge_type(UseChallenge::Http01)
+        .state();
+    let tls_acceptor = acme_state.axum_acceptor(acme_state.default_rustls_config());
+    let http01 = acme_state.http01_challenge_tower_service();
+
+    // AcmeState must be polled continuously for initial issuance and renewal.
+    tokio::spawn(async move {
+        while let Some(event) = acme_state.next().await {
+            match event {
+                Ok(event) => tracing::info!(?event, "ACME event"),
+                Err(error) => tracing::error!(?error, "ACME error"),
+            }
+        }
+        tracing::error!("ACME state stream ended");
+    });
+
+    // HTTP-01 is served before the fallback. Every other port-80 request gets
+    // a permanent redirect preserving its path and query string.
+    let redirect_app = Router::new()
+        .route_service("/.well-known/acme-challenge/{challenge_token}", http01)
+        .fallback(redirect_to_https)
+        .with_state(site_url.clone());
+    let http_listener = tokio::net::TcpListener::bind(&cfg.web.listen)
+        .await
+        .with_context(|| format!("bind HTTP redirect listener {}", cfg.web.listen))?;
+
+    println!(
+        "termblog-web listening on {} at {} (HTTP redirect/ACME on {})",
+        site_url, tls.listen, cfg.web.listen
+    );
+    let https_server = axum_server::bind(https_addr)
+        .acceptor(tls_acceptor)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+    let http_server = axum::serve(http_listener, redirect_app);
+    tokio::try_join!(async { https_server.await.context("serve HTTPS") }, async {
+        http_server.await.context("serve HTTP redirect/ACME")
+    },)?;
+    Ok(())
+}
+
+async fn redirect_to_https(
+    State(site_url): State<String>,
+    OriginalUri(uri): OriginalUri,
+) -> Redirect {
+    Redirect::permanent(&https_location(&site_url, &uri))
+}
+
+fn https_location(site_url: &str, uri: &axum::http::Uri) -> String {
+    format!(
+        "{}{}",
+        site_url.trim_end_matches('/'),
+        uri.path_and_query().map_or("/", |value| value.as_str())
+    )
 }
 
 async fn comments_handler(
@@ -330,4 +418,27 @@ async fn handle(sock: WebSocket, store: SessionStore, peer: IpAddr) {
     // 6) WS 断开: 停下行泵; 会话不杀, 由 detach 的宽限定时器兜底回收
     down.abort();
     store.detach(&conn.token, conn.id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_redirect_preserves_path_and_query() {
+        let uri: axum::http::Uri = "/freebsd/empty/?from=http".parse().unwrap();
+        assert_eq!(
+            https_location("https://www.yizishun.com", &uri),
+            "https://www.yizishun.com/freebsd/empty/?from=http"
+        );
+    }
+
+    #[test]
+    fn https_redirect_root_has_one_slash() {
+        let uri: axum::http::Uri = "/".parse().unwrap();
+        assert_eq!(
+            https_location("https://www.yizishun.com/", &uri),
+            "https://www.yizishun.com/"
+        );
+    }
 }

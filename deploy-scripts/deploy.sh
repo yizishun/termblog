@@ -50,7 +50,7 @@ publish_static() {
 if [ "${1:-}" = "--static-only" ]; then
     echo ">> 1/2 Compiling content (as $BUILD_USER, artifacts to frontend/dist and jailtpl/content/.rendered)"
     su -l "$BUILD_USER" -c "set -e; cd $REPO; cargo build --release -p content-build; \
-        ./target/release/content-build --content jailtpl/content --dist frontend/dist"
+        TERMBLOG_CONFIG=$REPO/etc/termblog.toml ./target/release/content-build --content jailtpl/content --dist frontend/dist"
     echo ">> 2/2 Publishing static mirror (pure file replacement, seamless, no restart)"
     install -d /usr/local/share/termblog
     install -m 444 "$REPO/jailtpl/content/.comment-targets.tsv" /usr/local/share/termblog/comment-targets.tsv
@@ -121,7 +121,7 @@ done < /jails/template/usr/local/share/termblog/comment-targets.tsv
 echo ">> Compiling (full workspace + frontend + content artifacts)"
 su -l "$BUILD_USER" -c "set -e; cd $REPO; cargo build --release; \
     cd frontend; [ -d node_modules ] || npm install; npm run build; \
-    cd $REPO; ./target/release/content-build --content jailtpl/content --dist frontend/dist"
+    cd $REPO; TERMBLOG_CONFIG=$REPO/etc/termblog.toml ./target/release/content-build --content jailtpl/content --dist frontend/dist"
 
 # ── 4. 安装 ──
 echo ">> Installing binaries / frontend / rc scripts"
@@ -189,6 +189,9 @@ fi
 # ── 8. 运行时目录与日志 ──
 mkdir -p /var/db/termblog /var/log
 chown www /var/db/termblog
+# rustls-acme caches the account key and certificate here. The enclosing 0700
+# directory protects the files even though DirCache follows the process umask.
+install -d -m 700 -o www -g www /var/db/termblog/acme
 touch /var/log/commentd.log /var/log/termblog-statd.log /var/log/jaild.log /var/log/termblog-web.log /var/log/termblog-ssh.log
 chown root:wheel /var/log/commentd.log /var/log/termblog-statd.log /var/log/jaild.log
 chmod 640 /var/log/commentd.log /var/log/termblog-statd.log /var/log/jaild.log
@@ -223,5 +226,6 @@ echo "== Deployment complete, current status =="
 ls -l /var/run/commentd-public.sock /var/run/commentd-private.sock /var/run/termblog-statd.sock /var/run/termblog.sock
 ps -axo user,pid,comm | grep -E "commentd|jaild|termblog-" | grep -v grep
 echo ""
-echo ">> Web: http://$(hostname)   ssh: ssh blog@$(hostname)   (端口以 etc/termblog.toml 为准)"
+site_url=$(awk -F '"' '/^[[:space:]]*site_url[[:space:]]*=/{print $2; exit}' /usr/local/etc/termblog.toml)
+echo ">> Web: ${site_url:-http://$(hostname)}   ssh: ssh blog@$(hostname)   (端口以 etc/termblog.toml 为准)"
 echo ">> Verification: sh $REPO/tests/verify-m3.sh (root), sh $REPO/tests/verify-m5.sh, sh $REPO/tests/verify-comments.sh, sh $REPO/tests/verify-stats.sh"

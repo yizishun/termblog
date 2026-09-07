@@ -51,12 +51,12 @@ build-frontend: frontend/node_modules
 # 注意顺序: 必须在 vite build 之后跑(产物写入 dist 且需读 assets/index-*.js)
 build-content:
 	cargo build --release -p content-build
-	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
+	TERMBLOG_CONFIG=etc/termblog.toml $(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
 
 # ── 构建: 一次产出全部二进制(含 jailbin)+ 前端 + 内容镜像 ──
 build: build-frontend
 	cargo build --release
-	$(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
+	TERMBLOG_CONFIG=etc/termblog.toml $(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
 
 # ── 部署入口(需要 root): 薄入口, sudo 已内嵌; 逻辑在 deploy-scripts/ ──
 tpl:

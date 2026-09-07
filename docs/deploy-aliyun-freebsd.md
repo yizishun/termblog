@@ -137,11 +137,17 @@ sudo hostname freebsd-server
 # (旧版自动备份为 .old), 所以改 repo 这份才是长久之计, 不是改 /usr/local/etc。
 vim ~/termblog/etc/termblog.toml
 
-# 必改 1: site_url —— sitemap/atom/canonical/OG 的公共前缀。
-#         当前是内网开发地址 192.168.0.100, 必须换成公网可达地址。
-site_url = "http://<你的公网IP或域名>:8080"
-# (跳过 8080、直接上 80 的部署: site_url 不带端口、listen 改 0.0.0.0:80,
-#  且必须先完成阶段 6.5 的 6.5.1/6.5.2, 否则 www 绑不上 80)
+# 必改 1: HTTPS 域名。site_url 与 domains 必须使用公网 DNS 名称。
+site_url = "https://www.yizishun.com"
+[web.tls]
+enabled = true
+listen = "0.0.0.0:443"
+domains = ["www.yizishun.com"]
+contacts = []
+cache_dir = "/var/db/termblog/acme"
+production = true
+# 同时保留 [web] listen = "0.0.0.0:80" 承载 HTTP-01 与 HTTPS 跳转；
+# 必须先完成阶段 6.5，否则 www 绑不上 80/443。
 
 # 必改 2: max_total —— 2G 内存机器上 64 会话×128M 内存帽是超售,
 #         降到 16 是稳妥值(rctl 是上限不是预留, 但没必要赌)
@@ -151,12 +157,10 @@ max_total = 16
 grep -E "site_url|max_total" ~/termblog/etc/termblog.toml
 
 # ── 2.5 先装一份配置到 /usr/local/etc(重要, 别跳过!) ───────────────────
-# content-build 读的是 $TERMBLOG_CONFIG 或 /usr/local/etc/termblog.toml
-# (不是仓库副本), 而 deploy.sh 是"先编译内容(步骤3)、后安装配置(步骤4)"——
-# 全新机器上首次运行时 /usr/local/etc/termblog.toml 还不存在, site_url 为空,
-# 首发镜像页会缺 sitemap/atom/canonical。先手动装一次即可消除:
+# 运行时进程读取 /usr/local/etc/termblog.toml。构建脚本则显式读取仓库配置，
+# 因此生成的 sitemap/atom/canonical 会在首次部署时直接使用 HTTPS URL。
 sudo install -m 644 ~/termblog/etc/termblog.toml /usr/local/etc/termblog.toml
-# (deploy.sh 之后会看到两份一致, 自动跳过覆盖; 改配置后同样先改仓库再装这里)
+# deploy.sh 也会安装并备份运行时配置；上面提前安装可让首次启动配置明确可查。
 ```
 
 ## 阶段 3 —— 预编译(以 yzs 身份; 让 root 脚本里的编译步骤变增量秒回)
@@ -265,15 +269,15 @@ sudo sh ~/termblog/tests/verify-comments.sh
 # 统计链路(root): statd socket/数据权限 / 会话 /proc/.../stat 快照
 sudo sh ~/termblog/tests/verify-stats.sh
 
-# ── 公网访问: 阿里云控制台 → ECS → 安全组 → 入方向放行 TCP 80 / 22 / 2222 ──
-# (80=web, 22=termblog-ssh 访客入口, 2222=系统 sshd 管理; 见阶段 6.5/6.6)
+# ── 公网访问: 阿里云控制台 → ECS → 安全组 → 入方向放行 TCP 80 / 443 / 22 / 2222 ──
+# (80=ACME/HTTPS 跳转, 443=HTTPS, 22=termblog-ssh, 2222=系统 sshd 管理)
 # (系统内无 ipfw/pf, 只差安全组这一道)
 # 浏览器: http://<公网IP>   访客终端: ssh blog@<公网IP>   管理: ssh -p 2222 yzs@<公网IP>
 ```
 
-## 阶段 6.5 —— mac_portacl: www 直绑特权端口 80(web)与 22(termblog-ssh)
+## 阶段 6.5 —— mac_portacl: www 直绑特权端口 80/443(web)与 22(termblog-ssh)
 
-> 本次实际采用: 首发部署前直接配置 80+22, 不走 8080/2222 过渡。
+> 本次实际采用: 首发部署前直接配置 80+443+22, 不走 8080/2222 过渡。
 > 硬性顺序: 6.5.1 与 6.6 的 sshd 迁移都必须早于 deploy.sh 启动 termblog-web/ssh。
 
 www 用户直绑特权端口的正路。两个坑(均在 15.0 上对着 man page 核实过):
@@ -281,17 +285,17 @@ www 用户直绑特权端口的正路。两个坑(均在 15.0 上对着 man page
    网上流传的 `www:tcp:80` 用户名写法静默不生效;
 ② portacl 管不到保留段(net.inet.ip.portrange.reservedlow/high, 默认 0-1023)
    内的端口 —— 目标端口必须先脱离保留段, 规则才生效(man page 原文明示)。
-   80 和 22 都要绑 → reservedhigh 必须降到 **21**(只降到 79 不够:
+   80、443 和 22 都要绑 → reservedhigh 必须降到 **21**(只降到 79 不够:
    22 仍在保留段内, portacl 对 22 无效 —— 容易踩)。
 
 设计上 portacl 是"接管者"而非"补丁": 加载后 1-1023 对非 root 默认全拒,
-再按规则放行。最终安全态势 = 原状 + 仅"uid 80 可绑 tcp 80 与 tcp 22"两条;
+再按规则放行。最终安全态势 = 原状 + 仅"uid 80 可绑 tcp 80/443/22"三条;
 root 经 suser_exempt(默认 1)照旧豁免(sshd 迁 2222 后是非特权端口, 无需豁免)。
 
 ```sh
 # ── 6.5.1 内核侧(root, 免重启; 顺序有讲究: 任何时刻都不比现状更宽松) ──
 sudo kldload mac_portacl
-sudo sysctl security.mac.portacl.rules=uid:80:tcp:80,uid:80:tcp:22
+sudo sysctl security.mac.portacl.rules=uid:80:tcp:80,uid:80:tcp:443,uid:80:tcp:22
 sudo sysctl net.inet.ip.portrange.reservedhigh=21
 sysctl security.mac.portacl.suser_exempt          # 确认 root 豁免 = 1
 
@@ -300,26 +304,29 @@ echo 'mac_portacl_load="YES"' | sudo tee -a /boot/loader.conf
 # 机器上已有本节旧两行(80 单端口 + reservedhigh=79)时这样原位替换;
 # 全新机器可直接 printf 追加同样的两行:
 sudo sed -i.bak \
-    -e 's|^security.mac.portacl.rules=.*|security.mac.portacl.rules=uid:80:tcp:80,uid:80:tcp:22|' \
+    -e 's|^security.mac.portacl.rules=.*|security.mac.portacl.rules=uid:80:tcp:80,uid:80:tcp:443,uid:80:tcp:22|' \
     -e 's|^net.inet.ip.portrange.reservedhigh=.*|net.inet.ip.portrange.reservedhigh=21|' /etc/sysctl.conf
 # rules 是 mac_portacl 唯一不能写成 loader tunable 的变量, 只能进 sysctl.conf;
 # 注意 rules 是"整表替换"语义 —— 以后增删端口要改这一行, 不能追加第二行
 # (两行 rules 的话后行覆盖前行, 前面放行的端口会静默失效)。
 
 # ── 6.5.3 应用侧(改仓库这份 etc/termblog.toml) ──
-#   [web] listen   = "0.0.0.0:80"
-#   [web] site_url = "http://www.yizishun.com"    # 不带端口
+#   [web] listen       = "0.0.0.0:80"             # ACME HTTP-01 + 308
+#   [web] site_url     = "https://www.yizishun.com"
+#   [web.tls] enabled  = true
+#   [web.tls] listen   = "0.0.0.0:443"
+#   [web.tls] domains  = ["www.yizishun.com"]
 #   [ssh] listen   = "0.0.0.0:22"
 sudo install -m 644 ~/termblog/etc/termblog.toml /usr/local/etc/termblog.toml
 sudo sh ~/termblog/deploy-scripts/deploy.sh
-# 安全组放行 80 / 22 / 2222。验证脚本端口默认即 80/22, 无需环境变量。
+# 安全组放行 80 / 443 / 22 / 2222。verify-m5 默认读取 site_url 验证 HTTPS。
 ```
 
 前提: 域名须已 ICP 备案(大陆 ECS 的 80/443 会拦未备案域名, 与本机制无关;
-SSH 22 不受 ICP 影响)。将来上 HTTPS 有两条路: 反代方案(nginx/haproxy 等)
-则本节整体退役; 推荐 termblog-web 原生 rustls(无代理, 真实访客 IP 天然
-保留, 不需要 X-Forwarded-For 代码)—— 那样 rules 再加一段 uid:80:tcp:443
-即可, 本节继续生效。
+SSH 22 不受 ICP 影响)。termblog-web 原生使用 rustls + rustls-acme：80 提供
+HTTP-01 并把其他请求 308 到 HTTPS，443 提供 HTTPS/WSS；证书账户、私钥与
+续期状态缓存在 `/var/db/termblog/acme`，无需 nginx/certbot，真实访客 IP 也
+天然保留。
 
 ## 阶段 6.6 —— 系统 sshd 迁 2222, 把 22 让给 termblog-ssh
 
@@ -391,11 +398,12 @@ sysctl vfs.zfs.arc_summary | head -20
 | npm: not found | `sudo pkg install -y npm-node24`(node24 包不捆绑 npm) |
 | cargo 编译被 Killed | 内存不足 → `CARGO_BUILD_JOBS=1 cargo build --release` |
 | cargo 长时间卡在 Updating crates.io index | 国内直连 crates.io 慢 → 阶段 3.1 的 rsproxy.cn 镜像(实测 15 分钟 → 30 秒) |
-| 绑 80/22 报 Permission denied(portacl 已配) | 规则误写用户名(必须 `uid:80:tcp:80,uid:80:tcp:22`)/ reservedhigh 没降到 21(79 不够, 22 仍在保留段)/ 模块没加载(`kldstat \| grep portacl`) |
-| 重启后 80/22 又绑不上 | sysctl.conf 里 rules 被追加成了第二行(整表替换, 后行覆盖前行)/ loader.conf 缺 mac_portacl_load |
+| 绑 80/443/22 报 Permission denied(portacl 已配) | 规则误写用户名(必须使用数字 UID，并包含 `uid:80:tcp:80,uid:80:tcp:443,uid:80:tcp:22`)/ reservedhigh 没降到 21/ 模块没加载(`kldstat \| grep portacl`) |
+| 重启后 80/443/22 又绑不上 | sysctl.conf 里 rules 被追加成了第二行(整表替换, 后行覆盖前行)/ loader.conf 缺 mac_portacl_load |
+| HTTPS 一直拿不到证书 | DNS 未指向本机/安全组未同时开放 80 和 443/大陆 ECS 域名未备案；查 `/var/log/termblog-web.log` 的 ACME error |
 | ssh -p 2222 连不上(管理入口) | 安全组没放行 2222 / sshd_config 缺 Port 2222 行 / cloud-init 重写了 sshd_config |
 | build-template.sh 下载 16.0-CURRENT | 必须先做阶段 4.1 预下载(或显式传 15.0 URL 参数) |
-| 公网不通但本机 fetch 通 | 阿里云安全组没放行 8080/2222 |
+| 公网不通但本机 fetch 通 | 阿里云安全组没放行 80/443/22/2222 中对应的入口端口 |
 | 会话开不出, 查 jaild 日志 | `tail -50 /var/log/jaild.log` |
 
 ## 升级路径(备忘; 仅方案 B 起步者需要, 方案 A 天然就是真 vdev)
