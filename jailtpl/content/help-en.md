@@ -1,4 +1,4 @@
-# Welcome to ~yzs's termblog
+# Welcome to yzs's blog
 
 This is both a personal blog and a real, temporary FreeBSD jail. Read, explore, and leave a
 message as you would in a normal terminal. Files created during your session disappear when
