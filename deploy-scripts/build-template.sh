@@ -214,8 +214,9 @@ TRAPURG() {
     [[ -o zle ]] && zle -I
     return 0
 }
-echo 'Help: blog ~/help.md    Blog: blog for list, blog <article-key> to read'
-echo 'Casts: play for list, play <cast-key> to watch (space to pause, q to quit)'
+echo 'Welcome to yzs blog!'
+echo 'You are in a real FreeBSD environment. Use familiar Unix commands to explore.'
+echo 'Try "play demo.cast" or "blog help.md" first'
 EOF
 
 # 4. content 是 guest HOME 的唯一蓝图。复制全部非隐藏路径，系统生成的

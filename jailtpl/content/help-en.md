@@ -51,8 +51,6 @@ changes.
 
 ## Images
 
-Reference an image in the same directory with a relative Markdown path. The Web mirror shows
-the image directly; capable terminals render it inline, while other terminals show a clickable
-placeholder.
+This is an image demo for my blog.
 
 ![termblog image demo](demo.png)
