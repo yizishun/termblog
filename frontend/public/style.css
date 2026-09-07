@@ -198,13 +198,6 @@ html, body {
   font-weight: 400;
 }
 .link-confirm p { margin: 0 0 10px; color: var(--fg); font: inherit; }
-/* xterm renders CJK glyphs as two cells and adds 5px tracking to their DOM
-   spans. Mirror that spacing for the dialog's Chinese labels. */
-.link-confirm h2,
-.link-confirm form > p,
-.link-confirm-actions button {
-  letter-spacing: 5px;
-}
 .link-confirm-url {
   display: block;
   max-height: 8em;
