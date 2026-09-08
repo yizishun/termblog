@@ -109,11 +109,19 @@ pub fn truncate_chars(s: &str, n: usize) -> String {
     }
 }
 
-/// 文章日期: git 最后提交时间(commit date, ISO8601); 无历史时回退文件 mtime。
+/// 文章日期: git 最后一次添加/内容修改时间(commit date, ISO8601)；
+/// 跟随 rename 历史但忽略纯重命名提交，无历史时回退文件 mtime。
 /// 返回 (YYYY-MM-DD, 完整 RFC3339, 是否走了 fallback)。
 pub fn article_date(path: &Path) -> (String, String, bool) {
     if let Ok(out) = Command::new("git")
-        .args(["log", "-1", "--format=%cI", "--"])
+        .args([
+            "log",
+            "--follow",
+            "--diff-filter=AM",
+            "-1",
+            "--format=%cI",
+            "--",
+        ])
         .arg(path)
         .output()
     {
