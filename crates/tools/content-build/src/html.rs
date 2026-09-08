@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
 
-use crate::Article;
+use crate::{Article, ImagePresentation};
 
 /// HTML 属性转义(& < > ")。所有进模板占位符的值先过这里,
 /// 正文 HTML 则由 pulldown-cmark 的 push_html 保证转义。
@@ -28,10 +28,11 @@ pub fn attr_escape(s: &str) -> String {
 ///    不再过转义, 否则会被转义成文本)。
 /// 2. 若第一个块级元素是 H1(即元数据标题的来源)则整块剥掉, 其余喂 push_html。
 ///
-/// image_meta: 本地图 dest_url 原文 → (宽, 高, 站点绝对路径); 查不到 = 外链(原样, 无宽高)。
+/// image_meta: 本地图 dest_url 原文 → 内联图或原图链接；
+/// 查不到 = 外链(原样内联, 无宽高)。
 pub fn body_html(
     events: &[Event<'static>],
-    image_meta: &HashMap<String, (u32, u32, String)>,
+    image_meta: &HashMap<String, ImagePresentation>,
 ) -> String {
     let mut out = String::new();
     let pre = preprocess_events(events, image_meta);
@@ -65,7 +66,7 @@ pub fn body_html(
 /// 预处理事件流: 转义原始 HTML 事件; Image 事件换成手写 <img> 的 InlineHtml。
 fn preprocess_events(
     events: &[Event<'static>],
-    image_meta: &HashMap<String, (u32, u32, String)>,
+    image_meta: &HashMap<String, ImagePresentation>,
 ) -> Vec<Event<'static>> {
     let mut out = Vec::with_capacity(events.len());
     let mut i = 0;
@@ -87,7 +88,7 @@ fn preprocess_events(
                     }
                     j += 1;
                 }
-                let tag = build_img_tag(dest_url, title, alt.trim(), image_meta);
+                let tag = build_image_html(dest_url, title, alt.trim(), image_meta);
                 out.push(Event::InlineHtml(tag.into()));
                 i = if j < events.len() { j + 1 } else { j }; // 跳过 End(Image)
             }
@@ -108,16 +109,39 @@ fn preprocess_events(
     out
 }
 
-/// 手写 <img>: src 用重写后的 content-relative 站点路径(外链原样); 本地图带真实宽高;
-/// 所有属性值过 attr_escape。
-fn build_img_tag(
+/// 手写图片 HTML：预算内本地图输出 `<img>` 和真实宽高；
+/// 超限本地图输出指向无限制原图的 `<a>`；外链图片保持 `<img>`。
+fn build_image_html(
     dest_url: &str,
     title: &str,
     alt: &str,
-    image_meta: &HashMap<String, (u32, u32, String)>,
+    image_meta: &HashMap<String, ImagePresentation>,
 ) -> String {
     let (src, dims) = match image_meta.get(dest_url) {
-        Some((w, h, url)) => (url.as_str(), Some((*w, *h))),
+        Some(ImagePresentation::Inline { width, height, url }) => {
+            (url.as_str(), Some((*width, *height)))
+        }
+        Some(ImagePresentation::LinkOnly { url }) => {
+            let fallback = dest_url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(dest_url)
+                .rsplit('/')
+                .next()
+                .unwrap_or("image");
+            let label = if alt.is_empty() { fallback } else { alt };
+            let title_attr = if title.is_empty() {
+                String::new()
+            } else {
+                format!(" title=\"{}\"", attr_escape(title))
+            };
+            return format!(
+                "<a class=\"image-link\" href=\"{}\"{}>[image: {}]</a>",
+                attr_escape(url),
+                title_attr,
+                attr_escape(label)
+            );
+        }
         None => (dest_url, None), // 外链: 不进表, 原样输出, 省略宽高
     };
     let mut tag = format!(
@@ -439,7 +463,11 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert(
             "hello/arch.png".to_string(),
-            (1080u32, 640u32, "/blog/hello/arch.png".to_string()),
+            ImagePresentation::Inline {
+                width: 1080,
+                height: 640,
+                url: "/blog/hello/arch.png".to_string(),
+            },
         );
         let b = body_html(&parse("![架构图](hello/arch.png)\n"), &meta);
         assert!(
@@ -455,7 +483,11 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert(
             "x.png".to_string(),
-            (2u32, 2u32, "/blog/t/x.png".to_string()),
+            ImagePresentation::Inline {
+                width: 2,
+                height: 2,
+                url: "/blog/t/x.png".to_string(),
+            },
         );
         let b = body_html(&parse("![含 \"引号\" & <标签>](x.png)\n"), &meta);
         assert!(
@@ -465,6 +497,26 @@ mod tests {
         // title 同理
         let b = body_html(&parse("![a](x.png \"ti<b>tle\")\n"), &meta);
         assert!(b.contains("title=\"ti&lt;b&gt;tle\""), "title 应转义: {b}");
+    }
+
+    #[test]
+    fn body_oversize_local_image_becomes_original_link() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            "screen.png".to_string(),
+            ImagePresentation::LinkOnly {
+                url: "/notes/screen.png".to_string(),
+            },
+        );
+        let b = body_html(
+            &parse("![full & screen](screen.png \"open & zoom\")\n"),
+            &meta,
+        );
+        assert_eq!(
+            b,
+            "<p><a class=\"image-link\" href=\"/notes/screen.png\" title=\"open &amp; zoom\">[image: full &amp; screen]</a></p>\n"
+        );
+        assert!(!b.contains("<img"), "超限原图不应内联: {b}");
     }
 
     #[test]
@@ -489,8 +541,14 @@ mod tests {
     #[test]
     fn mirror_page_og_image() {
         let mut a = article("hello", "你好", "# 你好\n\n![图](hello/x.png)\n");
-        a.image_meta
-            .insert("hello/x.png".into(), (2, 2, "/blog/hello/x.png".into()));
+        a.image_meta.insert(
+            "hello/x.png".into(),
+            ImagePresentation::Inline {
+                width: 2,
+                height: 2,
+                url: "/blog/hello/x.png".into(),
+            },
+        );
         a.first_image = Some("/blog/hello/x.png".into());
         let page = render_mirror_page(
             &a,

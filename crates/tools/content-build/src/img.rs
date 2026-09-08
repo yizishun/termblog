@@ -1,12 +1,13 @@
-//! 图片管线: 白名单 / URL 重写 / 缩放重编码 / 构建期预算。
+//! 图片管线: 白名单 / URL 重写 / 缩放重编码 / 内联预算。
 //!
 //! 图片以 Markdown 所在目录为基准解析，规范化后必须仍在 content/HOME 根内；
 //! 本地引用在构建期改写为 content-relative 的站点绝对路径。
 //!
-//! 预算(处理**后**字节, 全部构建期 fail-fast): 单张位图 ≤ 640 KiB,
-//! gif ≤ 512 KiB(gif 不重编码, 保动画), 单篇文章图片总量 ≤ 6 MiB;
-//! 位图宽度 > 1080 px 自动缩小到 1080。外部图片(http(s):// 等绝对 URL)
-//! 原样透传, 不校验、不复制、不计预算。
+//! 内联预算: 单张位图 ≤ 256 KiB, gif ≤ 512 KiB(gif 不重编码,
+//! 保动画), 单篇文章内联图片总量 ≤ 1.5 MiB。原图或处理后产物
+//! 超限时不再报错：Web 原样发布无尺寸限制的原图，正文降级为链接，
+//! 终端不传输图像载荷。只有内联位图宽度 > 1080 px 时才缩小到 1080。
+//! 外部图片(http(s):// 等绝对 URL)原样透传, 不校验、不复制、不计预算。
 
 use std::path::Path;
 
@@ -15,11 +16,11 @@ use anyhow::{bail, Context, Result};
 /// 位图宽度上限: 超过则缩小到此宽度。
 pub const MAX_WIDTH: u32 = 1080;
 /// 单张位图处理后字节预算。
-pub const MAX_BITMAP_BYTES: usize = 640 * 1024;
+pub const MAX_BITMAP_BYTES: usize = 256 * 1024;
 /// 单张 gif 字节预算(原样采用, 不缩放不重编码)。
 pub const MAX_GIF_BYTES: usize = 512 * 1024;
-/// 单篇文章图片总量预算(6 MiB)。
-pub const MAX_ARTICLE_BYTES: usize = 6 * 1024 * 1024;
+/// 单篇文章内联图片总量预算(1.5 MiB)。
+pub const MAX_ARTICLE_BYTES: usize = 1536 * 1024;
 
 /// 扩展名白名单(大小写不敏感)。svg 明确拒绝: 同域直接打开会执行其中脚本。
 pub fn is_image_ext(ext: &str) -> bool {
@@ -122,38 +123,68 @@ pub struct ProcessedImage {
     pub dist_rel: String,
 }
 
+/// 图片在两种发布形态之间的构建期决策。
+#[derive(Debug)]
+pub enum ImageOutput {
+    /// 处理后图像可进入终端内联管线。
+    Inline(ProcessedImage),
+    /// 超出单图内联预算；原文件仅发布到 Web，正文显示链接。
+    LinkOnly { reason: String },
+}
+
 /// 处理一张本地图: 读原字节 → gif 原样采用(只解码拿尺寸);
 /// 位图宽 > 1080 则缩小重编码(重编码变大则回退原字节, 此时尺寸按原图报告);
 /// **webp 产物(含回退原字节分支)统一转 png** —— 构建期格式保证: 处理后产物
 /// 只含 png/jpeg/gif(收窄 addon-image 载荷兼容面; webp 只出现在 lossless
 /// 场景, 转 png 字节级等价)。预算按转换后字节核算。
-/// 所有预算违规 bail, 报错含文章 key / 文件路径 / 实际大小 / 建议。
-pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<ProcessedImage> {
+/// 原图或处理后产物超出单图预算时返回 `LinkOnly`，不压缩原图。
+/// 解码错误等非预算问题仍然报错。
+pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<ImageOutput> {
     use image::ImageEncoder;
-    let raw = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
 
+    let source_budget = if ext == "gif" {
+        MAX_GIF_BYTES
+    } else {
+        MAX_BITMAP_BYTES
+    };
+    let source_len = std::fs::metadata(path)
+        .with_context(|| format!("stat image {}", path.display()))?
+        .len();
+    if source_len > source_budget as u64 {
+        // 只读头部/尺寸以拒绝伪图片，不将无限制原图读入内存。
+        image::ImageReader::open(path)
+            .with_context(|| format!("open image of \"{article_key}\": {rel}"))?
+            .with_guessed_format()
+            .with_context(|| format!("detect image format of \"{article_key}\": {rel}"))?
+            .into_dimensions()
+            .with_context(|| {
+                format!("failed to read image dimensions of \"{article_key}\": {rel}")
+            })?;
+        return Ok(ImageOutput::LinkOnly {
+            reason: format!(
+                "original {} KiB exceeds per-image inline budget {} KiB",
+                source_len / 1024,
+                source_budget / 1024
+            ),
+        });
+    }
+    let raw = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
+
     if ext == "gif" {
-        // gif: 原样采用, 不缩放(会丢动画); 先查预算再解码首帧拿 (w, h)
-        if raw.len() > MAX_GIF_BYTES {
-            bail!(
-                "image {rel} of \"{article_key}\" is {} KiB, exceeds gif budget {} KiB; please compress/scale it down",
-                raw.len() / 1024,
-                MAX_GIF_BYTES / 1024
-            );
-        }
+        // gif: 已通过原图预算，原样采用，不缩放(会丢动画)。
         let img = image::load_from_memory_with_format(&raw, image::ImageFormat::Gif)
             .with_context(|| format!("failed to decode gif of \"{article_key}\": {rel}"))?;
-        return Ok(ProcessedImage {
+        return Ok(ImageOutput::Inline(ProcessedImage {
             bytes: raw,
             width: img.width(),
             height: img.height(),
             dist_rel: rel.to_string(),
-        });
+        }));
     }
 
     let img = image::load_from_memory(&raw)
@@ -168,13 +199,13 @@ pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<Proces
             .with_context(|| format!("failed to re-encode image of \"{article_key}\": {rel}"))?;
         if encoded.len() > raw.len() {
             // 重编码后更大(如 WebP 只有 lossless): 回退用原字节, 尺寸按原图
-            (raw, w, h)
+            (raw.clone(), w, h)
         } else {
             (encoded, MAX_WIDTH, nh)
         }
     } else {
         // 未触发缩放: 直接用原字节, 不重编码
-        (raw, w, h)
+        (raw.clone(), w, h)
     };
 
     // webp → png: 处理后产物只含 png/jpeg/gif(见文件头注释)。重解码拿像素
@@ -199,18 +230,20 @@ pub fn process_image(path: &Path, rel: &str, article_key: &str) -> Result<Proces
     };
 
     if bytes.len() > MAX_BITMAP_BYTES {
-        bail!(
-            "image {rel} of \"{article_key}\" is {} KiB after processing, exceeds per-image budget {} KiB; please compress/scale it down",
-            bytes.len() / 1024,
-            MAX_BITMAP_BYTES / 1024
-        );
+        return Ok(ImageOutput::LinkOnly {
+            reason: format!(
+                "processed {} KiB exceeds per-image inline budget {} KiB",
+                bytes.len() / 1024,
+                MAX_BITMAP_BYTES / 1024
+            ),
+        });
     }
-    Ok(ProcessedImage {
+    Ok(ImageOutput::Inline(ProcessedImage {
         bytes,
         width: fw,
         height: fh,
         dist_rel,
-    })
+    }))
 }
 
 /// rel 的扩展名换成 .png(webp 产物转 png 后的最终文件名)。
@@ -373,12 +406,19 @@ mod tests {
         p
     }
 
+    fn expect_inline(output: ImageOutput) -> ProcessedImage {
+        match output {
+            ImageOutput::Inline(image) => image,
+            ImageOutput::LinkOnly { reason } => panic!("expected inline image: {reason}"),
+        }
+    }
+
     #[test]
     fn process_wide_png_resized() {
         let dir = std::env::temp_dir().join(format!("tb-img-test-{}-wide", std::process::id()));
         // 2000×100 纯色 PNG: 宽 > 1080 → 应缩小到 1080×54
         let p = write_tmp(&dir, "wide.png", &make_png(2000, 100));
-        let r = process_image(&p, "t/wide.png", "t").unwrap();
+        let r = expect_inline(process_image(&p, "t/wide.png", "t").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(r.width, 1080);
         assert_eq!(r.height, 54);
@@ -392,16 +432,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tb-img-test-{}-small", std::process::id()));
         let raw = make_png(100, 50);
         let p = write_tmp(&dir, "small.png", &raw);
-        let r = process_image(&p, "t/small.png", "t").unwrap();
+        let r = expect_inline(process_image(&p, "t/small.png", "t").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!((r.width, r.height), (100, 50));
         assert_eq!(r.bytes, raw, "未触发缩放应原样采用原字节");
     }
 
     #[test]
-    fn process_oversize_bitmap_fails() {
+    fn process_oversize_bitmap_becomes_original_link() {
         let dir = std::env::temp_dir().join(format!("tb-img-test-{}-big", std::process::id()));
-        // 噪点 PNG 压不下去: 1000×1000 随机像素必然 > 640 KiB
+        // 噪点 PNG: 原图超 256 KiB，应不解码/压缩，直接发布原图链接。
         let mut img = image::RgbaImage::new(1000, 1000);
         let mut x: u32 = 12345;
         for px in img.pixels_mut() {
@@ -423,11 +463,26 @@ mod tests {
             .unwrap();
         assert!(buf.len() > MAX_BITMAP_BYTES, "测试前提: 噪点图应超预算");
         let p = write_tmp(&dir, "big.png", &buf);
-        let err = process_image(&p, "t/big.png", "my-post").unwrap_err();
+        let output = process_image(&p, "t/big.png", "my-post").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        let msg = format!("{err}");
-        assert!(msg.contains("my-post"), "报错须含文章 key: {msg}");
-        assert!(msg.contains("t/big.png"), "报错须含文件路径: {msg}");
+        match output {
+            ImageOutput::LinkOnly { reason } => {
+                assert!(reason.contains("256"), "降级原因须包含预算: {reason}");
+            }
+            ImageOutput::Inline(_) => panic!("超限图片不应内联"),
+        }
+    }
+
+    #[test]
+    fn process_oversize_fake_image_still_fails_validation() {
+        let dir = std::env::temp_dir().join(format!("tb-img-test-{}-fake-big", std::process::id()));
+        let fake = vec![b'x'; MAX_BITMAP_BYTES + 1];
+        let p = write_tmp(&dir, "fake.png", &fake);
+        let error = process_image(&p, "t/fake.png", "my-post").unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        let message = format!("{error:#}");
+        assert!(message.contains("my-post"), "报错须含文章 key: {message}");
+        assert!(message.contains("t/fake.png"), "报错须含路径: {message}");
     }
 
     #[test]
@@ -441,17 +496,21 @@ mod tests {
             0x3b,
         ];
         let p = write_tmp(&dir, "a.gif", gif1x1);
-        let r = process_image(&p, "t/a.gif", "t").unwrap();
+        let r = expect_inline(process_image(&p, "t/a.gif", "t").unwrap());
         assert_eq!((r.width, r.height), (1, 1));
         assert_eq!(r.bytes, gif1x1, "gif 应原样采用");
-        // 超 512 KiB 的 gif → fail(内容是不是合法 gif 无所谓, 尺寸解码失败也会 fail;
-        // 这里构造: 合法 gif 头 + 尾部填充垃圾 —— gif 解码器容忍尾部垃圾)
+        // 超 512 KiB 的 gif 原样发布为链接，不进入解码/内联管线。
         let mut big = gif1x1.to_vec();
         big.resize(MAX_GIF_BYTES + 1, 0);
         let p2 = write_tmp(&dir, "big.gif", &big);
-        let err = process_image(&p2, "t/big.gif", "t").unwrap_err();
+        let output = process_image(&p2, "t/big.gif", "t").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(format!("{err}").contains("512"), "gif 预算报错: {err}");
+        match output {
+            ImageOutput::LinkOnly { reason } => {
+                assert!(reason.contains("512"), "gif 降级原因: {reason}");
+            }
+            ImageOutput::Inline(_) => panic!("超限 gif 不应内联"),
+        }
     }
 
     #[test]
@@ -465,7 +524,7 @@ mod tests {
             .write_image(img.as_raw(), 2, 2, image::ExtendedColorType::Rgba8)
             .unwrap();
         let p = write_tmp(&dir, "a.webp", &buf);
-        let r = process_image(&p, "t/a.webp", "t").unwrap();
+        let r = expect_inline(process_image(&p, "t/a.webp", "t").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(r.dist_rel, "t/a.png", "webp 产物应统一转 png 扩展名");
         assert_eq!((r.width, r.height), (2, 2));

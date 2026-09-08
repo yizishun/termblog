@@ -29,6 +29,24 @@ use termblog_content_model::{ArticlePath, CommentAttachment, ContentScope};
 const GLOBAL_LIST_DIRECTORY: &str = "blog";
 const GLOBAL_LIST_OUTPUT: &str = "blog/index.html";
 
+/// 本地图片在正文中的发布形态。
+pub enum ImagePresentation {
+    /// 处理后图片可在 Web 和终端中内联显示。
+    Inline {
+        width: u32,
+        height: u32,
+        url: String,
+    },
+    /// 原图仅由 Web 发布，正文显示可点击链接。
+    LinkOnly { url: String },
+}
+
+/// Web 图片产物：小图用内存中的处理后字节，超限原图从磁盘流式复制。
+enum WebAsset {
+    Processed(Vec<u8>),
+    Original(PathBuf),
+}
+
 /// 一篇文章的编译中间态: 元数据 + 解析后的事件流。
 pub struct Article {
     pub path: ArticlePath,
@@ -41,9 +59,8 @@ pub struct Article {
     /// 日期走了 mtime fallback(构建告警用)
     pub date_warned: bool,
     pub events: Vec<Event<'static>>,
-    /// 本地图 dest_url 原文 → (宽, 高, 重写后的站点绝对路径); html.rs 查表用。
-    /// 外链不进表(html.rs 查不到 = External, 省略宽高)。
-    pub image_meta: HashMap<String, (u32, u32, String)>,
+    /// 本地图 dest_url 原文 → 内联图或原图链接。外链不进表。
+    pub image_meta: HashMap<String, ImagePresentation>,
     /// 本地图 dest_url 原文 → (源 rel 路径, 处理后产物 rel 路径)。
     /// 图片二期 manifest 锚点用(webp 转 png 后两个扩展名不同)。
     pub dest_paths: HashMap<String, (String, String)>,
@@ -700,15 +717,18 @@ fn main() -> Result<()> {
         .collect();
 
     // 逐篇: 读文件(BOM/CRLF 规范化)→ 解析(两投影共用同一套选项)→ 元数据 → 日期
-    // 同循环处理图片: resolve → 存在性校验 → 缩放/预算 → 记录 image_meta。
-    // 所有图片问题收集后统一 fail(宁构建失败, 不线上 404)。
+    // 同循环处理图片: resolve → 存在性校验 → 内联/原图链接决策。
+    // 路径、解码和输出冲突仍统一 fail；超预算只降级为链接。
     let mut arts: Vec<Article> = vec![];
     let mut image_errors: Vec<String> = vec![];
-    let mut asset_bytes: HashMap<String, Vec<u8>> = HashMap::new(); // Web 产物 rel → 处理后字节
+    let mut web_assets: HashMap<String, WebAsset> = HashMap::new();
+    let mut rendered_asset_bytes: HashMap<String, Vec<u8>> = HashMap::new();
     let mut asset_owners: BTreeMap<String, String> = BTreeMap::new();
     let mut referenced: HashSet<String> = HashSet::new(); // 被引用的源资源 rel 路径
-    let mut total_imgs = 0usize;
-    let mut total_bytes = 0usize;
+    let mut total_inline_imgs = 0usize;
+    let mut total_inline_bytes = 0usize;
+    let mut total_link_imgs = 0usize;
+    let mut total_link_bytes = 0u64;
     for article_path in &article_paths {
         let path = cli.content.join(&article_path.source_rel);
         let src =
@@ -739,8 +759,8 @@ fn main() -> Result<()> {
             ));
         }
 
-        // 图片引用: 逐张 resolve + 处理, 单篇总量预算 6 MiB
-        let mut image_meta: HashMap<String, (u32, u32, String)> = HashMap::new();
+        // 图片引用: 逐张 resolve + 处理, 单篇内联总量预算 1.5 MiB
+        let mut image_meta: HashMap<String, ImagePresentation> = HashMap::new();
         let mut dest_paths: HashMap<String, (String, String)> = HashMap::new(); // dest → (源 rel, 产物 rel)
         let mut first_image: Option<String> = None;
         let mut article_bytes = 0usize;
@@ -773,18 +793,34 @@ fn main() -> Result<()> {
                 ));
                 continue;
             }
-            match img::process_image(&img_path, &rel_path, key) {
-                Err(e) => image_errors.push(format!("{e:#}")),
-                Ok(p) => {
-                    article_bytes += p.bytes.len();
-                    if article_bytes > img::MAX_ARTICLE_BYTES {
-                        image_errors.push(format!(
-                            "total image size for \"{key}\" exceeds per-article budget: accumulated {} KiB (limit {} KiB, excess from {rel_path}); please compress/reduce images",
-                            article_bytes / 1024,
+            let source_len = match std::fs::metadata(&img_path) {
+                Ok(metadata) => metadata.len(),
+                Err(e) => {
+                    image_errors.push(format!("stat image {}: {e}", img_path.display()));
+                    continue;
+                }
+            };
+            let output = match img::process_image(&img_path, &rel_path, key) {
+                Err(e) => {
+                    image_errors.push(format!("{e:#}"));
+                    continue;
+                }
+                Ok(img::ImageOutput::Inline(p))
+                    if article_bytes.saturating_add(p.bytes.len()) > img::MAX_ARTICLE_BYTES =>
+                {
+                    img::ImageOutput::LinkOnly {
+                        reason: format!(
+                            "article inline total would reach {} KiB, exceeding {} KiB",
+                            article_bytes.saturating_add(p.bytes.len()) / 1024,
                             img::MAX_ARTICLE_BYTES / 1024
-                        ));
-                        continue;
+                        ),
                     }
+                }
+                Ok(output) => output,
+            };
+
+            match output {
+                img::ImageOutput::Inline(p) => {
                     if let Some(first) = asset_owners.insert(p.dist_rel.clone(), rel_path.clone()) {
                         if first != rel_path {
                             image_errors.push(format!(
@@ -794,17 +830,51 @@ fn main() -> Result<()> {
                             continue;
                         }
                     }
-                    total_imgs += 1;
-                    total_bytes += p.bytes.len();
+                    article_bytes += p.bytes.len();
+                    total_inline_imgs += 1;
+                    total_inline_bytes += p.bytes.len();
                     referenced.insert(rel_path.clone());
-                    asset_bytes.insert(p.dist_rel.clone(), p.bytes.clone());
+                    web_assets.insert(p.dist_rel.clone(), WebAsset::Processed(p.bytes.clone()));
+                    rendered_asset_bytes.insert(p.dist_rel.clone(), p.bytes);
                     // 产物 URL: webp 已转 png, 路径用转换后的扩展名
                     let url = format!("/{}{suffix}", p.dist_rel);
-                    image_meta.insert(dest.clone(), (p.width, p.height, url.clone()));
+                    image_meta.insert(
+                        dest.clone(),
+                        ImagePresentation::Inline {
+                            width: p.width,
+                            height: p.height,
+                            url: url.clone(),
+                        },
+                    );
                     dest_paths.insert(dest.clone(), (rel_path, p.dist_rel));
                     if first_image.is_none() {
                         first_image = Some(url);
                     }
+                }
+                img::ImageOutput::LinkOnly { reason } => {
+                    if let Some(first) = asset_owners.insert(rel_path.clone(), rel_path.clone()) {
+                        if first != rel_path {
+                            image_errors.push(format!(
+                                "Web output conflict: {rel_path} generated simultaneously by {first} and {rel_path}"
+                            ));
+                            continue;
+                        }
+                    }
+                    total_link_imgs += 1;
+                    total_link_bytes = total_link_bytes.saturating_add(source_len);
+                    referenced.insert(rel_path.clone());
+                    web_assets.insert(rel_path.clone(), WebAsset::Original(img_path));
+                    let url = format!("/{rel_path}{suffix}");
+                    image_meta.insert(
+                        dest.clone(),
+                        ImagePresentation::LinkOnly { url: url.clone() },
+                    );
+                    if first_image.is_none() {
+                        first_image = Some(url);
+                    }
+                    warns.push(format!(
+                        "\"{key}\" image {rel_path} published as original link: {reason}"
+                    ));
                 }
             }
         }
@@ -950,15 +1020,31 @@ fn main() -> Result<()> {
         .map(|(path, target)| format!("{path}\t{target}\n"))
         .collect();
 
-    // 复制被引用的图片资源进 Web staging 和 .rendered-assets staging。
-    // Web 与 .rendered-assets 使用相同 content-relative 路径和字节。
-    for (rel_path, bytes) in &asset_bytes {
+    // Web 包含所有被引用资源：预算内用处理后字节，超限用无限制原图。
+    for (rel_path, asset) in &web_assets {
         let p = stage_web.join(rel_path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        std::fs::write(&p, bytes).with_context(|| format!("write image {}", p.display()))?;
+        match asset {
+            WebAsset::Processed(bytes) => {
+                std::fs::write(&p, bytes)
+                    .with_context(|| format!("write image {}", p.display()))?;
+            }
+            WebAsset::Original(source) => {
+                std::fs::copy(source, &p).with_context(|| {
+                    format!(
+                        "copy original image {} -> {}",
+                        source.display(),
+                        p.display()
+                    )
+                })?;
+            }
+        }
+    }
+    // 终端资产只含预算内图片；链接原图不进入 IIP 载荷。
+    for (rel_path, bytes) in &rendered_asset_bytes {
         let q = rendered_assets.join(rel_path);
         if let Some(parent) = q.parent() {
             std::fs::create_dir_all(parent)
@@ -974,16 +1060,28 @@ fn main() -> Result<()> {
 
     // 逐篇产出: HTML 镜像页 + ANSI 预渲染(+ 图片 sidecar manifest)
     for a in &arts {
-        // 锚点查表: dest 原文 → (源 rel, 产物 rel, 宽, 高)。外链/行内图查不到
-        // → 不产锚点, 占位框保持纯文本形态。
+        // 锚点查表只返回预算内图片。外链/链接原图不产生锚点，
+        // 因而 TUI 不读取、不传输它们。
         let lookup = |dest: &str| -> Option<ansi::ImgMeta> {
-            let (w, h, _) = *a.image_meta.get(dest)?;
+            let ImagePresentation::Inline {
+                width: w,
+                height: h,
+                ..
+            } = a.image_meta.get(dest)?
+            else {
+                return None;
+            };
             let (path, asset) = a
                 .dest_paths
                 .get(dest)
                 .cloned()
                 .unwrap_or_else(|| (dest.to_string(), dest.to_string()));
-            Some(ansi::ImgMeta { path, asset, w, h })
+            Some(ansi::ImgMeta {
+                path,
+                asset,
+                w: *w,
+                h: *h,
+            })
         };
         let (ansi_out, anchors) = ansi::render_ansi(
             &a.events,
@@ -1107,10 +1205,15 @@ fn main() -> Result<()> {
     );
     println!("  ANSI pre-rendered: {}/.rendered/", cli.content.display());
     println!(
-        "  images: {} file(s), total {} KiB (budget {} KiB/article)",
-        total_imgs,
-        total_bytes / 1024,
+        "  inline images: {} file(s), total {} KiB (budget {} KiB/article)",
+        total_inline_imgs,
+        total_inline_bytes / 1024,
         img::MAX_ARTICLE_BYTES / 1024
+    );
+    println!(
+        "  linked originals: {} file(s), total {} KiB (no size limit)",
+        total_link_imgs,
+        total_link_bytes / 1024
     );
     println!(
         "  processed images: {}/.rendered-assets/",

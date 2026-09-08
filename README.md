@@ -26,10 +26,10 @@ SEO 产物(sitemap/atom/canonical)构建期生成。
   HTML 静态镜像(输出路径直接对应文章 route，爬虫不开 jail 也能读全文)与 ANSI 预渲染
   (`jailtpl/content/.rendered/`, 终端 `less -R` 可读), 并产出列表页/
   sitemap/atom/robots。图片走资源管线: 相对 Markdown 目录解析并改写为站点绝对路径、
-  超宽自动缩放、尺寸/字节预算 fail-fast; 镜像页出真图(`<img>` 带真实宽高 +
-  og:image), 终端出格式稳定的占位框(OSC 8 可点链接)。带图文章另产
+  预算内图片可内联；超限时不压缩原图，而是发布无限制原图并将正文降级为
+  可点击链接。带内联图文章另产
   sidecar `~/.rendered/<article-key>.images.json`(占位框行号区间 + 几何)与
-  处理后图片 `~/.rendered-assets/`(webp 统一转 png, 与 Web 产物同字节)。
+  处理后图片 `~/.rendered-assets/`(webp 统一转 png)。
   路径映射、评论配置和写作约定见 `docs/content-authoring.md`。
 - **jailbin**: 装进 jail 模板的访客命令多合一二进制(busybox 式), `blog`(cat 式
   文章阅读器: 读预渲染排版 + 同步地址栏)、`play`(asciicast 终端录像播放器,
