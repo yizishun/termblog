@@ -6,6 +6,8 @@
 #   make tpl-refresh  联网刷新 base/pkg 并零停机换模板
 #   make deploy       全量生产部署(deploy.sh; 需模板已构建)
 #   make content      只改文章的部署: 静态发布 + 模板零停机换面
+#   make deploy-debug 使用 debug 配置全量部署
+#   make content-debug 使用 debug 配置发布文章
 #
 # 开发期目标(不带后缀的操作 web, 带 -ssh 后缀的对应操作 ssh):
 #   run/run-ssh            前台运行(Ctrl-C 停止, 调试用)
@@ -24,6 +26,8 @@
 BIN_WEB := target/release/termblog-web
 BIN_SSH := target/release/termblog-ssh
 BIN_CONTENT := target/release/content-build
+CONFIG_PROD := etc/termblog.toml
+CONFIG_DEBUG := etc/termblog-debug.toml
 PID_WEB := .termblog-web.pid
 PID_SSH := .termblog-ssh.pid
 LOG_WEB := termblog-web.log
@@ -33,7 +37,8 @@ URL_WEB := http://$(HOSTNAME):8080
 URL_SSH := ssh://0.0.0.0:2222
 
 .PHONY: all build build-frontend build-content \
-        tpl tpl-refresh deploy content verify-comments verify-stats verify-content-paths \
+        tpl tpl-refresh deploy deploy-debug content content-debug \
+        verify-comments verify-stats verify-content-paths \
         run run-ssh \
         start start-ssh stop stop-ssh restart restart-ssh \
         status status-ssh logs logs-ssh clean
@@ -51,27 +56,33 @@ build-frontend: frontend/node_modules
 # 注意顺序: 必须在 vite build 之后跑(产物写入 dist 且需读 assets/index-*.js)
 build-content:
 	cargo build --release -p content-build
-	TERMBLOG_CONFIG=etc/termblog.toml $(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
+	TERMBLOG_CONFIG=$(CONFIG_PROD) $(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
 
 # ── 构建: 一次产出全部二进制(含 jailbin)+ 前端 + 内容镜像 ──
 build: build-frontend
 	cargo build --release
-	TERMBLOG_CONFIG=etc/termblog.toml $(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
+	TERMBLOG_CONFIG=$(CONFIG_PROD) $(BIN_CONTENT) --content jailtpl/content --dist frontend/dist
 
 # ── 部署入口(需要 root): 薄入口, sudo 已内嵌; 逻辑在 deploy-scripts/ ──
 tpl:
-	sudo sh deploy-scripts/build-template.sh
+	sudo env TERMBLOG_CONFIG=$(CONFIG_PROD) sh deploy-scripts/build-template.sh
 
 # 显式联网刷新 FreeBSD base/pkg 基础层，然后零停机换模板。
 tpl-refresh:
-	sudo sh deploy-scripts/build-template.sh --refresh-base
+	sudo env TERMBLOG_CONFIG=$(CONFIG_PROD) sh deploy-scripts/build-template.sh --refresh-base
 
 deploy:
-	sudo sh deploy-scripts/deploy.sh
+	sudo env TERMBLOG_CONFIG=$(CONFIG_PROD) sh deploy-scripts/deploy.sh
+
+deploy-debug:
+	sudo env TERMBLOG_CONFIG=$(CONFIG_DEBUG) sh deploy-scripts/deploy.sh
 
 # 只改文章的部署: 静态发布 + 模板零停机换面(全程不停服、不杀会话)
 content:
-	sudo sh -c 'sh deploy-scripts/deploy.sh --static-only && sh deploy-scripts/build-template.sh --replace'
+	sudo env TERMBLOG_CONFIG=$(CONFIG_PROD) sh -c 'sh deploy-scripts/deploy.sh --static-only && sh deploy-scripts/build-template.sh --replace'
+
+content-debug:
+	sudo env TERMBLOG_CONFIG=$(CONFIG_DEBUG) sh -c 'sh deploy-scripts/deploy.sh --static-only && sh deploy-scripts/build-template.sh --replace'
 
 # ── 前台运行(Ctrl-C 停止) ──
 run: build

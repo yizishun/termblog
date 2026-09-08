@@ -1,9 +1,10 @@
 #!/bin/sh
-# deploy-scripts/deploy.sh —— 生产部署(必须以 root 运行, 一步到位)
+# deploy-scripts/deploy.sh —— 全量/内容部署(默认生产配置，必须以 root 运行)
 #
 #   su -
 #   sh /home/yzs/termblog/deploy-scripts/deploy.sh               # 全量部署(用已构建的模板)
 #   sh /home/yzs/termblog/deploy-scripts/deploy.sh --static-only # 只发静态镜像(零停机改文章)
+#   TERMBLOG_CONFIG=etc/termblog-debug.toml sh ...                # 使用 debug 配置
 #
 # 全量做的事: 检查/写入 racct(loader tunable, 首次需要重启机器) ->
 # 检查 jail 模板已存在(不存在则提示先跑 build-template.sh) ->
@@ -21,8 +22,16 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 REPO=$(dirname "$SCRIPT_DIR")
 STATIC_DIR=/usr/local/share/termblog/frontend
 BUILD_USER=yzs
+CONFIG=${TERMBLOG_CONFIG:-etc/termblog.toml}
+case "$CONFIG" in
+    /*) ;;
+    *) CONFIG="$REPO/$CONFIG" ;;
+esac
 
 [ "$(id -u)" -eq 0 ] || { echo "root required (service/zfs/install)"; exit 1; }
+
+[ -f "$CONFIG" ] || { echo "configuration not found: $CONFIG"; exit 1; }
+echo ">> Configuration: $CONFIG"
 
 publish_static() {
     static_parent=$(dirname "$STATIC_DIR")
@@ -50,7 +59,7 @@ publish_static() {
 if [ "${1:-}" = "--static-only" ]; then
     echo ">> 1/2 Compiling content (as $BUILD_USER, artifacts to frontend/dist and jailtpl/content/.rendered)"
     su -l "$BUILD_USER" -c "set -e; cd $REPO; cargo build --release -p content-build; \
-        TERMBLOG_CONFIG=$REPO/etc/termblog.toml ./target/release/content-build --content jailtpl/content --dist frontend/dist"
+        TERMBLOG_CONFIG=$CONFIG ./target/release/content-build --content jailtpl/content --dist frontend/dist"
     echo ">> 2/2 Publishing static mirror (pure file replacement, seamless, no restart)"
     install -d /usr/local/share/termblog
     install -m 444 "$REPO/jailtpl/content/.comment-targets.tsv" /usr/local/share/termblog/comment-targets.tsv
@@ -121,7 +130,7 @@ done < /jails/template/usr/local/share/termblog/comment-targets.tsv
 echo ">> Compiling (full workspace + frontend + content artifacts)"
 su -l "$BUILD_USER" -c "set -e; cd $REPO; cargo build --release; \
     cd frontend; [ -d node_modules ] || npm install; npm run build; \
-    cd $REPO; TERMBLOG_CONFIG=$REPO/etc/termblog.toml ./target/release/content-build --content jailtpl/content --dist frontend/dist"
+    cd $REPO; TERMBLOG_CONFIG=$CONFIG ./target/release/content-build --content jailtpl/content --dist frontend/dist"
 
 # ── 4. 安装 ──
 echo ">> Installing binaries / frontend / rc scripts"
@@ -134,10 +143,10 @@ install -m 555 "$REPO/target/release/termblog-statd" /usr/local/sbin/termblog-st
 ln -sf commentd /usr/local/sbin/commentctl
 install -m 444 "$REPO/jailtpl/content/.comment-targets.tsv" /usr/local/share/termblog/comment-targets.tsv
 install -m 444 "$REPO/jailtpl/content/.rendered/.index.json" /usr/local/share/termblog/article-index.json
-install -m 644 "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml.sample
-if [ -f /usr/local/etc/termblog.toml ] && ! cmp -s "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml; then
+install -m 644 "$CONFIG" /usr/local/etc/termblog.toml.sample
+if [ -f /usr/local/etc/termblog.toml ] && ! cmp -s "$CONFIG" /usr/local/etc/termblog.toml; then
     cp /usr/local/etc/termblog.toml /usr/local/etc/termblog.toml.old
-    install -m 644 "$REPO/etc/termblog.toml" /usr/local/etc/termblog.toml
+    install -m 644 "$CONFIG" /usr/local/etc/termblog.toml
     echo ">> Configuration updated: old version backed up to /usr/local/etc/termblog.toml.old, active config refreshed to repo version"
 elif [ ! -f /usr/local/etc/termblog.toml ]; then
     cp /usr/local/etc/termblog.toml.sample /usr/local/etc/termblog.toml

@@ -51,7 +51,7 @@ deploy-scripts/  # build-template.sh(模板构建/零停机换面) deploy.sh(全
 tests/           # verify 脚本与无 blog 目录的 content path 端到端验收
 jailtpl/content/ # guest HOME 蓝图；任意可见 *.md 是文章，blog/ 无特殊语义
                  # 隐藏配置和 .rendered 等生成物不按普通内容复制
-etc/             # termblog.toml 样例 + rc.d + newsyslog
+etc/             # production/debug TOML 配置 + rc.d + newsyslog
 frontend/        # xterm.js 前端(vite)
 ```
 
@@ -63,6 +63,8 @@ frontend/        # xterm.js 前端(vite)
 | `make tpl-refresh` | 显式联网刷新 FreeBSD base/pkg 基础层，并零停机换模板 |
 | `make deploy` | 全量生产部署: racct 检查 → 编译 → 安装 → 发布镜像 → 拉起服务(需模板已构建) |
 | `make content` | 只改文章的部署: 静态发布 + 模板零停机换面, 全程不停服、不杀会话 |
+| `make deploy-debug` | 使用 `etc/termblog-debug.toml` 全量部署(HTTP 8080 / SSH 2222 / 关闭 TLS) |
+| `make content-debug` | 使用 debug 配置发布静态镜像并零停机换模板 |
 | `deploy.sh --static-only` | 只发静态镜像(零停机); jail 侧下次模板重建跟进 |
 | `build-template.sh --replace` | 零停机换模板(旧会话继续用旧模板, 全部退出后回收) |
 
@@ -74,7 +76,8 @@ FreeBSD/pkg 网络。需要安全更新或升级 jail 用户态时才运行
 `make tpl-refresh`。Cargo/npm 仍按各自的本地依赖缓存做增量构建。
 
 部署目标内嵌 sudo, 直接 `make tpl` / `make tpl-refresh` / `make deploy` /
-`make content` 即可
+`make content` 即可；debug 环境使用 `make deploy-debug` / `make content-debug`
+即可
 (会提示输入密码)。部署脚本不依赖 Makefile; Makefile 只是薄入口。
 
 > **模板功能升级注意**: 新 jailbin、评论 FIFO/scope 清单、jail-root `/proc` 目录树、文章机器索引、`help.md` 和图片产物只存在于
@@ -83,7 +86,11 @@ FreeBSD/pkg 网络。需要安全更新或升级 jail 用户态时才运行
 > `deploy.sh` 会拒绝启动缺少 scope 清单、文章索引或 `/proc` 目录的旧模板，避免新 jaild 交付不了会话。
 > 后续只改文章仍走 `make content`(内部已含 `--replace`)。
 
-配置: `/usr/local/etc/termblog.toml`(仓库 `etc/termblog.toml` 为样例)。
+配置: `/usr/local/etc/termblog.toml`。仓库中 `etc/termblog.toml` 是默认生产
+配置，`etc/termblog-debug.toml` 是 debug 配置；不带 `-debug` 的部署目标
+总是使用生产配置。`deploy-debug` 会将 debug 配置安装为运行配置，
+`content-debug` 只按 debug URL 重建并发布内容，不改动已安装的运行配置。
+
 部署后务必设 `web.site_url`(不设则不产 sitemap/atom/canonical);
 `web.site_title` 用于镜像页标题 / og:site_name / atom 标题。`[stats]` 配置统计 socket、root-only 数据目录和非关键请求超时；首次全量部署会显式执行 `termblog-statd --init`，已有目录缺文件或 schema 损坏时拒绝自动修复。
 

@@ -22,6 +22,7 @@
 #
 # 构建输入(jailbin 二进制 + 内容产物 .rendered)由本脚本自建(以 yzs 编译,
 # 不依赖 Makefile)。
+# 默认读取 etc/termblog.toml；可用 TERMBLOG_CONFIG 指定仓库相对或绝对路径。
 
 set -eu
 
@@ -58,9 +59,17 @@ GUEST=guest
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 REPO=$(dirname "$SCRIPT_DIR")
 BUILD_USER=yzs
+CONFIG=${TERMBLOG_CONFIG:-etc/termblog.toml}
+case "$CONFIG" in
+    /*) ;;
+    *) CONFIG="$REPO/$CONFIG" ;;
+esac
 
 [ "$(id -u)" -eq 0 ] || { echo "root required (zfs/mount/pw)"; exit 1; }
 command -v zfs >/dev/null || { echo "ZFS required"; exit 1; }
+
+[ -f "$CONFIG" ] || { echo "configuration not found: $CONFIG"; exit 1; }
+echo ">> Configuration: $CONFIG"
 
 CLEANUP_BASE_DS=
 CLEANUP_BASE_MOUNT=
@@ -171,7 +180,7 @@ echo ">> Preparing build inputs (as $BUILD_USER: content-build + jailbin + conte
 su -l "$BUILD_USER" -c "set -e; cd $REPO; \
     cargo build --release -p content-build -p termblog-jailbin; \
     ( cd frontend; [ -d node_modules ] || npm install; npm run build ); \
-    TERMBLOG_CONFIG=$REPO/etc/termblog.toml ./target/release/content-build --content jailtpl/content --dist frontend/dist"
+    TERMBLOG_CONFIG=$CONFIG ./target/release/content-build --content jailtpl/content --dist frontend/dist"
 
 # 1. 确定构建目标数据集: --replace 走旁路名(旧模板与在线会话全程不动)
 if [ "$REPLACE" -eq 1 ]; then

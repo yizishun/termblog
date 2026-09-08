@@ -1,0 +1,53 @@
+# termblog debug 配置(jaild / termblog-web / termblog-ssh 三个二进制共用)
+
+[web]
+# debug 使用非特权端口，不需要 mac_portacl。
+listen = "0.0.0.0:8080"
+static_dir = "/usr/local/share/termblog/frontend"
+site_url = "http://192.168.50.100:8080"
+site_title = "~yzs"
+
+[web.tls]
+# debug 不申请 ACME 证书，只启动上面的 HTTP 监听。
+enabled = false
+listen = "0.0.0.0:3443"
+domains = []
+contacts = []
+cache_dir = "/var/db/termblog/acme-debug"
+production = false
+
+[ssh]
+listen = "0.0.0.0:2222"
+user = "blog"
+host_key = "/var/db/termblog/ssh_host_ed25519"
+
+[session]
+max_total = 64
+max_per_ip = 3
+hard_lifetime_secs = 7200
+
+[jail]
+socket = "/var/run/termblog.sock"
+template = "zroot/jails/template@release"
+dataset_prefix = "zroot/jails/s-"
+disk_quota = "4M"
+path_prefix = "/jails"
+memory = "128M"
+vmemory = "512M"
+maxproc = 32
+openfiles = 256
+pcpu = 25
+zsh = "/usr/local/bin/zsh"
+guest_user = "guest"
+
+[comments]
+public_socket = "/var/run/commentd-public.sock"
+private_socket = "/var/run/commentd-private.sock"
+data_dir = "/var/db/termblog-commentd"
+targets_file = "/usr/local/share/termblog/comment-targets.tsv"
+session_drain_ms = 1000
+
+[stats]
+socket = "/var/run/termblog-statd.sock"
+data_dir = "/var/db/termblog-statd"
+request_timeout_ms = 250
