@@ -69,12 +69,14 @@ frontend/        # xterm.js 前端(vite)
 | `build-template.sh --replace` | 零停机换模板(旧会话继续用旧模板, 全部退出后回收) |
 
 `build-template.sh` 使用两层 ZFS 模板。`zroot/jails/template-base@prepared`
-只含默认固定的 FreeBSD 15.0-RELEASE base 和 jail 通用包；首次构建时下载并将 `base.txz`
+只含与宿主版本对应的 FreeBSD base 和 jail 通用包；首次构建时下载并将 `base.txz`
 持久缓存到 `/var/cache/termblog`。后续 `--replace`/`make content` 直接从
 该快照本地 clone，只更新 guest 配置、`jailbin` 和博客内容，不再访问
 FreeBSD/pkg 网络。需要安全更新或升级 jail 用户态时才运行
-`make tpl-refresh`。需要改版本时可为脚本设置 `TERMBLOG_JAIL_RELEASE`
-或显式传入 base.txz URL。Cargo/npm 仍按各自的本地依赖缓存做增量构建。
+`make tpl-refresh`。脚本会为 RELEASE 选择 `releases/`，为
+CURRENT/STABLE 选择 `snapshots/`。需要固定版本时可设置
+`TERMBLOG_JAIL_RELEASE` 或显式传入 base.txz URL。Cargo/npm 仍按各自的
+本地依赖缓存做增量构建。
 
 部署目标内嵌 sudo, 直接 `make tpl` / `make tpl-refresh` / `make deploy` /
 `make content` 即可；debug 环境使用 `make deploy-debug` / `make content-debug`

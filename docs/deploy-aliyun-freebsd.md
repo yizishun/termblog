@@ -203,12 +203,13 @@ cd ..
 
 ## 阶段 4 —— 构建 jail 模板(root, 首次需网络)
 
-`build-template.sh` 默认固定 FreeBSD `15.0-RELEASE`，不跟随执行脚本的
-宿主版本。因此 16.0-CURRENT 的 debug 宿主和 15.0-RELEASE 的生产宿主
-都会构建同一套 15.0 jail 用户态。官方 URL 默认为：
+`build-template.sh` 默认跟随执行脚本的宿主用户态版本
+(`freebsd-version -u`)，并去掉 `-pN` patch level。RELEASE 使用
+`releases/`，CURRENT/STABLE 使用 `snapshots/`。例如：
 
 ```text
-https://download.freebsd.org/releases/amd64/amd64/15.0-RELEASE/base.txz
+15.0-RELEASE-p4 -> releases/amd64/amd64/15.0-RELEASE/base.txz
+16.0-CURRENT    -> snapshots/amd64/amd64/16.0-CURRENT/base.txz
 ```
 
 ```sh
@@ -220,7 +221,7 @@ cd ~/termblog && make tpl
 make content
 # debug 环境则用: make content-debug
 
-# 需要改 jail 版本时才覆盖，并显式刷新 base：
+# 需要固定 jail 版本时才覆盖，并显式刷新 base：
 sudo env TERMBLOG_JAIL_RELEASE=15.0-RELEASE \
   sh deploy-scripts/build-template.sh --refresh-base
 
@@ -408,7 +409,7 @@ sysctl vfs.zfs.arc_summary | head -20
 | 重启后 80/443/22 又绑不上 | sysctl.conf 里 rules 被追加成了第二行(整表替换, 后行覆盖前行)/ loader.conf 缺 mac_portacl_load |
 | HTTPS 一直拿不到证书 | DNS 未指向本机/安全组未同时开放 80 和 443/大陆 ECS 域名未备案；查 `/var/log/termblog-web.log` 的 ACME error |
 | ssh -p 2222 连不上(管理入口) | 安全组没放行 2222 / sshd_config 缺 Port 2222 行 / cloud-init 重写了 sshd_config |
-| build-template.sh 下载了错误的 FreeBSD 版本 | 默认应为 15.0-RELEASE；检查 `TERMBLOG_JAIL_RELEASE` 或传入的 URL，然后重试 `--refresh-base` |
+| build-template.sh 下载了错误的 FreeBSD 版本 | 默认应跟随 `freebsd-version -u`；检查 `TERMBLOG_JAIL_RELEASE` 或传入的 URL，然后重试 `--refresh-base` |
 | 公网不通但本机 fetch 通 | 阿里云安全组没放行 80/443/22/2222 中对应的入口端口 |
 | 会话开不出, 查 jaild 日志 | `tail -50 /var/log/jaild.log` |
 
