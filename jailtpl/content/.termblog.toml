@@ -1,3 +1,8 @@
 [scopes]
 # 空字符串代表 HOME 根；其余项是 content/HOME 相对目录。
-directories = ["", "freebsd"]
+directories = [
+    "",
+    "freebsd",
+    "security/riscv-linux-security",
+    "security/riscv-linux-security/weekly-reports",
+]
