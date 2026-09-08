@@ -201,34 +201,40 @@ cd ..
 ./target/release/content-build --content jailtpl/content --dist frontend/dist
 ```
 
-## 阶段 4 —— 构建 jail 模板(root, 需网络)
+## 阶段 4 —— 构建 jail 模板(root, 首次需网络)
+
+`build-template.sh` 默认固定 FreeBSD `15.0-RELEASE`，不跟随执行脚本的
+宿主版本。因此 16.0-CURRENT 的 debug 宿主和 15.0-RELEASE 的生产宿主
+都会构建同一套 15.0 jail 用户态。官方 URL 默认为：
+
+```text
+https://download.freebsd.org/releases/amd64/amd64/15.0-RELEASE/base.txz
+```
 
 ```sh
-# ── 4.1 预下载 base.txz(脚本见 /tmp/termblog-base.txz 存在即跳过下载) ──
-# 必须 15.0-RELEASE: 与宿主内核同版本(jail 用户态不能比宿主内核新)。
-# 脚本默认 URL 是 16.0-CURRENT 快照, 这就是为什么要预下载覆盖它。
-# 文件保留在 /tmp 供以后 --replace 换面复用(约 800M, 磁盘预算内)。
-fetch -o /tmp/termblog-base.txz \
-  https://mirrors.aliyun.com/freebsd/releases/amd64/15.0-RELEASE/base.txz
+# 全新环境：创建 prepared base，再从它 clone 出 release 模板。
+cd ~/termblog && make tpl
 
-# ── 4.2 校验(脚本自己不校验; hash 取自官方 MANIFEST, 镜像文件应一致) ──
-test "$(sha256 -q /tmp/termblog-base.txz)" = \
-  "ac0c933cc02ee8af4da793f551e4a9a15cdcf0e67851290b1e8c19dd6d30bba8" \
-  && echo "base.txz 校验 OK" \
-  || { echo "校验失败! 删除重下: rm /tmp/termblog-base.txz"; }
+# 已有旧单层 template@release、但没有 template-base@prepared 时：
+# 无需删除旧模板；content/content-debug 会先旁路补建 base，再零停机换 release。
+make content
+# debug 环境则用: make content-debug
 
-# ── 4.3 构建(首次; 模板已存在会拒绝, 防覆盖在跑会话) ──────────────────
-# 内部: 以 yzs 增量编译(阶段 3 已热, 秒回)→ 建 zroot/jails/template →
-#   解 base.txz → chroot pkg 装 zsh/less/tree → guest 用户 →
-#   内容 + 评论 FIFO + /proc scope 目录 + jailbin → snapshot → readonly=on
-sudo sh ~/termblog/deploy-scripts/build-template.sh
+# 需要改 jail 版本时才覆盖，并显式刷新 base：
+sudo env TERMBLOG_JAIL_RELEASE=15.0-RELEASE \
+  sh deploy-scripts/build-template.sh --refresh-base
 
-# ── 4.4 核验模板 ───────────────────────────────────────────────────────
-zfs list -o name,used,readonly zroot/jails/template        # readonly=on
-zfs list -t snapshot                                         # @release 在列
-ls -l /jails/template/usr/local/bin/blog                    # jailbin 符号链接
-ls /jails/template/usr/local/share/termblog/                # comment-targets.tsv + article-index.json
+# base.txz 缓存在 /var/cache/termblog，以后换内容不再下载。
+zfs list -o name,used,readonly zroot/jails/template-base zroot/jails/template
+zfs list -t snapshot | grep -E 'template-base@prepared|template@release'
+zfs get org.termblog:base-url zroot/jails/template-base
+ls -l /jails/template/usr/local/bin/blog
+ls /jails/template/usr/local/share/termblog/
 ```
+
+首次补建 base 或下载失败时，脚本只操作 `template-base.new` /
+`template.new` 旁路数据集；失败残留会在下次重试时自动清理，不要手工
+destroy 正在使用的 `zroot/jails/template`。
 
 ## 阶段 5 —— 全量部署(root)
 
@@ -402,7 +408,7 @@ sysctl vfs.zfs.arc_summary | head -20
 | 重启后 80/443/22 又绑不上 | sysctl.conf 里 rules 被追加成了第二行(整表替换, 后行覆盖前行)/ loader.conf 缺 mac_portacl_load |
 | HTTPS 一直拿不到证书 | DNS 未指向本机/安全组未同时开放 80 和 443/大陆 ECS 域名未备案；查 `/var/log/termblog-web.log` 的 ACME error |
 | ssh -p 2222 连不上(管理入口) | 安全组没放行 2222 / sshd_config 缺 Port 2222 行 / cloud-init 重写了 sshd_config |
-| build-template.sh 下载 16.0-CURRENT | 必须先做阶段 4.1 预下载(或显式传 15.0 URL 参数) |
+| build-template.sh 下载了错误的 FreeBSD 版本 | 默认应为 15.0-RELEASE；检查 `TERMBLOG_JAIL_RELEASE` 或传入的 URL，然后重试 `--refresh-base` |
 | 公网不通但本机 fetch 通 | 阿里云安全组没放行 80/443/22/2222 中对应的入口端口 |
 | 会话开不出, 查 jaild 日志 | `tail -50 /var/log/jaild.log` |
 

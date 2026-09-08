@@ -18,7 +18,9 @@
 # 模板替换构建到旁路名 template.new 再换名上场,
 #       全程不停服、不杀会话。旧会话继续用旧模板(内容旧), 新会话取新模板
 #       (内容新); 旧模板被旧会话的 clone pin 住, 全部退出后回收。
-# 默认使用与宿主同版本的 RELEASE base.txz，持久缓存在 /var/cache/termblog。
+# 默认使用项目指定的 FreeBSD 15.0-RELEASE base.txz，持久缓存在
+# /var/cache/termblog。可用 TERMBLOG_JAIL_RELEASE 覆盖版本，或用位置参数
+# 直接传入完整 base.txz URL。
 #
 # 构建输入(jailbin 二进制 + 内容产物 .rendered)由本脚本自建(以 yzs 编译,
 # 不依赖 Makefile)。
@@ -47,11 +49,13 @@ MOUNT=/jails/template
 BASE_DATASET=zroot/jails/template-base
 BASE_SNAPSHOT="$BASE_DATASET@prepared"
 BASE_MOUNT=/jails/template-base
-HOST_RELEASE=$(freebsd-version -u 2>/dev/null || uname -r)
-HOST_RELEASE=${HOST_RELEASE%%-p*}
+JAIL_RELEASE=${TERMBLOG_JAIL_RELEASE:-15.0-RELEASE}
+case "$JAIL_RELEASE" in
+    ""|*[!A-Za-z0-9._-]*) echo "invalid TERMBLOG_JAIL_RELEASE: $JAIL_RELEASE"; exit 64 ;;
+esac
 PLATFORM=$(uname -m)
 MACHINE=$(uname -p)
-BASE_TXZ_URL="${BASE_TXZ_ARG:-https://download.freebsd.org/releases/$PLATFORM/$MACHINE/$HOST_RELEASE/base.txz}"
+BASE_TXZ_URL="${BASE_TXZ_ARG:-https://download.freebsd.org/releases/$PLATFORM/$MACHINE/$JAIL_RELEASE/base.txz}"
 BASE_CACHE_DIR=/var/cache/termblog
 BASE_TXZ_CACHE="$BASE_CACHE_DIR/base.txz"
 BASE_URL_CACHE="$BASE_CACHE_DIR/base.txz.url"
