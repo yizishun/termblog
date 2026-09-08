@@ -3,8 +3,8 @@
 //! 图片以 Markdown 所在目录为基准解析，规范化后必须仍在 content/HOME 根内；
 //! 本地引用在构建期改写为 content-relative 的站点绝对路径。
 //!
-//! 预算(处理**后**字节, 全部构建期 fail-fast): 单张位图 ≤ 256 KiB,
-//! gif ≤ 512 KiB(gif 不重编码, 保动画), 单篇文章图片总量 ≤ 1.5 MiB;
+//! 预算(处理**后**字节, 全部构建期 fail-fast): 单张位图 ≤ 640 KiB,
+//! gif ≤ 512 KiB(gif 不重编码, 保动画), 单篇文章图片总量 ≤ 6 MiB;
 //! 位图宽度 > 1080 px 自动缩小到 1080。外部图片(http(s):// 等绝对 URL)
 //! 原样透传, 不校验、不复制、不计预算。
 
@@ -15,11 +15,11 @@ use anyhow::{bail, Context, Result};
 /// 位图宽度上限: 超过则缩小到此宽度。
 pub const MAX_WIDTH: u32 = 1080;
 /// 单张位图处理后字节预算。
-pub const MAX_BITMAP_BYTES: usize = 256 * 1024;
+pub const MAX_BITMAP_BYTES: usize = 640 * 1024;
 /// 单张 gif 字节预算(原样采用, 不缩放不重编码)。
 pub const MAX_GIF_BYTES: usize = 512 * 1024;
-/// 单篇文章图片总量预算(1.5 MiB)。
-pub const MAX_ARTICLE_BYTES: usize = 1536 * 1024;
+/// 单篇文章图片总量预算(6 MiB)。
+pub const MAX_ARTICLE_BYTES: usize = 6 * 1024 * 1024;
 
 /// 扩展名白名单(大小写不敏感)。svg 明确拒绝: 同域直接打开会执行其中脚本。
 pub fn is_image_ext(ext: &str) -> bool {
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn process_oversize_bitmap_fails() {
         let dir = std::env::temp_dir().join(format!("tb-img-test-{}-big", std::process::id()));
-        // 噪点 PNG 压不下去: 1000×1000 随机像素必然 > 256 KiB
+        // 噪点 PNG 压不下去: 1000×1000 随机像素必然 > 640 KiB
         let mut img = image::RgbaImage::new(1000, 1000);
         let mut x: u32 = 12345;
         for px in img.pixels_mut() {

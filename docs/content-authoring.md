@@ -26,7 +26,7 @@ notes/unix.md 中写 ![架构图](unix/arch.png)
 Web URL：/notes/unix/arch.png
 ```
 
-允许 `png`、`jpg`、`jpeg`、`webp`、`gif`；资源路径字符集为 `[a-z0-9/._-]`。普通位图宽度超过 1080 px 会缩小，处理后单张上限 256 KiB，GIF 上限 512 KiB，单篇总量上限 1.5 MiB。WebP 的终端资产会统一转成 PNG。外部绝对 URL 原样保留，未被文章引用的本地图片不发布并给出告警。
+允许 `png`、`jpg`、`jpeg`、`webp`、`gif`；资源路径字符集为 `[a-z0-9/._-]`。普通位图宽度超过 1080 px 会缩小，处理后普通位图的单张上限为 640 KiB，GIF 上限为 512 KiB，单篇总量上限 6 MiB。WebP 的终端资产会统一转成 PNG。外部绝对 URL 原样保留，未被文章引用的本地图片不发布并给出告警。
 
 ## 目录 scope、评论与统计快照
 

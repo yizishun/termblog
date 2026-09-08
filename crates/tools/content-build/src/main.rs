@@ -739,7 +739,7 @@ fn main() -> Result<()> {
             ));
         }
 
-        // 图片引用: 逐张 resolve + 处理, 单篇总量预算 1.5 MiB
+        // 图片引用: 逐张 resolve + 处理, 单篇总量预算 6 MiB
         let mut image_meta: HashMap<String, (u32, u32, String)> = HashMap::new();
         let mut dest_paths: HashMap<String, (String, String)> = HashMap::new(); // dest → (源 rel, 产物 rel)
         let mut first_image: Option<String> = None;
