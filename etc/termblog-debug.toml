@@ -24,6 +24,8 @@ host_key = "/var/db/termblog/ssh_host_ed25519"
 [session]
 max_total = 64
 max_per_ip = 3
+# 仅键盘/粘贴输入续期；持续输出、窗口 resize 与 keepalive 都不算用户活动。
+idle_timeout_secs = 900
 hard_lifetime_secs = 7200
 
 [jail]

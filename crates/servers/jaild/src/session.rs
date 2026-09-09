@@ -18,6 +18,7 @@ use termblog_core::{Control, SessionHandle};
 use termblog_statd::{RecordEvent, Source, MAX_BATCH_EVENTS};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 use crate::jail::JailBackend;
 use crate::pty::{CommentFifo, ShellChild};
@@ -28,6 +29,26 @@ const COMMENT_QUEUE: usize = 16;
 const ACK_QUEUE: usize = 32;
 const MAX_SESSION_COMMENTS: usize = 8;
 
+struct IdleDeadline {
+    timeout: Duration,
+    deadline: Instant,
+}
+
+impl IdleDeadline {
+    fn new(timeout: Duration, now: Instant) -> Self {
+        Self {
+            timeout,
+            deadline: now + timeout,
+        }
+    }
+
+    fn refresh_on_input(&mut self, bytes: &[u8], now: Instant) {
+        if !bytes.is_empty() {
+            self.deadline = now + self.timeout;
+        }
+    }
+}
+
 pub struct Quota {
     pub max_total: usize,
     pub max_per_ip: usize,
@@ -36,6 +57,7 @@ pub struct Quota {
 struct Inner {
     backend: Arc<JailBackend>,
     quota: Quota,
+    idle_timeout: Duration,
     table: Mutex<HashMap<String, IpAddr>>,
 }
 
@@ -43,10 +65,11 @@ struct Inner {
 pub struct SessionManager(Arc<Inner>);
 
 impl SessionManager {
-    pub fn new(backend: JailBackend, quota: Quota) -> Self {
+    pub fn new(backend: JailBackend, quota: Quota, idle_timeout: Duration) -> Self {
         Self(Arc::new(Inner {
             backend: Arc::new(backend),
             quota,
+            idle_timeout,
             table: Mutex::new(HashMap::new()),
         }))
     }
@@ -179,11 +202,21 @@ async fn pump(
     ));
     let mut buf = [0u8; 8192];
     let mut ack_open = true;
+    let mut idle = IdleDeadline::new(inner.idle_timeout, Instant::now());
     let why: &str;
     loop {
         tokio::select! {
             data = input.recv() => match data {
-                Some(b) => { let _ = write_all(&master, &b).await; }
+                Some(b) => {
+                    idle.refresh_on_input(&b, Instant::now());
+                    if tokio::time::timeout_at(idle.deadline, write_all(&master, &b))
+                        .await
+                        .is_err()
+                    {
+                        why = "idle timeout (no user input)";
+                        break;
+                    }
+                }
                 None => { why = "input channel closed (access layer disconnected)"; break; }
             },
             c = ctrl.recv() => match c {
@@ -196,9 +229,16 @@ async fn pump(
             ack = ack_rx.recv(), if ack_open => match ack {
                 Some(bytes) => {
                     // ack 只进已有输出队列；绝不写 PTY master（否则等价于模拟键盘）。
-                    if out.send(bytes).await.is_err() {
-                        why = "output channel closed (access layer disconnected)";
-                        break;
+                    match tokio::time::timeout_at(idle.deadline, out.send(bytes)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            why = "output channel closed (access layer disconnected)";
+                            break;
+                        }
+                        Err(_) => {
+                            why = "idle timeout (no user input)";
+                            break;
+                        }
                     }
                     // zsh 可能已在异步 ack 之前画好下一个 prompt。用默认为
                     // ignore 的专用信号让 .zshrc 中的 ZLE trap 重画当前编辑行；
@@ -212,14 +252,30 @@ async fn pump(
                 match nix::unistd::read(master.as_raw_fd(), &mut buf) {
                     Ok(0) => { why = "PTY EOF (shell exited)"; break; }
                     Ok(n) => {
-                        if out.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                            why = "output channel closed (access layer disconnected)";
-                            break;
+                        match tokio::time::timeout_at(
+                            idle.deadline,
+                            out.send(Bytes::copy_from_slice(&buf[..n])),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                why = "output channel closed (access layer disconnected)";
+                                break;
+                            }
+                            Err(_) => {
+                                why = "idle timeout (no user input)";
+                                break;
+                            }
                         }
                     }
                     Err(nix::errno::Errno::EAGAIN) => g.clear_ready(),
                     Err(_) => { why = "PTY read error"; break; }
                 }
+            },
+            _ = tokio::time::sleep_until(idle.deadline) => {
+                why = "idle timeout (no user input)";
+                break;
             },
         }
     }
@@ -645,6 +701,21 @@ async fn write_all(master: &AsyncFd<OwnedFd>, mut bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_deadline_refreshes_only_for_nonempty_user_input() {
+        let timeout = Duration::from_secs(15 * 60);
+        let started = Instant::now();
+        let mut idle = IdleDeadline::new(timeout, started);
+        let original_deadline = idle.deadline;
+
+        idle.refresh_on_input(&[], started + Duration::from_secs(60));
+        assert_eq!(idle.deadline, original_deadline);
+
+        let input_at = started + Duration::from_secs(60);
+        idle.refresh_on_input(b"x", input_at);
+        assert_eq!(idle.deadline, input_at + timeout);
+    }
 
     #[tokio::test]
     async fn one_fifo_write_preserves_internal_newlines_and_is_bounded() {

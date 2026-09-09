@@ -39,6 +39,10 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.session.idle_timeout_secs == 0 {
+            anyhow::bail!("session idle timeout must be greater than 0");
+        }
+
         let tls = &self.web.tls;
         if tls.enabled {
             if self.web.listen == tls.listen {
@@ -246,6 +250,8 @@ impl Default for SshConfig {
 pub struct SessionConfig {
     pub max_total: usize,
     pub max_per_ip: usize,
+    /// 用户无键盘或粘贴输入超过此时长后回收会话；输出、resize 和 keepalive 不续期。
+    pub idle_timeout_secs: u64,
     /// 硬寿命上限(M4 落地, 先占位)
     pub hard_lifetime_secs: u64,
 }
@@ -255,6 +261,7 @@ impl Default for SessionConfig {
         Self {
             max_total: 64,
             max_per_ip: 3,
+            idle_timeout_secs: 15 * 60,
             hard_lifetime_secs: 7200,
         }
     }
@@ -308,6 +315,16 @@ impl Default for JailConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_idle_timeout_defaults_to_fifteen_minutes_and_cannot_be_zero() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.session.idle_timeout_secs, 15 * 60);
+        assert!(cfg.validate().is_ok());
+
+        cfg.session.idle_timeout_secs = 0;
+        assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn stats_paths_and_timeout_are_validated() {

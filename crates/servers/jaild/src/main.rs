@@ -98,8 +98,13 @@ async fn main() -> Result<()> {
             max_total: cfg.session.max_total,
             max_per_ip: cfg.session.max_per_ip,
         },
+        Duration::from_secs(cfg.session.idle_timeout_secs),
     );
-    info!(socket = %socket.display(), "jaild ready, starting accept");
+    info!(
+        socket = %socket.display(),
+        idle_timeout_secs = cfg.session.idle_timeout_secs,
+        "jaild ready, starting accept"
+    );
 
     loop {
         match listener.accept().await {
