@@ -7,7 +7,7 @@
 #   1. 进程形态: jaild=root, termblog-web/ssh=www, socket 0660 root:www
 #   2. ssh 会话跑在真实 jail 里(uid=guest, hostname=blog)
 #   3. 多访客互不可见(会话 A 写的文件会话 B 看不到)
-#   4. rctl 掐死 fork bomb(maxproc=32 deny)
+#   4. jail 聚合 rctl 限制 fork bomb，同时验证每进程 fd 上限
 #   5. 配额: 同一 IP 第 4 个并发会话被拒(3 个 jail 封顶)
 #   6. 断线后 jail 立即回收, zfs 与空 mountpoint 均无泄漏
 #   7. 磁盘配额: 每会话 zfs quota=4M, 写超被拒
@@ -113,31 +113,63 @@ run_ssh /tmp/tb-verify3.txt 'test ! -e /tmp/mine.txt && echo ISOLATED_$((6+6))' 
 grep -q "ISOLATED_12" /tmp/tb-verify3.txt
 check $? "会话 B 看不到会话 A 写的文件"
 
-echo "== 4. rctl 掐死 fork bomb =="
+echo "== 4. jail 聚合 rctl 限制 fork bomb =="
 # 受控炸弹: 后台起 40 个 sleep 撞资源限额。实测 vmemoryuse=512M 在 maxproc
-# 之前就会掐住 fork(zsh 每 fork 一份虚拟内存 ~90MB), 所以"fork failed"即
-# rctl 拒绝的证据。sleep 只睡 5s, 自然死亡后资源释放; 7s 时再从 ssh 侧
-# 投喂存活标记(等资源释放后再发命令, shell 无需在饱和期 fork)。
+# 之前就会掐住 fork(zsh 每 fork 一份虚拟内存 ~90MB)。先用 /usr/bin/true
+# 证明普通外部命令原本能 fork，再记录实际启动数并要求小于 40，避免把
+# “第一个进程就 fork 失败”误判为限额生效。sleep 只睡 8s，自然死亡后
+# 资源释放；20s 时再执行一次外部命令，覆盖 zsh 在 EAGAIN 后的退避时间，
+# 并证明 shell 真正恢复了 fork 能力。
 # 会话断开即回收: jail 名与 rctl 规则必须在会话存活窗口内抓取, 否则已销毁。
 # 先 sleep 2 等会话建好再投喂命令(同第 2 组, 避免撞会话创建窗口)。
-(sleep 2; printf 'i=0; while [ $i -lt 40 ]; do sleep 5 & i=$((i+1)); done\n'; sleep 7; \
- printf 'echo BOMB_SURVIVED_$((6+6))\n'; sleep 1) \
-    | timeout 20 $SSH 2>&1 | tr -d '\r' > /tmp/tb-verify4.txt &
+BOMB_TAG="tb_verify_bomb_$$"
+(sleep 2; printf '/usr/bin/true && echo FORK_BASELINE_$((6+6))\n'; \
+ printf 'echo NOFILE_LIMIT_$(ulimit -n)\n'; \
+ printf "%s\n" "i=0; while [ \$i -lt 40 ]; do TB_VERIFY_BOMB=$BOMB_TAG /bin/sh -c 'echo BOMB_CHILD_\$1; exec /bin/sleep 8' sh \$i & i=\$((i+1)); done"; \
+ sleep 20; printf '/usr/bin/true && echo BOMB_RECOVERED_$((6+6))\n'; sleep 2) \
+    | timeout 35 $SSH 2>&1 | tr -d '\r' > /tmp/tb-verify4.txt &
 BOMBPID=$!
 sleep 5
-BJAIL=$(jls name 2>/dev/null | grep '^s-[0-9a-f]\{8\}$' | tail -1) # 最新 = 炸弹会话
-RCTL_OUT=$(rctl jail:"$BJAIL" 2>&1 | head -8)
-echo "$RCTL_OUT" | grep -q ':deny='
-RCTL_OK=$?
-check $RCTL_OK "rctl 限额规则已挂载 ($BJAIL)"
+# 通过只注入炸弹子进程的环境标签反查 JID，避免有真实访客并发时把“最新 jail”
+# 误认成验收会话。脚本要求 root 运行，因此能读取 guest 进程的环境。
+BJID=$(ps e -axww -o jid= -o command= 2>/dev/null \
+    | awk -v tag="$BOMB_TAG" '$1 != 0 && index($0, tag) { print $1; exit }')
+BJAIL=""
+if [ -n "$BJID" ]; then
+    BJAIL=$(jls -j "$BJID" name 2>/dev/null | grep '^s-[0-9a-f]\{8\}$' | tail -1)
+fi
+[ -n "$BJAIL" ]
+check $? "通过标记进程定位炸弹会话 ($BJAIL)"
+if [ -n "$BJAIL" ]; then
+    RCTL_OUT=$(rctl jail:"$BJAIL" 2>&1 | head -8)
+else
+    RCTL_OUT=""
+fi
+RCTL_OK=0
+for resource in memoryuse vmemoryuse maxproc pcpu; do
+    echo "$RCTL_OUT" | grep -q ":$resource:deny=" || RCTL_OK=1
+done
+check $RCTL_OK "四项 jail 聚合 rctl 限额规则已挂载 ($BJAIL)"
 if [ "$RCTL_OK" -ne 0 ]; then
     echo "    rctl jail:$BJAIL 实际输出:"; echo "$RCTL_OUT" | sed 's/^/    /'
 fi
+if [ -z "$BJAIL" ] || echo "$RCTL_OUT" | grep -q ':openfiles:'; then
+    check 1 "openfiles 未错误地作为 jail 聚合 rctl"
+else
+    check 0 "openfiles 未错误地作为 jail 聚合 rctl"
+fi
 wait "$BOMBPID"
+grep -q '^FORK_BASELINE_12$' /tmp/tb-verify4.txt
+check $? "施压前普通外部命令可以 fork"
+grep -q '^NOFILE_LIMIT_256$' /tmp/tb-verify4.txt
+check $? "guest 每进程 RLIMIT_NOFILE=256"
 grep -q "fork failed" /tmp/tb-verify4.txt
 check $? "rctl 拒绝超限 fork (输出含 fork failed)"
-grep -q "BOMB_SURVIVED_12" /tmp/tb-verify4.txt
-check $? "炸弹进程自然死亡后 shell 仍存活"
+BOMB_STARTED=$(grep -Ec '^BOMB_CHILD_[0-9]+$' /tmp/tb-verify4.txt || true)
+[ "$BOMB_STARTED" -ge 1 ] && [ "$BOMB_STARTED" -lt 40 ]
+check $? "受控炸弹实际启动过进程且未跑满 40 个 (实际: $BOMB_STARTED)"
+grep -q '^BOMB_RECOVERED_12$' /tmp/tb-verify4.txt
+check $? "炸弹进程自然死亡后外部命令恢复 fork"
 
 echo "== (等 8s: 会话回收, 清空配额) =="
 sleep 8

@@ -6,9 +6,9 @@
 //! spawn(sid):
 //!   1. zfs clone <template> <prefix><sid>        # 毫秒级, 可写层来自 clone
 //!   2. mountpoint + mount, 挂 devfs(规则集 4)
-//!   3. jail -c(无网络, allow.* 全关, persist) + rctl 限额
-//!   4. openpty + fork; 子进程: setsid -> ctty -> closefrom(3) -> jail_attach -> 降权 guest
-//!      -> chdir(home) -> exec zsh -l
+//!   3. jail -c(无网络, allow.* 全关, persist) + jail 聚合 rctl 限额
+//!   4. openpty + fork; 子进程: setsid -> ctty -> closefrom(3) -> RLIMIT_NOFILE
+//!      -> jail_attach -> 降权 guest -> chdir(home) -> exec zsh -l
 //!
 //! cleanup(sid): umount devfs -> jail -r -> zfs destroy -> remove empty mountpoint
 //!               -> reclaim unpinned template.old* (幂等)
@@ -310,12 +310,15 @@ fn spawn_inner(
     }
     let jid = jail_jid(name).context("query jail jid")?;
 
-    // 4. rctl 限额(racct 未开启时 fail-closed: 宁可不给会话, 也不跑无配额 jail)
+    // 4. jail 聚合 rctl 限额(racct 未开启时 fail-closed: 宁可不给会话,
+    // 也不跑无配额 jail)。openfiles 不能放在这里: jaild 是长寿命、多线程进程，
+    // fork 出来的子进程会继承曾经扩大的 fd 表；即使 closefrom(3) 关掉了实际 fd，
+    // jail_attach 后 RACCT_NOFILE 的高水位仍会计入 jail，导致干净的 zsh 也无法
+    // fork。文件描述符限制改由 fork 子进程上的 RLIMIT_NOFILE 承担。
     for limit in [
         format!("memoryuse:deny={}", cfg.memory),
         format!("vmemoryuse:deny={}", cfg.vmemory),
         format!("maxproc:deny={}", cfg.maxproc),
-        format!("openfiles:deny={}", cfg.openfiles),
         format!("pcpu:deny={}", cfg.pcpu),
     ] {
         run("rctl", &["-a", &format!("jail:{name}:{limit}")])?;
@@ -435,6 +438,9 @@ fn spawn_inner(
         .collect();
     let mut envp: Vec<*const c_char> = envs.iter().map(|e| e.as_ptr()).collect();
     envp.push(std::ptr::null());
+    // 在 fork 前构造，避免多线程进程 fork 后触碰分配器。软、硬上限一并降低，
+    // guest 及其后代都不能自行把 fd 上限抬回宿主值。
+    let nofile_limit = child_nofile_rlimit(cfg.openfiles);
 
     match unsafe { fork() }.context("fork")? {
         ForkResult::Parent { child } => {
@@ -457,6 +463,11 @@ fn spawn_inner(
             libc::setsid();
             libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0);
             install_child_stdio(slave.as_raw_fd());
+            if !set_child_nofile_limit(&nofile_limit) {
+                let msg = b"setrlimit nofile failed\n";
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::_exit(127);
+            }
             // 顺序关键: attach 需要权限, 必须在降权之前
             if libc::jail_attach(jid) != 0 {
                 let msg = b"jail_attach failed\n";
@@ -481,8 +492,8 @@ fn spawn_inner(
 
 /// 把本会话 PTY 安装为标准输入输出，并关闭从多线程 jaild 继承的
 /// 其他全部描述符。子进程在 `jail_attach` 前仍处于宿主环境；若不做
-/// `closefrom(3)`，新 zsh 会持有其他会话的 PTY master，既破坏隔离，又会让
-/// rctl `openfiles` 按 fd 表高水位快速耗尽。
+/// `closefrom(3)`，新 zsh 会持有其他会话的 PTY master，既破坏隔离，也会把
+/// jaild 的描述符状态泄漏给访客进程。
 ///
 /// # Safety
 ///
@@ -498,6 +509,24 @@ unsafe fn install_child_stdio(slave_fd: c_int) {
     // FreeBSD closefrom(2) 由一次内核调用关闭所有 fd >= 3，
     // 不遍历 RLIMIT_NOFILE，适合多线程进程 fork 后的受限子进程。
     libc::closefrom(3);
+}
+
+fn child_nofile_rlimit(openfiles: u32) -> libc::rlimit {
+    let limit = libc::rlim_t::from(openfiles);
+    libc::rlimit {
+        rlim_cur: limit,
+        rlim_max: limit,
+    }
+}
+
+/// 将每进程文件描述符上限降到配置值；后续 `execve` 会保留该限制。
+///
+/// # Safety
+///
+/// 只能在 `fork` 后、`execve` 前的子进程中调用。调用方必须传入 fork 前构造、
+/// 当前仍有效的 `rlimit`。
+unsafe fn set_child_nofile_limit(limit: &libc::rlimit) -> bool {
+    libc::setrlimit(libc::RLIMIT_NOFILE, limit) == 0
 }
 
 #[derive(serde::Serialize)]
@@ -1259,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn child_stdio_closes_all_inherited_non_stdio_fds() {
+    fn child_stdio_closes_inherited_fds_and_applies_nofile_limit() {
         use std::io::Read as _;
 
         use nix::sys::wait::{waitpid, WaitStatus};
@@ -1268,6 +1297,7 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
         let leaked_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD, 100) };
         assert!(leaked_fd >= 100);
+        let nofile_limit = child_nofile_rlimit(64);
 
         match unsafe { fork() }.unwrap() {
             ForkResult::Child => unsafe {
@@ -1275,10 +1305,16 @@ mod tests {
                 // closefrom(3) 必须同时关闭读端、原始写端和刻意制造的高位 fd。
                 install_child_stdio(pipe_fds[1]);
                 let closed = libc::fcntl(leaked_fd, libc::F_GETFD) == -1;
-                let (message, code): (&[u8], c_int) = if closed {
-                    (b"closed", 0)
+                let limited = set_child_nofile_limit(&nofile_limit);
+                let mut actual: libc::rlimit = std::mem::zeroed();
+                let queried = libc::getrlimit(libc::RLIMIT_NOFILE, &mut actual) == 0;
+                let correct_limit = queried
+                    && actual.rlim_cur == nofile_limit.rlim_cur
+                    && actual.rlim_max == nofile_limit.rlim_max;
+                let (message, code): (&[u8], c_int) = if closed && limited && correct_limit {
+                    (b"closed-and-limited", 0)
                 } else {
-                    (b"leaked", 1)
+                    (b"child-setup-failed", 1)
                 };
                 libc::write(1, message.as_ptr().cast(), message.len());
                 libc::_exit(code);
@@ -1292,7 +1328,7 @@ mod tests {
                 unsafe { File::from_raw_fd(pipe_fds[0]) }
                     .read_to_string(&mut output)
                     .unwrap();
-                assert_eq!(output, "closed");
+                assert_eq!(output, "closed-and-limited");
                 assert_eq!(waitpid(child, None).unwrap(), WaitStatus::Exited(child, 0));
             }
         }

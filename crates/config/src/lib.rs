@@ -42,6 +42,11 @@ impl Config {
         if self.session.idle_timeout_secs == 0 {
             anyhow::bail!("session idle timeout must be greater than 0");
         }
+        // 20 是 POSIX 保证实现至少支持的 _POSIX_OPEN_MAX。更低的硬上限连
+        // 动态加载 shell 和建立一条普通 pipe 都无法可靠完成，应在启动时拒绝。
+        if self.jail.openfiles < 20 {
+            anyhow::bail!("jail openfiles limit must be at least 20 (_POSIX_OPEN_MAX)");
+        }
 
         let tls = &self.web.tls;
         if tls.enabled {
@@ -285,6 +290,7 @@ pub struct JailConfig {
     pub memory: String,
     pub vmemory: String,
     pub maxproc: u32,
+    /// 每个 guest 进程的文件描述符上限(RLIMIT_NOFILE，不是 jail 聚合 rctl)。
     pub openfiles: u32,
     pub pcpu: u32,
     /// jail 内登录 shell 路径(模板里由 pkg 装到 /usr/local/bin)
@@ -324,6 +330,16 @@ mod tests {
 
         cfg.session.idle_timeout_secs = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn jail_openfiles_limit_cannot_be_below_posix_minimum() {
+        let mut cfg = Config::default();
+        cfg.jail.openfiles = 19;
+        assert!(cfg.validate().is_err());
+
+        cfg.jail.openfiles = 20;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

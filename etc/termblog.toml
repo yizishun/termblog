@@ -50,6 +50,7 @@ path_prefix = "/jails"
 memory = "128M"
 vmemory = "512M"
 maxproc = 32
+# 每个 guest 进程的 RLIMIT_NOFILE；不是整个 jail 的聚合 openfiles rctl。
 openfiles = 256
 pcpu = 25
 zsh = "/usr/local/bin/zsh"
