@@ -197,12 +197,25 @@ fn render_article_comments(article: &ArticleIndexEntry) {
 
 fn show_file(path: &Path) -> i32 {
     if std::io::stdin().is_terminal() {
-        let _ = Command::new("less").arg("-RXc").arg(path).status();
-        0
+        run_pager("less", path)
     } else if cat(path).is_err() {
         1
     } else {
         0
+    }
+}
+
+fn run_pager(program: &str, path: &Path) -> i32 {
+    match Command::new(program).arg("-RXc").arg(path).status() {
+        Ok(status) if status.success() => 0,
+        Ok(status) => {
+            eprintln!("blog: {program} exited with {status}");
+            status.code().unwrap_or(1)
+        }
+        Err(error) => {
+            eprintln!("blog: failed to start {program}: {error}");
+            1
+        }
     }
 }
 
@@ -273,5 +286,14 @@ mod tests {
             home_relative_file(&dir.path().join("notes/unix.md"), dir.path()).as_deref(),
             Some("notes/unix.md")
         );
+    }
+
+    #[test]
+    fn pager_failures_return_nonzero() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("article");
+        std::fs::write(&file, "article").unwrap();
+        assert_eq!(run_pager("/termblog-test/no-such-pager", &file), 1);
+        assert_eq!(run_pager("/usr/bin/false", &file), 1);
     }
 }

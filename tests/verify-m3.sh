@@ -69,13 +69,14 @@ if [ "$ready" -ne 1 ]; then
     check 1 "jail 内以 guest 身份运行"
     check 1 "jail hostname=blog"
     check 1 "起始目录为 guest 家目录 (/home/guest)"
+    check 1 "guest 未继承 jaild/其他会话的 PTY fd"
 else
 # 新语义: 会话断开即回收, jls/zfs 观察必须趁会话还活着做——后台起会话
 # (末条命令 sleep 8 撑住存活窗口), 先查 jls/zfs, 再 wait 收尾验输出。
 # 先 sleep 2 等会话建好再投喂命令: 服务刚重启后冷 clone 较慢, 命令早到
 # 会撞上会话创建窗口(曾导致一次性竞态失败)。
 (sleep 2; printf 'echo IN_JAIL_$((39+3))\n'; printf 'id -un\n'; printf 'hostname\n'; \
-  printf 'pwd\n'; printf 'sleep 8\n'; sleep 9) \
+  printf 'pwd\n'; printf 'procstat -f $$\n'; printf 'sleep 8\n'; sleep 9) \
     | timeout 20 $SSH 2>&1 | tr -d '\r' > /tmp/tb-verify1.txt &
 SSHPID=$!
 sleep 5
@@ -92,6 +93,15 @@ grep -q "^blog$" /tmp/tb-verify1.txt
 check $? "jail hostname=blog"
 grep -q "^/home/guest$" /tmp/tb-verify1.txt
 check $? "起始目录为 guest 家目录 (/home/guest)"
+# PTY master 在 procstat 中是 `FD数字 t ... pts/N`；正常 zsh 只有自己的
+# ctty/0/1/2（vnode 字符设备），不应继承 jaild 当前或旧会话的 master。
+grep -q 'PID COMM.*FD' /tmp/tb-verify1.txt
+procstat_ok=$?
+if [ "$procstat_ok" -eq 0 ] && ! grep -Eq '^[[:space:]]*[0-9]+[[:space:]]+zsh[[:space:]]+[0-9]+[[:space:]]+t[[:space:]]' /tmp/tb-verify1.txt; then
+    check 0 "guest 未继承 jaild/其他会话的 PTY fd"
+else
+    check 1 "guest 未继承 jaild/其他会话的 PTY fd"
+fi
 fi
 
 echo "== (等 8s: 会话回收, 释放每 IP 配额) =="

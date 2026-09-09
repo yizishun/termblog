@@ -7,7 +7,7 @@
 //!   1. zfs clone <template> <prefix><sid>        # 毫秒级, 可写层来自 clone
 //!   2. mountpoint + mount, 挂 devfs(规则集 4)
 //!   3. jail -c(无网络, allow.* 全关, persist) + rctl 限额
-//!   4. openpty + fork; 子进程: setsid -> ctty -> jail_attach -> 降权 guest
+//!   4. openpty + fork; 子进程: setsid -> ctty -> closefrom(3) -> jail_attach -> 降权 guest
 //!      -> chdir(home) -> exec zsh -l
 //!
 //! cleanup(sid): umount devfs -> jail -r -> zfs destroy (幂等)
@@ -444,12 +444,7 @@ fn spawn_inner(
         ForkResult::Child => unsafe {
             libc::setsid();
             libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0);
-            for fd in 0..3 {
-                libc::dup2(slave.as_raw_fd(), fd);
-            }
-            if slave.as_raw_fd() > 2 {
-                libc::close(slave.as_raw_fd());
-            }
+            install_child_stdio(slave.as_raw_fd());
             // 顺序关键: attach 需要权限, 必须在降权之前
             if libc::jail_attach(jid) != 0 {
                 let msg = b"jail_attach failed\n";
@@ -470,6 +465,27 @@ fn spawn_inner(
             libc::_exit(127);
         },
     }
+}
+
+/// 把本会话 PTY 安装为标准输入输出，并关闭从多线程 jaild 继承的
+/// 其他全部描述符。子进程在 `jail_attach` 前仍处于宿主环境；若不做
+/// `closefrom(3)`，新 zsh 会持有其他会话的 PTY master，既破坏隔离，又会让
+/// rctl `openfiles` 按 fd 表高水位快速耗尽。
+///
+/// # Safety
+///
+/// 只能在 `fork` 后、`execve` 前的子进程中调用；`slave_fd` 必须是有效的
+/// PTY slave。函数只执行 async-signal-safe 的系统调用。
+unsafe fn install_child_stdio(slave_fd: c_int) {
+    for fd in 0..3 {
+        libc::dup2(slave_fd, fd);
+    }
+    if slave_fd > 2 {
+        libc::close(slave_fd);
+    }
+    // FreeBSD closefrom(2) 由一次内核调用关闭所有 fd >= 3，
+    // 不遍历 RLIMIT_NOFILE，适合多线程进程 fork 后的受限子进程。
+    libc::closefrom(3);
 }
 
 #[derive(serde::Serialize)]
@@ -1070,6 +1086,46 @@ fn stderr_of(out: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_stdio_closes_all_inherited_non_stdio_fds() {
+        use std::io::Read as _;
+
+        use nix::sys::wait::{waitpid, WaitStatus};
+
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let leaked_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD, 100) };
+        assert!(leaked_fd >= 100);
+
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => unsafe {
+                // 用管道写端模拟 PTY slave；helper 会把它装到 0/1/2，随后
+                // closefrom(3) 必须同时关闭读端、原始写端和刻意制造的高位 fd。
+                install_child_stdio(pipe_fds[1]);
+                let closed = libc::fcntl(leaked_fd, libc::F_GETFD) == -1;
+                let (message, code): (&[u8], c_int) = if closed {
+                    (b"closed", 0)
+                } else {
+                    (b"leaked", 1)
+                };
+                libc::write(1, message.as_ptr().cast(), message.len());
+                libc::_exit(code);
+            },
+            ForkResult::Parent { child } => {
+                unsafe {
+                    libc::close(pipe_fds[1]);
+                    libc::close(leaked_fd);
+                }
+                let mut output = String::new();
+                unsafe { File::from_raw_fd(pipe_fds[0]) }
+                    .read_to_string(&mut output)
+                    .unwrap();
+                assert_eq!(output, "closed");
+                assert_eq!(waitpid(child, None).unwrap(), WaitStatus::Exited(child, 0));
+            }
+        }
+    }
 
     #[test]
     fn envp_contains_termblog_img_only_with_cap() {
