@@ -10,7 +10,8 @@
 //!   4. openpty + fork; 子进程: setsid -> ctty -> closefrom(3) -> jail_attach -> 降权 guest
 //!      -> chdir(home) -> exec zsh -l
 //!
-//! cleanup(sid): umount devfs -> jail -r -> zfs destroy (幂等)
+//! cleanup(sid): umount devfs -> jail -r -> zfs destroy -> remove empty mountpoint
+//!               -> reclaim unpinned template.old* (幂等)
 //! sweep(): 启动时回收上次崩溃遗留的 s-* 数据集
 //! ```
 //!
@@ -34,7 +35,7 @@ use anyhow::{bail, Context, Result};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::{openpty, Winsize};
 use nix::unistd::{chown, fork, ForkResult, Gid, Uid};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use termblog_commentd::{
     protocol::PRIVATE_SYNC, visible_comments, Client as CommentClient, Comment, VisibleReply,
@@ -96,8 +97,13 @@ impl JailBackend {
             warn!(sid, "reclaiming startup residual jail");
             cleanup_sync(cfg, sid);
         }
-        // 旧版本留下的空 mountpoint 目录(/jails/<sid> 或 /jails/s-<sid>)一并清掉。
-        // 只删空目录: 非空说明还挂着文件系统, 不能碰。
+        // 旧版本留下的 session 及模板构建 staging 空 mountpoint 一并清掉。
+        // 只删空目录：非空或仍挂载时 remove_dir 会安全失败。
+        let template_leaf = cfg
+            .template
+            .split_once('@')
+            .map(|(dataset, _)| dataset)
+            .and_then(|dataset| dataset.rsplit('/').next());
         if let Ok(entries) = std::fs::read_dir(&cfg.path_prefix) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -105,11 +111,17 @@ impl JailBackend {
                     || name
                         .strip_prefix("s-")
                         .is_some_and(|s| s.chars().all(|c| c.is_ascii_hexdigit()));
-                if sid_like {
+                let stale_template_mount = template_leaf.is_some_and(|template| {
+                    name == format!("{template}.new") || name == format!("{template}-base.new")
+                });
+                if sid_like || stale_template_mount {
                     let _ = std::fs::remove_dir(e.path());
                 }
             }
         }
+        // 零停机换模板时，旧模板可能曾被旧会话 clone pin 住。最后一个
+        // clone 消失后它已经可以销毁，不能一直等到下一次模板构建。
+        cleanup_retired_templates(cfg);
         Ok(())
     }
 }
@@ -1012,7 +1024,7 @@ pub fn ensure_devfs_ruleset() {
 }
 
 /// 幂等清理。顺序: devfs 先卸(否则 zfs destroy 会因 busy 失败)
-/// -> 移 jail(顺带杀光 jail 里残留进程) -> 毁数据集。
+/// -> 移 jail(顺带杀光 jail 里残留进程) -> 毁数据集 -> 删空 mountpoint。
 fn cleanup_sync(cfg: &JailConfig, sid: &str) {
     let ds = format!("{}{}", cfg.dataset_prefix, sid);
     let path = format!("{}/s-{sid}", cfg.path_prefix);
@@ -1026,6 +1038,120 @@ fn cleanup_sync(cfg: &JailConfig, sid: &str) {
     if let Err(e) = run("zfs", &["destroy", "-f", &ds]) {
         warn!(sid, %e, "zfs destroy failed (can be ignored)");
     }
+    // FreeBSD ZFS 销毁数据集后可能保留它自动创建的 mountpoint。这里只用
+    // remove_dir，目录非空或仍是挂载点时会安全失败，绝不能递归删除。
+    match std::fs::remove_dir(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(sid, path, %e, "remove empty jail mountpoint failed"),
+    }
+
+    // 当前 session 可能正是某个 template.old* 的最后一个 clone。此时顺手
+    // 回收退役模板；仍被其他 clone 引用时 zfs destroy 会拒绝，后续 session
+    // cleanup 或下次启动还会重试。
+    cleanup_retired_templates(cfg);
+}
+
+/// 回收零停机换面留下、且已不再被 session clone 引用的 template.old*。
+///
+/// 只匹配当前配置模板的精确退役命名：<template>.old 或
+/// <template>.old-<unix timestamp>。使用 zfs destroy -r 而不是 -R：
+/// 前者遇到外部 clone 会安全失败，绝不会连仍存活的 session clone 一起删掉。
+/// template.old* 清完后，再清理由它们 pin 住的
+/// <template>-base.old-<unix timestamp>-<pid>。
+fn cleanup_retired_templates(cfg: &JailConfig) {
+    let Some((template_dataset, snapshot)) = cfg.template.split_once('@') else {
+        warn!(
+            template = cfg.template,
+            "template has no snapshot; retired template cleanup skipped"
+        );
+        return;
+    };
+    if template_dataset.is_empty() || snapshot.is_empty() {
+        warn!(
+            template = cfg.template,
+            "invalid template snapshot; retired template cleanup skipped"
+        );
+        return;
+    }
+
+    let parent = parent_dataset(template_dataset);
+    let out = Command::new("zfs")
+        .args(["list", "-H", "-o", "name", "-r", parent])
+        .output();
+    let Ok(out) = out else {
+        warn!(
+            parent,
+            "execute zfs list for retired template cleanup failed"
+        );
+        return;
+    };
+    if !out.status.success() {
+        warn!(
+            parent,
+            error = %stderr_of(&out),
+            "list retired templates failed"
+        );
+        return;
+    }
+
+    let listed = String::from_utf8_lossy(&out.stdout);
+    // 顺序不能反：退役 template 是退役 base snapshot 的 clone。
+    for dataset in listed.lines() {
+        if !is_retired_template_dataset(template_dataset, dataset) {
+            continue;
+        }
+        match run("zfs", &["destroy", "-r", dataset]) {
+            Ok(()) => info!(dataset, "retired jail template storage reclaimed"),
+            Err(e) => debug!(
+                dataset,
+                %e,
+                "retired jail template still pinned; keeping it"
+            ),
+        }
+    }
+    for dataset in listed.lines() {
+        if !is_retired_template_base_dataset(template_dataset, dataset) {
+            continue;
+        }
+        match run("zfs", &["destroy", "-r", dataset]) {
+            Ok(()) => info!(dataset, "retired jail template storage reclaimed"),
+            Err(e) => debug!(
+                dataset,
+                %e,
+                "retired jail template base still pinned; keeping it"
+            ),
+        }
+    }
+}
+
+fn is_retired_template_dataset(template_dataset: &str, candidate: &str) -> bool {
+    let Some(suffix) = candidate.strip_prefix(template_dataset) else {
+        return false;
+    };
+    let Some(old_suffix) = suffix.strip_prefix(".old") else {
+        return false;
+    };
+    old_suffix.is_empty()
+        || old_suffix.strip_prefix('-').is_some_and(|timestamp| {
+            !timestamp.is_empty() && timestamp.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+fn is_retired_template_base_dataset(template_dataset: &str, candidate: &str) -> bool {
+    let prefix = format!("{template_dataset}-base.old-");
+    let Some(serial) = candidate.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut parts = serial.split('-');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(timestamp), Some(pid), None)
+            if !timestamp.is_empty()
+                && timestamp.chars().all(|c| c.is_ascii_digit())
+                && !pid.is_empty()
+                && pid.chars().all(|c| c.is_ascii_digit())
+    )
 }
 
 /// 从 jail 内的 /etc/passwd 解析 guest 的 uid/gid/home。
@@ -1086,6 +1212,51 @@ fn stderr_of(out: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_template_match_is_exact_and_never_selects_sessions() {
+        let template = "zroot/jails/template";
+        for candidate in [
+            "zroot/jails/template.old",
+            "zroot/jails/template.old-1725883200",
+        ] {
+            assert!(is_retired_template_dataset(template, candidate));
+        }
+        for candidate in [
+            "zroot/jails/template",
+            "zroot/jails/template@release",
+            "zroot/jails/template.old-",
+            "zroot/jails/template.old-backup",
+            "zroot/jails/template.old/child",
+            "zroot/jails/s-00000001",
+            "zroot/jails/other.old",
+        ] {
+            assert!(
+                !is_retired_template_dataset(template, candidate),
+                "must not reclaim {candidate}"
+            );
+        }
+
+        for candidate in [
+            "zroot/jails/template-base.old-1725883200-1234",
+            "zroot/jails/template-base.old-1-9",
+        ] {
+            assert!(is_retired_template_base_dataset(template, candidate));
+        }
+        for candidate in [
+            "zroot/jails/template-base",
+            "zroot/jails/template-base.old",
+            "zroot/jails/template-base.old-1725883200",
+            "zroot/jails/template-base.old-1725883200-pid",
+            "zroot/jails/template-base.old-1725883200-1234-child",
+            "zroot/jails/other-base.old-1725883200-1234",
+        ] {
+            assert!(
+                !is_retired_template_base_dataset(template, candidate),
+                "must not reclaim {candidate}"
+            );
+        }
+    }
 
     #[test]
     fn child_stdio_closes_all_inherited_non_stdio_fds() {

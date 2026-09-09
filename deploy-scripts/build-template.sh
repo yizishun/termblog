@@ -102,6 +102,7 @@ cleanup_on_exit() {
     if [ -n "$CLEANUP_BASE_DS" ]; then
         [ -z "$CLEANUP_BASE_MOUNT" ] || umount -f "$CLEANUP_BASE_MOUNT/dev" 2>/dev/null || true
         zfs destroy -r "$CLEANUP_BASE_DS" 2>/dev/null || true
+        [ -z "$CLEANUP_BASE_MOUNT" ] || rmdir "$CLEANUP_BASE_MOUNT" 2>/dev/null || true
     fi
     exit "$status"
 }
@@ -148,11 +149,15 @@ prepare_base() {
     zfs snapshot "$base_ds@prepared"
     zfs set readonly=on "$base_ds"
     zfs set mountpoint=none "$base_ds"
+    rmdir "$base_mount" 2>/dev/null || true
     CLEANUP_BASE_DS=
     CLEANUP_BASE_MOUNT=
 }
 
 zfs list -H -o name zroot/jails >/dev/null 2>&1 || zfs create -o mountpoint=none zroot/jails
+# ZFS 销毁/改 mountpoint 后可能留下自动创建的空目录。非空或仍挂载时
+# rmdir 会安全失败；这里也顺手回收旧版本脚本留下的 template-base.new。
+rmdir "$BASE_MOUNT.new" 2>/dev/null || true
 
 # 先拒绝误用，避免在明知不会替换现有模板时才去准备 base。
 if [ "$REPLACE" -eq 0 ] && [ "$REFRESH_BASE" -eq 0 ] \
@@ -206,6 +211,7 @@ su -l "$BUILD_USER" -c "set -e; cd $REPO; \
 # 1. 确定构建目标数据集: --replace 走旁路名(旧模板与在线会话全程不动)
 if [ "$REPLACE" -eq 1 ]; then
     zfs destroy -r "$DATASET.new" 2>/dev/null || true   # 清上次构建残留
+    rmdir "$MOUNT.new" 2>/dev/null || true
     BUILD_DS="$DATASET.new"
     BUILD_MOUNT="$MOUNT.new"
 else
@@ -341,13 +347,14 @@ if [ "$REPLACE" -eq 1 ]; then
     zfs set mountpoint="$MOUNT" "$DATASET"
     zfs set mountpoint=none "$DATASET.old"
     zfs mount "$DATASET" 2>/dev/null || true
-    # 历史旧模板: 逐个尝试回收(被旧会话 pin 的跳过, 下次更新再试;
-    # 会话硬寿命 7200s 兜底, 不会永远 pin 住)
+    rmdir "$BUILD_MOUNT" 2>/dev/null || true
+    # 历史旧模板: 逐个尝试回收；被旧会话 pin 的先保留，最后一个旧会话
+    # cleanup 时由 jaild 再次回收。
     for old in $(zfs list -H -o name -r zroot/jails 2>/dev/null | grep -E '^zroot/jails/template\.old(-[0-9]+)?$' || true); do
         zfs destroy -r "$old" 2>/dev/null || true
     done
-    # base 刷新时退役的旧 base 会被 template.old* pin 住；待相关会话
-    # 退出且旧 template 回收后，在此处一并尝试回收。
+    # base 刷新时退役的旧 base 会被 template.old* pin 住；构建时先尝试，
+    # 如仍被 pin，最后一个旧会话 cleanup 时由 jaild 一并回收。
     for old_base in $(zfs list -H -o name -r zroot/jails 2>/dev/null | grep -E '^zroot/jails/template-base\.old-[0-9]+-[0-9]+$' || true); do
         zfs destroy -r "$old_base" 2>/dev/null || true
     done

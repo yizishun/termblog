@@ -9,7 +9,7 @@
 #   3. 多访客互不可见(会话 A 写的文件会话 B 看不到)
 #   4. rctl 掐死 fork bomb(maxproc=32 deny)
 #   5. 配额: 同一 IP 第 4 个并发会话被拒(3 个 jail 封顶)
-#   6. 断线后 jail 立即回收, zfs 无泄漏
+#   6. 断线后 jail 立即回收, zfs 与空 mountpoint 均无泄漏
 #   7. 磁盘配额: 每会话 zfs quota=4M, 写超被拒
 #
 # 注意: socket 断开后会话立即回收(jail 与每 IP 配额同步释放); 需要观察
@@ -157,14 +157,17 @@ NEW=$((N - BASE))
 check $? "4 并发连接时新增 jail 数在 1..3 (基线 $BASE, 实际 $N, 新增 $NEW)"
 wait 2>/dev/null
 
-echo "== 6. 断线后 jail 回收, zfs 无泄漏 (等 8s) =="
+echo "== 6. 断线后 jail 回收, zfs/mountpoint 无泄漏 (等 8s) =="
 sleep 8
 NJAIL=$(jail_count)
 NZFS=$(zfs list -H -o name -r zroot/jails 2>/dev/null | grep -c 'zroot/jails/s-' || true)
+NDIR=$(find /jails -mindepth 1 -maxdepth 1 -type d -name 's-*' 2>/dev/null | wc -l | tr -d ' ')
 [ "$NJAIL" -eq 0 ]
 check $? "jail 全部回收 (残留: $NJAIL)"
 [ "$NZFS" -eq 0 ]
 check $? "zfs 数据集无泄漏 (残留: $NZFS)"
+[ "$NDIR" -eq 0 ]
+check $? "jail mountpoint 目录无泄漏 (残留: $NDIR)"
 
 echo "== 7. 磁盘配额: 每会话写空间 4M 封顶 =="
 # 会话存活窗口内: 抓最新会话数据集验 quota 属性; dd 写超 4M 触发超限。
