@@ -10,9 +10,9 @@
 //!   4. openpty + fork; 子进程: setsid -> ctty -> closefrom(3) -> RLIMIT_NOFILE
 //!      -> jail_attach -> 降权 guest -> chdir(home) -> exec zsh -l
 //!
-//! cleanup(sid): umount devfs -> jail -r -> zfs destroy -> remove empty mountpoint
-//!               -> reclaim unpinned template.old* (幂等)
-//! sweep(): 启动时回收上次崩溃遗留的 s-* 数据集
+//! cleanup(sid): umount devfs -> jail -r -> rctl -r -> zfs destroy
+//!               -> remove empty mountpoint -> reclaim unpinned template.old* (幂等)
+//! sweep(): 启动时回收上次崩溃遗留的 s-* 数据集和孤儿 RCTL 规则
 //! ```
 //!
 //! 实现选择: 优先 `jail(8)` / `zfs(8)` / `rctl(8)` 命令行, 接口封装在本文件内;
@@ -76,15 +76,23 @@ impl JailBackend {
         }
     }
 
-    /// 启动残留回收: 上次崩溃遗留的 s-* 数据集(jail + devfs + zfs 一并清掉)。
-    /// 幂等; zfs 不可用(非 ZFS 机器)时静默跳过, 方便开发环境直接拉起 jaild 调试。
+    /// 启动残留回收: 上次崩溃遗留的 s-* 数据集(jail + devfs + zfs 一并清掉)
+    /// 及孤儿 RCTL。幂等；zfs 不可用时跳过文件系统部分，RCTL 仍独立尝试。
     pub fn sweep(cfg: &JailConfig) -> Result<()> {
         let parent = parent_dataset(&cfg.dataset_prefix);
         let out = Command::new("zfs")
             .args(["list", "-H", "-o", "name", "-r", parent])
             .output();
-        let Ok(out) = out else { return Ok(()) };
+        let Ok(out) = out else {
+            if let Err(e) = cleanup_orphaned_session_rctl_rules() {
+                warn!(%e, "orphaned session rctl cleanup failed");
+            }
+            return Ok(());
+        };
         if !out.status.success() {
+            if let Err(e) = cleanup_orphaned_session_rctl_rules() {
+                warn!(%e, "orphaned session rctl cleanup failed");
+            }
             return Ok(());
         }
         for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -118,6 +126,12 @@ impl JailBackend {
                     let _ = std::fs::remove_dir(e.path());
                 }
             }
+        }
+        // RCTL 的 jail 规则按名称持久化，`jail -r` 不会自动删除。旧版本正常
+        // 销毁的会话可能已没有 dataset，所以上面的 ZFS 枚举发现不了；单独从
+        // RCTL 数据库枚举，并且只删除已确认没有活 jail 的 s-xxxxxxxx 规则。
+        if let Err(e) = cleanup_orphaned_session_rctl_rules() {
+            warn!(%e, "orphaned session rctl cleanup failed");
         }
         // 零停机换模板时，旧模板可能曾被旧会话 clone pin 住。最后一个
         // clone 消失后它已经可以销毁，不能一直等到下一次模板构建。
@@ -206,6 +220,23 @@ fn spawn_sync(
     let ds = format!("{}{}", cfg.dataset_prefix, sid);
     let path = format!("{}/s-{sid}", cfg.path_prefix);
     let name = format!("s-{sid}");
+
+    // 这段 preflight 必须位于下方“失败就 cleanup”边界之外：若发现同名活 jail，
+    // 直接返回，绝不能让 cleanup_sync 反过来杀掉它或销毁它的数据集。
+    // 会话编号在 jaild 重启后从 1 重新开始，而 FreeBSD 的 jail RCTL 规则会
+    // 跨 `jail -r` 保留。确认旧 jail 不存在后清掉同名规则，使旧 prison_racct
+    // 完全释放，不把历史 accounting 带进新会话。
+    let running_jails = running_jail_names()?;
+    if running_jails.contains(&name) {
+        bail!("refusing to replace running jail {name}");
+    }
+    if clear_rctl_rules(&name)? {
+        warn!(
+            sid,
+            jail = name,
+            "removed stale rctl rules before jail creation"
+        );
+    }
 
     // 失败兜底: 任何一步失败都把已建资源全部销毁(幂等), 不留半成品
     let res = spawn_inner(
@@ -1053,7 +1084,8 @@ pub fn ensure_devfs_ruleset() {
 }
 
 /// 幂等清理。顺序: devfs 先卸(否则 zfs destroy 会因 busy 失败)
-/// -> 移 jail(顺带杀光 jail 里残留进程) -> 毁数据集 -> 删空 mountpoint。
+/// -> 移 jail(顺带杀光 jail 里残留进程) -> 清 RCTL -> 毁数据集 -> 删空 mountpoint。
+/// RCTL 只能在确认 jail 已消失后删除；若 jail 仍活着就解除规则，会产生无配额窗口。
 fn cleanup_sync(cfg: &JailConfig, sid: &str) {
     let ds = format!("{}{}", cfg.dataset_prefix, sid);
     let path = format!("{}/s-{sid}", cfg.path_prefix);
@@ -1062,7 +1094,24 @@ fn cleanup_sync(cfg: &JailConfig, sid: &str) {
         warn!(sid, %e, "umount devfs failed (can be ignored)");
     }
     if let Err(e) = run("jail", &["-r", &name]) {
-        warn!(sid, %e, "jail -r failed (can be ignored)");
+        // 幂等清理时，失败可能只是 jail 已被另一轮清理移除。命令结果不能代替
+        // 状态检查；下面仍以 jls -d 为准，确认不存在后照样回收遗留规则。
+        warn!(sid, %e, "jail -r failed; checking whether jail is already absent");
+    }
+    match wait_for_jail_removal(&name) {
+        Ok(false) => warn!(
+            sid,
+            jail = name,
+            "jail is still alive or dying after cleanup wait; keeping rctl rules"
+        ),
+        Ok(true) => match clear_rctl_rules(&name) {
+            Ok(true) => debug!(sid, jail = name, "session rctl rules removed"),
+            Ok(false) => {}
+            Err(e) => warn!(sid, jail = name, %e, "remove session rctl rules failed"),
+        },
+        Err(e) => {
+            warn!(sid, jail = name, %e, "cannot confirm jail removal; keeping rctl rules")
+        }
     }
     if let Err(e) = run("zfs", &["destroy", "-f", &ds]) {
         warn!(sid, %e, "zfs destroy failed (can be ignored)");
@@ -1183,6 +1232,126 @@ fn is_retired_template_base_dataset(template_dataset: &str, candidate: &str) -> 
     )
 }
 
+/// 列出当前宿主上的 jail 名。查询失败必须向上传递：调用方不能在“不知道 jail
+/// 是否仍活着”时解除资源限制。
+fn running_jail_names() -> Result<BTreeSet<String>> {
+    let out = Command::new("jls")
+        // dying jail 仍可能有进程；必须把它视为存活，不能提前解除 RCTL。
+        .args(["-d", "name"])
+        .output()
+        .context("execute jls -d name")?;
+    if !out.status.success() {
+        bail!("jls -d name failed: {}", stderr_of(&out));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// `jail -r` 可能先把 jail 标为 dying、再异步等里面的进程退出。给它一个短暂
+/// 的有界等待；只有 `jls -d` 已看不到该名称，调用方才能安全解除 RCTL 规则。
+fn wait_for_jail_removal(name: &str) -> Result<bool> {
+    const ATTEMPTS: usize = 40;
+
+    for attempt in 0..ATTEMPTS {
+        if !running_jail_names()?.contains(name) {
+            return Ok(true);
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    Ok(false)
+}
+
+/// 查询并删除一个 jail subject 的全部 RCTL 规则。先查询是为了让“本来就没有
+/// 规则”保持幂等；FreeBSD 的 `rctl -r` 在零匹配时会以 ESRCH 失败。
+fn clear_rctl_rules(name: &str) -> Result<bool> {
+    let filter = format!("jail:{name}");
+    let out = Command::new("rctl")
+        .arg(&filter)
+        .output()
+        .context("execute rctl rule query")?;
+    if !out.status.success() {
+        bail!("rctl {filter} failed: {}", stderr_of(&out));
+    }
+    if out.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Ok(false);
+    }
+    run("rctl", &["-r", &filter])?;
+    Ok(true)
+}
+
+fn cleanup_orphaned_session_rctl_rules() -> Result<()> {
+    let running = running_jail_names()?;
+    let out = Command::new("rctl")
+        .output()
+        .context("execute rctl rule listing")?;
+    if !out.status.success() {
+        bail!("rctl rule listing failed: {}", stderr_of(&out));
+    }
+
+    let names = session_rctl_jail_names(&String::from_utf8_lossy(&out.stdout));
+    let mut failures = 0usize;
+    for name in names {
+        if running.contains(&name) {
+            warn!(jail = name, "live jail retained during orphan rctl sweep");
+            continue;
+        }
+        // 启动时尚未 accept，但宿主管理员仍可能并发创建 jail；删除前重新
+        // 查询一次，宁可暂留规则，也不能给刚出现的同名 jail 解除限额。
+        match running_jail_names() {
+            Ok(current) if current.contains(&name) => {
+                warn!(
+                    jail = name,
+                    "jail appeared during orphan rctl sweep; retaining rules"
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                failures += 1;
+                warn!(jail = name, %e, "cannot confirm orphaned jail; retaining rctl rules");
+                continue;
+            }
+        }
+        match clear_rctl_rules(&name) {
+            Ok(true) => info!(jail = name, "orphaned session rctl rules reclaimed"),
+            Ok(false) => {}
+            Err(e) => {
+                failures += 1;
+                warn!(jail = name, %e, "orphaned session rctl removal failed");
+            }
+        }
+    }
+    if failures > 0 {
+        bail!("failed to remove orphaned rctl rules for {failures} session jail(s)");
+    }
+    Ok(())
+}
+
+fn session_rctl_jail_names(rules: &str) -> BTreeSet<String> {
+    rules
+        .lines()
+        .filter_map(|line| {
+            let (name, _rule) = line.strip_prefix("jail:")?.split_once(':')?;
+            is_session_jail_name(name).then(|| name.to_owned())
+        })
+        .collect()
+}
+
+fn is_session_jail_name(name: &str) -> bool {
+    name.strip_prefix("s-").is_some_and(|sid| {
+        sid.len() == 8
+            && sid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// 从 jail 内的 /etc/passwd 解析 guest 的 uid/gid/home。
 /// (getpwnam 读的是宿主 passwd, guest 只存在于 jail 里, 所以直接解析文件)
 /// 兼容两种格式: FreeBSD 是 7 字段(name:passwd:uid:gid:gecos:home:shell,
@@ -1285,6 +1454,26 @@ mod tests {
                 "must not reclaim {candidate}"
             );
         }
+    }
+
+    #[test]
+    fn session_rctl_rule_parser_only_selects_owned_jail_names() {
+        let rules = concat!(
+            "jail:s-00000001:memoryuse:deny=134217728\n",
+            "jail:s-00000001:openfiles:deny=256\n",
+            "jail:s-00000002:pcpu:deny=25\n",
+            "user:guest:openfiles:deny=256\n",
+            "jail:production:memoryuse:deny=134217728\n",
+            "jail:s-0000000A:maxproc:deny=32\n",
+            "jail:s-0000000:maxproc:deny=32\n",
+            "jail:s-000000003:maxproc:deny=32\n",
+            "jail:s-00000004-child:maxproc:deny=32\n",
+            "jail:s-00000005\n",
+        );
+        assert_eq!(
+            session_rctl_jail_names(rules),
+            BTreeSet::from(["s-00000001".to_owned(), "s-00000002".to_owned()])
+        );
     }
 
     #[test]

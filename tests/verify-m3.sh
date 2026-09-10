@@ -173,6 +173,18 @@ check $? "炸弹进程自然死亡后外部命令恢复 fork"
 
 echo "== (等 8s: 会话回收, 清空配额) =="
 sleep 8
+if [ -n "$BJAIL" ]; then
+    BOMB_RCTL_RULES=$(rctl 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        BOMB_RCTL_LEFT=$(printf '%s\n' "$BOMB_RCTL_RULES" | grep -c "^jail:$BJAIL:" || true)
+    else
+        BOMB_RCTL_LEFT=query-failed
+    fi
+else
+    BOMB_RCTL_LEFT=jail-not-found
+fi
+[ "$BOMB_RCTL_LEFT" = 0 ]
+check $? "炸弹会话断线后 RCTL 规则全部回收 (残留: $BOMB_RCTL_LEFT)"
 
 echo "== 5. 配额: 每 IP 3 个并发会话封顶 =="
 # 基线可能是外部访客会话(浏览器开着的终端等), 不在本组 4 连接之内;

@@ -4,10 +4,10 @@
 //!   - 监听 Unix socket `/var/run/termblog.sock`(0660 root:www, SEQPACKET)
 //!   - 收 proto 帧, 调 SessionManager(JailBackend) 开会话/配额
 //!   - 每连接一个 task: 上行帧 -> 键入/Resize, 下行输出 -> 帧写 socket
-//!   - socket 断开 = 会话立即回收(jail -r + zfs destroy), 无宽限期;
+//!   - socket 断开 = 会话立即回收(jail -r + rctl -r + zfs destroy), 无宽限期;
 //!     刷新重连是 web 层的职责(web 侧 60s 宽限 + scrollback 回放),
 //!     jaild 不参与恢复机制
-//!   - 启动时扫描回收上次崩溃遗留的 s-* 残留
+//!   - 启动时扫描回收上次崩溃遗留的 s-* jail/ZFS/RCTL 残留
 //!
 //! 接入方(web/ssh, 降权 www)只经 socket 触达这里; 会话(PTY + jail)的
 //! 生命周期完全由本进程持有。
@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     let cfg = Config::load(cfg_path.as_deref().map(Path::new))?;
 
     // 先绑 socket 再做耗时启动步骤: 残留会话的 sweep(jail -r 杀进程 +
-    // zfs destroy)可达 10s+(现场: 14:52:47 重启, 14:52:58 才就绪), 若
+    // rctl -r + zfs destroy)可达 10s+(现场: 14:52:47 重启, 14:52:58 才就绪), 若
     // socket 晚于 sweep 才绑, 重启窗口里的连接会被直接拒绝。现在连接
     // 只在 backlog 里排队, accept 循环在所有启动步骤完成后才开始,
     // 排队的连接随后照常握手——sweep 期间没有任何新会话, 零竞态。
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     }
     info!(socket = %socket.display(), "socket listening (startup steps pending, connections will queue)");
 
-    // 启动残留回收: 上次崩溃遗留的 s-* 全部销毁(幂等)
+    // 启动残留回收: 上次崩溃遗留的 s-* jail/ZFS/RCTL 全部销毁(幂等)
     JailBackend::sweep(&cfg.jail)?;
     // devfs 规则集 4(FreeBSD 14+ 不自带, 缺了 jail 里没有 /dev)
     ensure_devfs_ruleset();

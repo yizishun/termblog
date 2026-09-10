@@ -55,7 +55,7 @@
                 <mxCell id="jaild" value="jaild 进程 [root] —— 整个系统唯一携带 root 的进程" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#fff2cc;strokeColor=#d6b656;" parent="1" vertex="1">
                     <mxGeometry x="360" y="620" width="720" height="474" as="geometry"/>
                 </mxCell>
-                <mxCell id="jlistener" value="LinkListener (SOCK_SEQPACKET)&#xa;启动: 先 bind socket 再 sweep 残留 + 补 devfs 规则集 4&#xa;(重启窗口内连接在 backlog 排队, 不被拒) → chmod 0660 / chown root:www → accept → handle_conn" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
+                <mxCell id="jlistener" value="LinkListener (SOCK_SEQPACKET)&#xa;启动: 先 bind socket 再 sweep 残留 jail/ZFS/RCTL + 补 devfs 规则集 4&#xa;(重启窗口内连接在 backlog 排队, 不被拒) → chmod 0660 / chown root:www → accept → handle_conn" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
                     <mxGeometry x="20" y="46" width="680" height="66" as="geometry"/>
                 </mxCell>
                 <mxCell id="jconn" value="handle_conn (每连接一个 task)&#xa;15s 握手: 首帧必须 Open (attach_token 已废弃, 忽略) → SessionManager::create, 配额拒绝回 Closed → Opened&#xa;单 task 双 select: 上行 Data→input / Resize→control; 下行 输出→帧 / 终结→Closed&#xa;socket 断开 = drop 句柄 = 会话立即回收 (无宽限期)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
@@ -64,7 +64,7 @@
                 <mxCell id="jmgr" value="SessionManager::create(peer_ip 由网关填入, 客户端不可信)&#xa;配额: 全局 ≤64 / 每 IP ≤3 (同一把锁检查+占位, 不超发) → 起会话 pump task&#xa;JailBackend (create 内调用, blocking 线程):&#xa;① zfs clone 只读模板(设 quota=4M, fail-closed)  ② mountpoint + devfs(规则集 4)  ③ jail -c(无网络, allow.* 全关, persist)&#xa;④ jail 聚合 rctl×4 (fail-closed: 挂不上就拒绝开会话)  ⑤ 解析 jail 内 passwd 得 guest&#xa;⑥ openpty + fork; 子进程: setsid → ctty → closefrom → RLIMIT_NOFILE → jail_attach → setuid(guest) → chdir(家目录) → exec zsh" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
                     <mxGeometry x="20" y="222" width="680" height="136" as="geometry"/>
                 </mxCell>
-                <mxCell id="jpump" value="会话 pump task (每会话一个, 独占 PTY)&#xa;select!{ 键入→write(master) · Resize→TIOCSWINSZ+SIGWINCH · master 可读→read→broadcast }&#xa;回收: SIGHUP 进程组 → reap(5s→SIGKILL) → cleanup(销 jail) → 移出会话表 (每环落日志)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
+                <mxCell id="jpump" value="会话 pump task (每会话一个, 独占 PTY)&#xa;select!{ 键入→write(master) · Resize→TIOCSWINSZ+SIGWINCH · master 可读→read→broadcast }&#xa;回收: SIGHUP 进程组 → reap(5s→SIGKILL) → cleanup(jail -r → rctl -r → zfs destroy) → 移出会话表 (每环落日志)" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#d6b656;fontSize=12;" parent="jaild" vertex="1">
                     <mxGeometry x="20" y="368" width="680" height="86" as="geometry"/>
                 </mxCell>
                 <mxCell id="kern" value="操作系统内核 / 子进程" style="swimlane;startSize=32;fontSize=15;fontStyle=1;fill=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
@@ -76,7 +76,7 @@
                 <mxCell id="slave" value="PTY slave&#xa;/dev/ttysN" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#9673a6;fontSize=12;" parent="kern" vertex="1">
                     <mxGeometry x="150" y="70" width="110" height="60" as="geometry"/>
                 </mxCell>
-                <mxCell id="jailbox" value="jail s-&lt;sid&gt; (persist, 无网络)&#xa;· 根: zfs clone 自只读模板 @release&#xa;· devfs (规则集 4: 只露无害设备)&#xa;· allow.* 全关&#xa;· rctl: mem 128M / vmem 512M / proc 32 / pcpu 25%&#xa;· 每进程 RLIMIT_NOFILE: files 256&#xa;· zfs quota=4M: 写满报 Disc quota exceeded&#xa;· 销毁: umount devfs → jail -r → zfs destroy (幂等)" style="rounded=1;whiteSpace=wrap;fill=#f8cecc;strokeColor=#b85450;fontSize=11;verticalAlign=top;" parent="kern" vertex="1">
+                <mxCell id="jailbox" value="jail s-&lt;sid&gt; (persist, 无网络)&#xa;· 根: zfs clone 自只读模板 @release&#xa;· devfs (规则集 4: 只露无害设备)&#xa;· allow.* 全关&#xa;· rctl: mem 128M / vmem 512M / proc 32 / pcpu 25%&#xa;· 每进程 RLIMIT_NOFILE: files 256&#xa;· zfs quota=4M: 写满报 Disc quota exceeded&#xa;· 销毁: umount devfs → jail -r → rctl -r → zfs destroy (幂等)" style="rounded=1;whiteSpace=wrap;fill=#f8cecc;strokeColor=#b85450;fontSize=11;verticalAlign=top;" parent="kern" vertex="1">
                     <mxGeometry x="20" y="200" width="240" height="190" as="geometry"/>
                 </mxCell>
                 <mxCell id="zsh" value="zsh -l (uid=guest)&#xa;fd 0/1/2 = PTY slave&#xa;HOME=/home/guest, cwd=家目录" style="rounded=1;whiteSpace=wrap;fill=#ffffff;strokeColor=#b85450;fontSize=12;" parent="kern" vertex="1">
@@ -100,7 +100,7 @@
                         <mxPoint as="offset"/>
                     </mxGeometry>
                 </mxCell>
-                <mxCell id="e5" value="建 (create 内): zfs clone → jail -c → rctl×4 → fork(RLIMIT_NOFILE)&#xa;销 (泵回收时): jail -r → zfs destroy" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d6b656;" parent="1" source="jmgr" target="jailbox" edge="1">
+                <mxCell id="e5" value="建 (create 内): 清同名旧 RCTL → zfs clone → jail -c → rctl×4 → fork(RLIMIT_NOFILE)&#xa;销 (泵回收时): jail -r → rctl -r → zfs destroy" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#d6b656;" parent="1" source="jmgr" target="jailbox" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
                 </mxCell>
                 <mxCell id="e6" value="fd 0/1/2" style="edgeStyle=orthogonalEdgeStyle;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#9673a6;" parent="1" source="slave" target="zsh" edge="1">
