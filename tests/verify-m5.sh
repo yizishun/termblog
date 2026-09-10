@@ -38,13 +38,31 @@ IMAGE_MANIFEST=$(find "$CONTENT/.rendered" -type f -name '*.images.json' -print 
 if [ -n "$IMAGE_MANIFEST" ]; then
     IMAGE_KEY=${IMAGE_MANIFEST#"$CONTENT/.rendered/"}
     IMAGE_KEY=${IMAGE_KEY%.images.json}
+    case "$IMAGE_KEY" in
+        ""|/*|*/|*//*|*[!a-z0-9/-]*)
+            echo "❌ 非法 IMAGE_KEY: $IMAGE_KEY"
+            exit 2
+            ;;
+    esac
     IMAGE_ROUTE="/$IMAGE_KEY/"
     IMAGE_ASSET=$(sed -n 's/^[[:space:]]*"asset": "\([^"]*\)",*$/\1/p' "$IMAGE_MANIFEST" \
+        | sed -n '1p')
+    IMAGE_BLOCK_START=$(sed -n \
+        's/^[[:space:]]*"block_start": \([0-9][0-9]*\),*$/\1/p' "$IMAGE_MANIFEST" \
         | sed -n '1p')
     if [ -z "$IMAGE_ASSET" ]; then
         echo "❌ 图片 manifest 没有 asset: $IMAGE_MANIFEST"
         exit 2
     fi
+    case "$IMAGE_BLOCK_START" in
+        ""|*[!0-9]*)
+            echo "❌ 图片 manifest 没有合法 block_start: $IMAGE_MANIFEST"
+            exit 2
+            ;;
+    esac
+    # sidecar 是 0-based，less 的 <数字>g 跳转使用 1-based 行号。
+    IMAGE_LINE=$((IMAGE_BLOCK_START + 1))
+    IMAGE_URL="${BASE%/}/$IMAGE_ASSET"
 fi
 
 echo "验收文章: $ARTICLE_SOURCE → $ARTICLE_ROUTE"
@@ -109,13 +127,15 @@ check $? "ssh: blog 显示预渲染排版(ANSI 粗体)"
 (sleep 2; printf 'blog -- "$HOME/%s.md"\n' "$ARTICLE_KEY"; sleep 2; printf 'q'; sleep 1) | timeout 15 $SSH 2>&1 | cat -v \
   | grep -qF ']7777;url=/^G'
 check $? "ssh: 退出 less 后 OSC 复位 /"
-# 图片占位框: 不过 cat -v(它会把框线字符的 UTF-8 字节转成 M- 记法导致匹配失败);
-# OSC8 的 ]8;; 是可打印 ASCII, 原始字节流里直接可匹配
+# 图片不保证在首屏；按 sidecar 锚点让 less 跳到占位框所在行。输出不过 cat -v
+# (它会把框线字符的 UTF-8 字节转成 M- 记法导致匹配失败)；OSC8 的 ]8;;
+# 是可打印 ASCII，原始字节流里直接可匹配。
 if [ -n "$IMAGE_MANIFEST" ]; then
-    out=$( (sleep 2; printf 'blog %s\n' "$IMAGE_KEY"; sleep 3) | timeout 15 $SSH 2>&1 )
+    out=$( (sleep 2; printf 'blog -- "$HOME/%s.md"\n' "$IMAGE_KEY"; sleep 2; \
+        printf '%sg' "$IMAGE_LINE"; sleep 2; printf 'q'; sleep 1) | timeout 15 $SSH 2>&1 )
     printf '%s\n' "$out" | grep -qF '┌─ image'
     check $? "ssh: 带图文章显示图片占位框"
-    printf '%s\n' "$out" | grep -qF ']8;;'
+    printf '%s\n' "$out" | grep -qF "]8;;$IMAGE_URL"
     check $? "ssh: 占位框 URL 带 OSC8 超链接"
 fi
 
